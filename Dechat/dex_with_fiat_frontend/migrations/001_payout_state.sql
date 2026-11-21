@@ -91,6 +91,30 @@ CREATE TABLE IF NOT EXISTS provider_reconciliation_records (
     )
 );
 
+-- Adaptive, bounded payout status polling (Issue #231).
+-- Tracks per-payout polling lifecycle so consumers can apply lifecycle-aware
+-- backoff, enforce per-provider concurrency limits, and stop polling once a
+-- terminal state is reached. last_checked_at and next_retry_at are exposed to
+-- the UI; poll_attempts drives the backoff schedule.
+CREATE TABLE IF NOT EXISTS payout_status_polls (
+  payout_id VARCHAR(64) PRIMARY KEY REFERENCES payout_intents(id) ON DELETE CASCADE,
+  provider VARCHAR(64) NOT NULL,
+  poll_attempts INTEGER NOT NULL DEFAULT 0,
+  last_checked_at TIMESTAMP WITH TIME ZONE,
+  next_retry_at TIMESTAMP WITH TIME ZONE,
+  last_observed_status VARCHAR(32),
+  terminal BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT payout_status_polls_attempts_non_negative
+    CHECK (poll_attempts >= 0),
+  CONSTRAINT payout_status_polls_terminal_consistency
+    CHECK (
+      (terminal = FALSE AND next_retry_at IS NOT NULL)
+      OR (terminal = TRUE AND next_retry_at IS NULL)
+    )
+);
+
 CREATE INDEX IF NOT EXISTS idx_payout_intents_status ON payout_intents(status);
 CREATE INDEX IF NOT EXISTS idx_payout_intents_created_at ON payout_intents(created_at);
 CREATE INDEX IF NOT EXISTS idx_payout_dual_control_payout_id ON payout_dual_control_actions(payout_id);
@@ -104,3 +128,7 @@ CREATE INDEX IF NOT EXISTS idx_provider_reconciliation_records_status
   ON provider_reconciliation_records(status);
 CREATE INDEX IF NOT EXISTS idx_provider_reconciliation_records_matched_payout
   ON provider_reconciliation_records(matched_payout_id);
+-- Supports per-provider concurrency limits and due-retry lookups for polling.
+CREATE INDEX IF NOT EXISTS idx_payout_status_polls_provider_due
+  ON payout_status_polls(provider, next_retry_at)
+  WHERE terminal = FALSE;
