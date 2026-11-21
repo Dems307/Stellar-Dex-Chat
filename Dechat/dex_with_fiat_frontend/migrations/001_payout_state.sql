@@ -115,6 +115,19 @@ CREATE TABLE IF NOT EXISTS payout_status_polls (
     )
 );
 
+-- Supported currency minor-unit (precision) metadata (Issue #232).
+-- Single source of truth for currency precision used by payout validation.
+-- Currencies absent from this table have unknown precision and MUST be
+-- rejected by validation rather than defaulted or guessed.
+CREATE TABLE IF NOT EXISTS payout_currency_precision (
+  currency VARCHAR(8) PRIMARY KEY,
+  minor_units SMALLINT NOT NULL,
+  provider VARCHAR(64),
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT payout_currency_precision_minor_units_range
+    CHECK (minor_units >= 0 AND minor_units <= 8)
+);
+
 CREATE INDEX IF NOT EXISTS idx_payout_intents_status ON payout_intents(status);
 CREATE INDEX IF NOT EXISTS idx_payout_intents_created_at ON payout_intents(created_at);
 CREATE INDEX IF NOT EXISTS idx_payout_dual_control_payout_id ON payout_dual_control_actions(payout_id);
