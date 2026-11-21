@@ -51,6 +51,46 @@ CREATE TABLE IF NOT EXISTS payout_dual_control_actions (
     )
 );
 
+-- Provider reconciliation imports (Issue #230).
+-- Each import batch is checksummed so re-imports are detectable, and each
+-- imported row retains its provider source identifier for row-level provenance.
+-- Reconciliation is read-only with respect to payout_intents: it never mutates
+-- payouts implicitly; any payout change must go through an explicit action.
+CREATE TABLE IF NOT EXISTS provider_reconciliation_imports (
+  id VARCHAR(64) PRIMARY KEY,
+  provider VARCHAR(64) NOT NULL,
+  statement_reference VARCHAR(128) NOT NULL,
+  import_checksum VARCHAR(128) NOT NULL,
+  record_count INTEGER NOT NULL,
+  imported_by VARCHAR(128) NOT NULL,
+  imported_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT provider_reconciliation_imports_checksum_unique
+    UNIQUE (provider, import_checksum)
+);
+
+CREATE TABLE IF NOT EXISTS provider_reconciliation_records (
+  id VARCHAR(64) PRIMARY KEY,
+  import_id VARCHAR(64) NOT NULL REFERENCES provider_reconciliation_imports(id) ON DELETE CASCADE,
+  source_record_id VARCHAR(128) NOT NULL,
+  source_checksum VARCHAR(128) NOT NULL,
+  provider_reference VARCHAR(128),
+  amount_minor_units BIGINT NOT NULL,
+  currency VARCHAR(8) NOT NULL,
+  status VARCHAR(32) NOT NULL,
+  matched_payout_id VARCHAR(64) REFERENCES payout_intents(id) ON DELETE SET NULL,
+  conflict_reason TEXT,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT provider_reconciliation_records_status_check
+    CHECK (status IN ('matched', 'unmatched', 'conflicting')),
+  CONSTRAINT provider_reconciliation_records_source_unique
+    UNIQUE (import_id, source_record_id),
+  CONSTRAINT provider_reconciliation_records_conflict_consistency
+    CHECK (
+      (status = 'conflicting' AND conflict_reason IS NOT NULL)
+      OR (status <> 'conflicting' AND conflict_reason IS NULL)
+    )
+);
+
 CREATE INDEX IF NOT EXISTS idx_payout_intents_status ON payout_intents(status);
 CREATE INDEX IF NOT EXISTS idx_payout_intents_created_at ON payout_intents(created_at);
 CREATE INDEX IF NOT EXISTS idx_payout_dual_control_payout_id ON payout_dual_control_actions(payout_id);
@@ -58,3 +98,9 @@ CREATE INDEX IF NOT EXISTS idx_payout_dual_control_status ON payout_dual_control
 CREATE UNIQUE INDEX IF NOT EXISTS idx_payout_dual_control_pending_unique
   ON payout_dual_control_actions(payout_id, action_type)
   WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_provider_reconciliation_records_import_id
+  ON provider_reconciliation_records(import_id);
+CREATE INDEX IF NOT EXISTS idx_provider_reconciliation_records_status
+  ON provider_reconciliation_records(status);
+CREATE INDEX IF NOT EXISTS idx_provider_reconciliation_records_matched_payout
+  ON provider_reconciliation_records(matched_payout_id);
