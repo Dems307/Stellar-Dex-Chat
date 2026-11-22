@@ -1,6 +1,14 @@
 import { rpc, scValToNative } from '@stellar/stellar-sdk';
 import fs from 'fs';
 import path from 'path';
+import {
+  TransactionalIndexer,
+  FileCheckpointStore,
+  FileEventStore,
+  RpcThrottle,
+  BackfillManager,
+  type RawContractEvent,
+} from '../lib/indexer';
 
 // Minimal interfaces to avoid import issues in script context
 interface ContractEvent {
@@ -22,6 +30,189 @@ interface IndexerState {
   updatedAt: string;
 }
 
+// ---------------------------------------------------------------------------
+// Client-side cache invalidation policy (issue #208)
+//
+// Maps wallet/network changes and contract events to the specific account,
+// balance, quote, and transaction caches they invalidate. This is the single
+// source of truth consumed by the frontend cache layer; it is intentionally
+// pure (no I/O) so it can be unit-tested and reused in the browser.
+//
+// Reordering: every event carries a monotonic `ledger` (and optional
+// `pagingToken`). The policy tracks the highest ledger it has applied per
+// contract and ignores events at or below that watermark, so a late/duplicate
+// event cannot re-invalidate caches or regress the watermark.
+//
+// Missed events: when a gap is detected (event ledger > watermark + 1) the
+// policy emits a `resync` action that invalidates every cache for the affected
+// scope, so caches converge even if intermediate events were dropped.
+// ---------------------------------------------------------------------------
+
+export type CacheScope =
+  | 'account'
+  | 'balance'
+  | 'quote'
+  | 'transaction';
+
+export type WalletEventKind =
+  | 'wallet:connected'
+  | 'wallet:disconnected'
+  | 'wallet:account-changed'
+  | 'network:changed'
+  | 'contract:deposit'
+  | 'contract:withdraw';
+
+export interface WalletEvent {
+  kind: WalletEventKind;
+  /** Monotonic ledger sequence for contract events; omitted for wallet events. */
+  ledger?: number;
+  /** Optional paging token for stable ordering within a ledger. */
+  pagingToken?: string;
+  /** Contract id the event belongs to (contract events only). */
+  contractId?: string;
+  /** Actor/account the event affects, when known. */
+  actor?: string;
+}
+
+export interface InvalidationAction {
+  scope: CacheScope;
+  /** Account whose caches are affected; `*` means all accounts. */
+  account: string;
+  /** Human-readable reason for observability/debugging. */
+  reason: string;
+  /** True when the action is a full resync after a detected gap. */
+  resync: boolean;
+}
+
+export interface InvalidationResult {
+  actions: InvalidationAction[];
+  /** True when the event was ignored (stale/duplicate/out-of-order). */
+  ignored: boolean;
+  /** True when a gap was detected and a resync was emitted. */
+  gapDetected: boolean;
+}
+
+interface Watermark {
+  ledger: number;
+  pagingToken?: string;
+}
+
+const ALL_SCOPES: CacheScope[] = ['account', 'balance', 'quote', 'transaction'];
+
+function actionsFor(
+  scopes: CacheScope[],
+  account: string,
+  reason: string,
+  resync: boolean
+): InvalidationAction[] {
+  return scopes.map((scope) => ({ scope, account, reason, resync }));
+}
+
+/**
+ * Stateful cache invalidation policy. One instance per contract/network scope.
+ * Feed it wallet and contract events in arrival order; it returns the cache
+ * invalidations to apply and tracks a per-contract ledger watermark.
+ */
+export class CacheInvalidationPolicy {
+  private watermarks = new Map<string, Watermark>();
+
+  /** Reset all watermarks (e.g. on network change). */
+  reset(): void {
+    this.watermarks.clear();
+  }
+
+  /**
+   * Apply a single event and return the invalidations it triggers.
+   * Out-of-order/duplicate contract events are ignored; gaps trigger a resync.
+   */
+  apply(event: WalletEvent): InvalidationResult {
+    switch (event.kind) {
+      case 'wallet:connected':
+        // Fresh session: account + balance may be stale from a prior wallet.
+        return {
+          actions: actionsFor(['account', 'balance'], '*', 'wallet connected', false),
+          ignored: false,
+          gapDetected: false,
+        };
+
+      case 'wallet:disconnected':
+        // Drop everything tied to the previous account.
+        return {
+          actions: actionsFor(ALL_SCOPES, '*', 'wallet disconnected', false),
+          ignored: false,
+          gapDetected: false,
+        };
+
+      case 'wallet:account-changed':
+        // New account: invalidate account/balance/transaction; quotes are
+        // account-agnostic but may be priced for the old account's tier.
+        return {
+          actions: actionsFor(
+            ['account', 'balance', 'quote', 'transaction'],
+            event.actor ?? '*',
+            'wallet account changed',
+            false
+          ),
+          ignored: false,
+          gapDetected: false,
+        };
+
+      case 'network:changed':
+        // Network switch invalidates every cache and resets watermarks so the
+        // new network's events are not compared against the old watermark.
+        this.reset();
+        return {
+          actions: actionsFor(ALL_SCOPES, '*', 'network changed', true),
+          ignored: false,
+          gapDetected: false,
+        };
+
+      case 'contract:deposit':
+      case 'contract:withdraw': {
+        const contractId = event.contractId ?? 'default';
+        const ledger = event.ledger ?? 0;
+        const prev = this.watermarks.get(contractId);
+
+        // Reordering: ignore stale/duplicate events at or below the watermark.
+        if (prev && ledger <= prev.ledger) {
+          return { actions: [], ignored: true, gapDetected: false };
+        }
+
+        // Missed-event recovery: a jump beyond the next ledger means events
+        // were dropped, so resync every cache for the affected account.
+        const gapDetected = prev !== undefined && ledger > prev.ledger + 1;
+        this.watermarks.set(contractId, { ledger, pagingToken: event.pagingToken });
+
+        const account = event.actor ?? '*';
+        const reason = gapDetected
+          ? `${event.kind} gap detected (ledger ${ledger})`
+          : event.kind;
+
+        // Deposits/withdrawals move balances and create transactions; quotes
+        // depend on balances so they are invalidated too. A gap widens the
+        // invalidation to the account cache as well.
+        const scopes: CacheScope[] = gapDetected
+          ? ALL_SCOPES
+          : ['balance', 'quote', 'transaction'];
+
+        return {
+          actions: actionsFor(scopes, account, reason, gapDetected),
+          ignored: false,
+          gapDetected,
+        };
+      }
+
+      default:
+        return { actions: [], ignored: true, gapDetected: false };
+    }
+  }
+
+  /** Current watermark for a contract, for tests/observability. */
+  getWatermark(contractId: string): Watermark | undefined {
+    return this.watermarks.get(contractId);
+  }
+}
+
 // Config from env or defaults
 const RPC_URL = process.env.NEXT_PUBLIC_STELLAR_RPC_URL || 'https://soroban-testnet.stellar.org';
 const CONTRACT_ID = process.env.NEXT_PUBLIC_FIAT_BRIDGE_CONTRACT || 'CAWYXBN4PSVXD7NIYEWVFFIIIEUCC6PUN3IMG3J2WHKDB4NVIISMXBPR';
@@ -30,7 +221,15 @@ const server = new rpc.Server(RPC_URL);
 const DATA_DIR = path.join(process.cwd(), 'data');
 const EVENTS_FILE = path.join(DATA_DIR, 'contract-events.json');
 const STATE_FILE = path.join(DATA_DIR, 'indexer-state.json');
+const BACKFILL_FILE = path.join(DATA_DIR, 'indexer-backfill.json');
 const ALERTS_FILE = path.join(DATA_DIR, 'observability-alerts.json');
+
+// Bounded ingestion batches and RPC throttling (issues #242 / #244).
+const INGEST_BATCH_SIZE = num(process.env.INDEXER_BATCH_SIZE, 100);
+const RPC_MIN_INTERVAL_MS = num(process.env.INDEXER_RPC_MIN_INTERVAL_MS, 250);
+const RPC_MAX_RETRIES = num(process.env.INDEXER_RPC_MAX_RETRIES, 5);
+const FRESH_START_LOOKBACK = num(process.env.INDEXER_FRESH_LOOKBACK_LEDGERS, 10000);
+const BACKFILL_MAX_LEDGERS = num(process.env.INDEXER_BACKFILL_MAX_LEDGERS, 5000);
 
 // Ensure data directory exists
 if (!fs.existsSync(DATA_DIR)) {
@@ -200,22 +399,104 @@ async function getLatestLedger() {
   return latestLedgerResp.sequence;
 }
 
+// Map a raw Soroban event into the canonical ContractEvent shape.
+// Topic 0: Version (u32), Topic 1: Symbol (deposit/withdraw),
+// Topic 2: Address (actor), Value: i128 (amount).
+function mapEvent(event: RawContractEvent): ContractEvent | null {
+  const topics = event.topic.map((t) => scValToNative(t));
+  const value = scValToNative(event.value);
+
+  const typeStr = topics[1] as string;
+  const actor = topics[2] as string;
+  const eventType: 'deposit' | 'withdraw' = typeStr === 'withdraw' ? 'withdraw' : 'deposit';
+  const contractId =
+    typeof event.contractId === 'string'
+      ? event.contractId
+      : (event.contractId as any)?.id || CONTRACT_ID;
+
+  if (eventType !== 'deposit' && eventType !== 'withdraw') return null;
+
+  return {
+    id: event.id,
+    type: eventType,
+    contractId: String(contractId),
+    ledger: event.ledger,
+    ledgerClosedAt: event.ledgerClosedAt,
+    txHash: event.txHash,
+    actor,
+    amount: String(value),
+    version: Number(topics[0]) || 1,
+  };
+}
+
 async function indexEvents() {
   console.log('Starting event indexing for contract:', CONTRACT_ID);
 
-  let state: IndexerState = {
-    lastPagingToken: '0',
-    lastLedger: 0,
-    updatedAt: new Date().toISOString()
+  // Durable checkpoint + event store. The checkpoint is the single source of
+  // truth for resume position; events and cursor advance atomically together.
+  const checkpointStore = new FileCheckpointStore(STATE_FILE);
+  const eventStore = new FileEventStore(EVENTS_FILE);
+  const throttle = new RpcThrottle({ minIntervalMs: RPC_MIN_INTERVAL_MS, maxRetries: RPC_MAX_RETRIES });
+
+  const indexer = new TransactionalIndexer({
+    contractId: CONTRACT_ID,
+    checkpointStore,
+    eventStore,
+    fetchEvents: async ({ startLedger, limit }) => {
+      const response = await throttle.run(() =>
+        server.getEvents({
+          startLedger,
+          filters: [{ type: 'contract', contractIds: [CONTRACT_ID] }],
+          limit,
+        })
+      );
+      return {
+        events: response.events as unknown as RawContractEvent[],
+        latestLedger: response.latestLedger,
+      };
+    },
+    mapEvent,
+    batchSize: INGEST_BATCH_SIZE,
+    onCommit: (info) => {
+      console.log(
+        `[checkpoint] committed ${info.eventCount} events; cursor ledger=${info.lastLedger} pagingToken=${info.lastPagingToken}`
+      );
+    },
+  });
+
+  const backfill = new BackfillManager({
+    indexer,
+    checkpointStore,
+    progressFile: BACKFILL_FILE,
+    maxLedgersPerRun: BACKFILL_MAX_LEDGERS,
+    throttle,
+    onProgress: (p) => {
+      console.log(
+        `[backfill] ${p.status} ${p.processedLedgers}/${p.totalLedgers} ledgers (cursor=${p.lastLedger})`
+      );
+    },
+  });
+
+  // Honor SIGINT/SIGTERM: stop scheduling new batches and let the in-flight
+  // batch commit atomically so we never leave a torn checkpoint.
+  let cancelled = false;
+  const requestCancel = (signal: string) => {
+    if (cancelled) return;
+    cancelled = true;
+    console.log(`[indexer] received ${signal}; cancelling after current batch`);
+    backfill.cancel();
+    indexer.cancel();
   };
+  process.on('SIGINT', () => requestCancel('SIGINT'));
+  process.on('SIGTERM', () => requestCancel('SIGTERM'));
 
-  if (fs.existsSync(STATE_FILE)) {
-    state = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
-  }
-
+  const checkpoint = await checkpointStore.load();
   const latestLedger = await getLatestLedger();
-  const startLedger = state.lastLedger || (latestLedger - 10000); // Index last 10k ledgers if fresh start
+  const startLedger = checkpoint?.lastLedger || latestLedger - FRESH_START_LOOKBACK;
 
+  console.log(
+    `Resuming from checkpoint ledger=${checkpoint?.lastLedger ?? 'none'} pagingToken=${checkpoint?.lastPagingToken ?? 'none'}`
+  );
   console.log(`Polling events from ledger ${startLedger} to ${latestLedger}`);
 
   try {
@@ -242,164 +523,6 @@ async function indexEvents() {
       
       const typeStr = topics[1] as string;
       const actor = topics[2] as string;
-      const eventType: 'deposit' | 'withdraw' = typeStr === 'withdraw' ? 'withdraw' : 'deposit';
-      const contractId = typeof event.contractId === 'string' ? event.contractId : (event.contractId as any)?.id || CONTRACT_ID;
-      
-      return {
-        id: event.id,
-        type: eventType,
-        contractId: String(contractId),
-        ledger: event.ledger,
-        ledgerClosedAt: event.ledgerClosedAt,
-        txHash: event.txHash,
-        actor: actor,
-        amount: String(value),
-        version: Number(topics[0]) || 1
-      };
-    }).filter(e => e.type === 'deposit' || e.type === 'withdraw');
+      const eventT
 
-    if (newEvents.length > 0) {
-      console.log(`Found ${newEvents.length} new events.`);
-      
-      let existingEvents: ContractEvent[] = [];
-      if (fs.existsSync(EVENTS_FILE)) {
-        existingEvents = JSON.parse(fs.readFileSync(EVENTS_FILE, 'utf8'));
-      }
-
-      // Merge and deduplicate by ID
-      const eventMap = new Map();
-      existingEvents.forEach(e => eventMap.set(e.id, e));
-      newEvents.forEach(e => eventMap.set(e.id, e));
-      
-      const mergedEvents = Array.from(eventMap.values())
-        .sort((a, b) => b.ledger - a.ledger); // Newest first
-
-      fs.writeFileSync(EVENTS_FILE, JSON.stringify(mergedEvents, null, 2));
-    }
-
-    // Update state
-    state.lastLedger = latestLedger;
-    state.updatedAt = new Date().toISOString();
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
-
-    // -----------------------------------------------------------------------
-    // Evaluate observability conditions and reconcile alerts (issue #121).
-    // -----------------------------------------------------------------------
-    const nowMs = Date.now();
-    const alertState = loadAlertState();
-
-    // Indexer lag: how far behind the chain tip we are.
-    const indexerLag = Math.max(0, latestLedger - state.lastLedger);
-
-    // Withdrawal queue: derived from indexed withdraw events that have not yet
-    // been reconciled. Safe refs use event ids / tx hashes only.
-    const withdrawals: WithdrawalRecord[] = [];
-    if (fs.existsSync(EVENTS_FILE)) {
-      const all: ContractEvent[] = JSON.parse(fs.readFileSync(EVENTS_FILE, 'utf8'));
-      for (const e of all) {
-        if (e.type !== 'withdraw') continue;
-        withdrawals.push({
-          id: e.id,
-          createdAt: e.ledgerClosedAt,
-          status: 'processing',
-          providerRef: e.txHash,
-        });
-      }
-    }
-
-    const pendingWithdrawals = withdrawals.filter(w => w.status !== 'completed' && w.status !== 'failed');
-    const queueDepth = pendingWithdrawals.length;
-
-    let oldestAgeSeconds = 0;
-    let oldestRef: string | undefined;
-    let providerFailureCount = 0;
-    let approvalDelayCount = 0;
-    for (const w of pendingWithdrawals) {
-      const { ageSeconds, isApprovalDelay } = classifyWithdrawal(w, nowMs);
-      if (isApprovalDelay) {
-        approvalDelayCount += 1;
-        continue; // expected user approval delay, not a provider failure
-      }
-      providerFailureCount += 1;
-      if (ageSeconds > oldestAgeSeconds) {
-        oldestAgeSeconds = ageSeconds;
-        oldestRef = w.id;
-      }
-    }
-
-    // Webhook backlog + reconciliation age are read from optional sidecar files
-    // produced by the payout worker; absent files mean no backlog.
-    const webhookBacklog = readCountFile(path.join(DATA_DIR, 'webhook-backlog.json'));
-    const reconciliationAgeSeconds = readAgeFile(path.join(DATA_DIR, 'reconciliation-state.json'));
-
-    const conditions = [
-      {
-        key: 'withdrawal_queue_age',
-        severity: severityFor(oldestAgeSeconds, THRESHOLDS.withdrawalQueueAgeSeconds),
-        summary: `Oldest pending withdrawal is ${Math.round(oldestAgeSeconds)}s old`,
-        operatorAction: 'Inspect the payout worker and retry the stuck withdrawal.',
-        safeRefs: { oldestWithdrawalId: oldestRef ?? 'none', ageSeconds: Math.round(oldestAgeSeconds) },
-      },
-      {
-        key: 'withdrawal_queue_depth',
-        severity: severityFor(queueDepth, THRESHOLDS.withdrawalQueueDepth),
-        summary: `Withdrawal queue depth is ${queueDepth}`,
-        operatorAction: 'Scale payout workers or drain the queue via the operator console.',
-        safeRefs: { queueDepth, providerFailures: providerFailureCount, approvalDelays: approvalDelayCount },
-      },
-      {
-        key: 'indexer_lag',
-        severity: severityFor(indexerLag, THRESHOLDS.indexerLagLedgers),
-        summary: `Indexer is ${indexerLag} ledgers behind the chain tip`,
-        operatorAction: 'Check RPC availability and restart the indexer if lag persists.',
-        safeRefs: { indexerLag, lastLedger: state.lastLedger, latestLedger },
-      },
-      {
-        key: 'webhook_backlog',
-        severity: severityFor(webhookBacklog, THRESHOLDS.webhookBacklog),
-        summary: `Webhook backlog is ${webhookBacklog}`,
-        operatorAction: 'Verify provider webhook delivery and replay failed deliveries.',
-        safeRefs: { webhookBacklog },
-      },
-      {
-        key: 'reconciliation_age',
-        severity: severityFor(reconciliationAgeSeconds, THRESHOLDS.reconciliationAgeSeconds),
-        summary: `Last reconciliation was ${Math.round(reconciliationAgeSeconds)}s ago`,
-        operatorAction: 'Run the payout reconciliation job and confirm ledger balances.',
-        safeRefs: { reconciliationAgeSeconds: Math.round(reconciliationAgeSeconds) },
-      },
-    ];
-
-    reconcileAlerts(alertState, conditions);
-    saveAlertState(alertState);
-
-    console.log('Indexing complete.');
-  } catch (error) {
-    console.error('Error indexing events:', error);
-  }
-}
-
-function readCountFile(file: string): number {
-  if (!fs.existsSync(file)) return 0;
-  try {
-    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
-    return Number(parsed?.count) || 0;
-  } catch {
-    return 0;
-  }
-}
-
-function readAgeFile(file: string): number {
-  if (!fs.existsSync(file)) return 0;
-  try {
-    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
-    const ts = parsed?.lastReconciledAt;
-    if (!ts) return 0;
-    return Math.max(0, (Date.now() - Date.parse(ts)) / 1000);
-  } catch {
-    return 0;
-  }
-}
-
-// Run indexing
-indexEvents().catch(console.error);
+/* … truncated 6190 chars — edit only what you need near the top … */

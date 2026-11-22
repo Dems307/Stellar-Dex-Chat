@@ -7,6 +7,27 @@ import {
   getProviderCircuitBreaker,
   handlePayoutApiError,
 } from '@/lib/payout/circuitBreaker';
+import {
+  extractOrGenerateCorrelationId,
+  validationError,
+  logStructuredError,
+  authorizationError,
+  createPayoutErrorResponse,
+} from '@/lib/payout/errors';
+import {
+  enforcePayoutApiVersion,
+  payoutSuccessResponse,
+} from '@/lib/payout/schemaEvolution';
+import {
+  authorizeTransferAccess,
+  uniformNotFoundResponse,
+} from '@/lib/auth/authorizationMatrix';
+import {
+  resolveCallerIdentity,
+  unauthorizedResponse,
+  nonEnumeratingNotFoundResponse,
+} from '@/lib/payout/auth';
+import { getTransferStatus } from '@/lib/transferStore';
 
 const RATE_LIMIT = {
   maxRequests: 15,
@@ -26,11 +47,17 @@ export async function POST(request: NextRequest) {
   // Enforce payout API security
   const securityBlocked = enforcePayoutRouteSecurity(request);
   if (securityBlocked) return securityBlocked;
+  const apiVersionBlocked = enforcePayoutApiVersion(request);
+  if (apiVersionBlocked) return apiVersionBlocked;
 
   const ip = getClientIp(request);
+  const correlationId = extractOrGenerateCorrelationId(request.headers);
 
   const limited = applyRateLimit(ip, '/api/transfer-status', RATE_LIMIT);
   if (limited) return limited;
+
+  const correlationId =
+    request.headers.get('x-correlation-id') || crypto.randomUUID();
 
   try {
     let body: unknown;
@@ -86,28 +113,35 @@ export async function POST(request: NextRequest) {
 
     // Verify ownership if tracked in store; return non-enumerating 404 for unauthorized
     const existing = getTransferStatus(reference);
-    if (existing && !isTransferAuthorized(existing, caller)) {
+    if (
+      existing &&
+      !caller.isOperator &&
+      existing.clientSessionId &&
+      existing.clientSessionId !== caller.address
+    ) {
       return nonEnumeratingNotFoundResponse('Transfer');
     }
 
     const provider = getPayoutProvider();
-    const breaker = getProviderCircuitBreaker(provider.name);
+    const breaker = getProviderCircuitBreaker(
+      provider.name,
+      'status_query',
+    );
 
     const data = await breaker.execute(() =>
       provider.checkTransferStatus({ reference }),
     );
 
-    const response = NextResponse.json({
-      success: true,
-      data: {
+    const response = payoutSuccessResponse(
+      {
         ...data,
         amountMinor:
           data.amountMinor !== undefined
             ? data.amountMinor.toString()
             : undefined,
       },
-    });
-    response.headers.set('X-Correlation-Id', correlationId);
+      { correlationId },
+    );
     return response;
   } catch (error: unknown) {
     logStructuredError('transfer-status', error, {
@@ -123,7 +157,10 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json(errorDetails.body, {
       status: errorDetails.status,
-      headers: errorDetails.headers,
+      headers: {
+        ...errorDetails.headers,
+        'X-Correlation-Id': correlationId,
+      },
     });
   }
 }

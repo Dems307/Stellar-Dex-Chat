@@ -27,7 +27,15 @@ async function mockBankApis(page: import('@playwright/test').Page) {
   );
   await page.route('**/api/verify-account', (route) =>
     route.fulfill({
-      json: { success: true, data: { account_name: 'John Doe' } },
+      json: {
+        success: true,
+        data: {
+          account_name: 'John Doe',
+          accountNumberMasked: '******7890',
+          verificationToken: 'test-verification-token',
+          verificationExpiresAt: new Date(Date.now() + 300_000).toISOString(),
+        },
+      },
     }),
   );
   await page.route('**/api/create-recipient', (route) =>
@@ -47,26 +55,38 @@ async function mockBankApis(page: import('@playwright/test').Page) {
       },
     }),
   );
-  await page.route('**/api/crypto-price**', (route) =>
+  await page.route('**/api/fx-quote', (route) =>
     route.fulfill({
       json: {
-        ngnAmount: 15000,
-        xlmAmount: 10,
-        rate: 1500,
-        expiresAt: Date.now() + 120_000,
+        success: true,
+        data: {
+          quoteId: '01234567-89ab-4cde-8fab-0123456789ab',
+          quoteToken: 'test-signed-fx-quote-token',
+          tokenSymbol: 'XLM',
+          tokenAmountDecimal: '10',
+          currency: 'NGN',
+          exchangeRateDecimal: '1500',
+          fiatAmountMinorUnits: '1500000',
+          roundingPolicy: 'HALF_UP_TO_MINOR_UNIT',
+          provider: 'coingecko',
+          providerRequestId: '11234567-89ab-4cde-8fab-0123456789ab',
+          providerResponseId: 'test-provider-response',
+          ngnAmount: 15000,
+          lockedAt: Date.now(),
+          expiresAt: Date.now() + 120_000,
+          stale: false,
+          source: 'live',
+        },
       },
-    }),
-  );
-  await page.route('**/api.coingecko.com/**', (route) =>
-    route.fulfill({
-      json: { stellar: { ngn: 1500, usd: 0.12 } },
     }),
   );
 }
 
 async function gotoBankDetailsStep2(page: import('@playwright/test').Page) {
   const dialog = page.getByRole('dialog', { name: /fiat payout/i });
-  await expect(dialog.getByRole('button', { name: 'Access Bank' })).toBeVisible();
+  await expect(
+    dialog.getByRole('button', { name: 'Access Bank' }),
+  ).toBeVisible();
   await dialog.getByRole('button', { name: 'Access Bank' }).click();
   await dialog.getByRole('button', { name: /^next$/i }).click();
   await expect(page.getByPlaceholder('0000000000')).toBeVisible();
@@ -118,7 +138,9 @@ test.describe('BankDetailsModal — Step 1: bank selection', () => {
     const searchInput = dialog.getByPlaceholder(/search banks/i);
     await searchInput.fill('Zenith');
     await expect(searchInput).toHaveValue('Zenith');
-    await expect(dialog.getByRole('button', { name: 'Zenith Bank' })).toBeVisible();
+    await expect(
+      dialog.getByRole('button', { name: 'Zenith Bank' }),
+    ).toBeVisible();
     await expect(
       dialog.getByRole('button', { name: 'Access Bank' }),
     ).not.toBeVisible();
@@ -210,7 +232,9 @@ test.describe('BankDetailsModal — Step 3: confirm payout', () => {
     ).toBeVisible();
   });
 
-  test('payout note field accepts text up to 160 characters', async ({ page }) => {
+  test('payout note field accepts text up to 160 characters', async ({
+    page,
+  }) => {
     const noteField = page.getByPlaceholder(/optional note/i);
     if (await noteField.isVisible()) {
       await noteField.fill('A'.repeat(160));
@@ -236,7 +260,9 @@ test.describe('BankDetailsModal — Step 4: success state', () => {
 });
 
 test.describe('BankDetailsModal — idempotency guard', () => {
-  test('rapid double-click on confirm does not submit twice', async ({ page }) => {
+  test('rapid double-click on confirm does not submit twice', async ({
+    page,
+  }) => {
     await mockBankApis(page);
 
     let callCount = 0;
