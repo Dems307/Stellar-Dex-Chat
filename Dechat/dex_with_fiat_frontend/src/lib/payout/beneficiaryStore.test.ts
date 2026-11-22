@@ -76,7 +76,7 @@ describe('beneficiaryStore', () => {
       });
 
       const input = {
-        name: 'John Doe',
+        name: 'Ada Synthetic',
         accountNumber: '0123456789',
         bankCode: '058',
         userScope: 'user_1',
