@@ -2,7 +2,7 @@
 
 Thanks for contributing to Dechat. This document covers the workflow for
 changes that touch the Soroban smart contract interface and its generated
-TypeScript client bindings.
+TypeScript client bindings, as well as the payout side-effect pipeline.
 
 ## Contract bindings and ABI compatibility
 
