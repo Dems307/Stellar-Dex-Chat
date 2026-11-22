@@ -452,11 +452,13 @@ Repo Avatar
 - **integration:** Catch integration failures across intent, signing, and payout
 - **contract:** Event schemas, resource budgets, upgrade compatibility, and adversarial fixtures
 - **api:** Harden payout lifecycle with reconciliation, minor units, ownership auth, and provider adapters
+- **fixtures:** Add deterministic privacy-safe synthetic fixtures
 - Add payout traceability and settlement safeguards (#228, #227, #226, #225)
 - **a11y:** Standardize accessible error summaries for API and wallet failures
 - **rtl:** Add right-to-left layout support for wallet and payout flows
 - **payout:** Stream status updates with bounded replay
 - **perf:** Enforce audit and chat performance budgets
+- **payout:** Audited, idempotent dead-letter replay operator action
 
 ### Fixed
 
@@ -954,6 +956,11 @@ Repo Avatar
 - #124 ops: automate production readiness and canary verification
 - #125 ci: enforce least-privilege path-aware workflows and required
 - #126 test(e2e): run full-stack flows against disposable Soroban and
+- #229 Implement dual control for high-risk manual payout actions
+- #230 Add typed provider reconciliation reports with row-level prove
+- #231 Make payout status polling adaptive and bounded
+- #232 Enforce payout amount and currency precision from provider met
+- **payout:** Add evidence conflict precedence
 - **payout:** Isolate circuits by provider operation
 - #217 Add tenant-aware AI budget accounting with atomic reservations
 - #218 Support cancellation and timeout propagation through every mod
@@ -1324,6 +1331,7 @@ Repo Avatar
 - **changelog:** Update changelog [skip ci]
 - **wallet:** Cover freighter transitions and account isolation
 - **locale:** Cover timezone and localized numeric boundaries
+- **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
 
