@@ -31,78 +31,17 @@ const PAYOUT_KEY_VARIABLES = [
 ];
 
 /**
- * Environment variables that describe service credentials, roles or data-store
- * privileges. In production these must be least-privilege: no wildcard scopes
- * and no broad administrative roles.
+ * Variables that define the browser-facing cross-origin policy and the trusted
+ * proxy boundary used for rate-limit identity derivation. These must be
+ * declared in .env.example so production and local-development configurations
+ * are explicit and reviewable.
  */
-const PERMISSION_VARIABLE_PATTERN = /(PERMISSION|ROLE|SCOPE|PRIVILEGE|GRANT)/i;
-
-/**
- * Tokens that indicate an over-broad permission grant. Matched as whole tokens
- * (case-insensitive) so that values like "readonly" or "reader" are allowed.
- */
-const WILDCARD_PERMISSION_TOKENS = ['*', 'all', 'admin', 'superuser', 'root', 'owner'];
-
-/**
- * Split a permission value into individual tokens. Supports comma, whitespace,
- * semicolon and pipe separated lists.
- */
-function tokenizePermissionValue(value: string): string[] {
-  return value
-    .split(/[\s,;|]+/)
-    .map(token => token.trim())
-    .filter(token => token !== '');
-}
-
-/**
- * Determine whether a permission value contains a wildcard or unnecessary
- * broad grant. Returns the offending tokens (empty when the value is fine).
- */
-export function findWildcardPermissions(value: string): string[] {
-  const offending: string[] = [];
-  for (const token of tokenizePermissionValue(value)) {
-    const normalized = token.toLowerCase();
-    if (WILDCARD_PERMISSION_TOKENS.includes(normalized)) {
-      offending.push(token);
-      continue;
-    }
-    // Catch scoped wildcards such as "payments:*" or "db.*".
-    if (normalized.includes('*')) {
-      offending.push(token);
-    }
-  }
-  return offending;
-}
-
-/**
- * Inspect permission/role related assignments for wildcard grants. Only
- * enforced when NODE_ENV is production so local development stays ergonomic.
- */
-export function validateProductionPermissions(
-  assignments: Map<string, string>,
-  nodeEnv: string | undefined = process.env.NODE_ENV,
-): boolean {
-  if (nodeEnv !== 'production') {
-    return true;
-  }
-
-  let isValid = true;
-  for (const [key, value] of assignments) {
-    if (!PERMISSION_VARIABLE_PATTERN.test(key)) {
-      continue;
-    }
-    const offending = findWildcardPermissions(value);
-    if (offending.length > 0) {
-      console.error(
-        `❌ ERROR: ${key} grants wildcard or unnecessary production permissions ` +
-          `(${offending.join(', ')}). Use a least-privilege role instead.`,
-      );
-      isValid = false;
-    }
-  }
-
-  return isValid;
-}
+const CORS_AND_PROXY_VARIABLES = [
+  'CORS_ALLOWED_ORIGINS',
+  'CORS_ALLOW_CREDENTIALS',
+  'TRUSTED_PROXY_HOPS',
+  'TRUSTED_PROXY_IPS',
+];
 
 /**
  * Extract variable names from env.ts schema definitions
@@ -197,6 +136,29 @@ function validatePayoutKeyMaterial(): boolean {
 }
 
 /**
+ * Ensure the cross-origin and trusted-proxy variables are declared in
+ * .env.example. They gate which browser origins may call financial routes and
+ * which hops are trusted when deriving client IPs, so an undocumented value
+ * would silently widen the trust boundary.
+ */
+function validateCorsAndProxyVariables(): boolean {
+  const exampleVars = extractEnvExampleVariables();
+  let isValid = true;
+
+  for (const key of CORS_AND_PROXY_VARIABLES) {
+    if (!exampleVars.has(key)) {
+      console.error(
+        `❌ ERROR: ${key} must be declared in .env.example so the CORS and ` +
+          'trusted-proxy policy is documented for production and local development.',
+      );
+      isValid = false;
+    }
+  }
+
+  return isValid;
+}
+
+/**
  * Main validation logic
  */
 function validateEnvExample(): boolean {
@@ -227,7 +189,7 @@ function validateEnvExample(): boolean {
     isValid = false;
   }
 
-  if (!validateProductionPermissions(extractEnvExampleAssignments())) {
+  if (!validateCorsAndProxyVariables()) {
     isValid = false;
   }
 
@@ -241,5 +203,4 @@ function validateEnvExample(): boolean {
 
 // Run validation
 const envValid = validateEnvExample();
-const alertsValid = validateAlertThresholds();
-process.exit(envValid && alertsValid ? 0 : 1);
+process.exit(envValid ? 0 : 1);

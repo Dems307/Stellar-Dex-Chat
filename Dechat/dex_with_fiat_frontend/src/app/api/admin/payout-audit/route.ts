@@ -2,11 +2,20 @@ import { NextRequest, NextResponse } from 'next/server';
 import { requireAdminAuth } from '../_utils/requireAdminAuth';
 import { payoutAuditLedger, PayoutAuditAction } from '@/lib/payout/auditLedger';
 import {
+  ADMIN_PAYOUT_AUDIT_CORS_POLICY,
+  enforceCorsPolicy,
+} from '@/lib/security/corsPolicy';
+import {
   payoutAuditArchive,
   PayoutAuditArchiveManifest,
 } from '@/lib/payout/auditArchive';
 
 export async function GET(request: NextRequest) {
+  const corsError = enforceCorsPolicy(request, ADMIN_PAYOUT_AUDIT_CORS_POLICY);
+  if (corsError) {
+    return corsError;
+  }
+
   const authError = requireAdminAuth(request);
   if (authError) {
     return authError;
@@ -109,28 +118,48 @@ export async function GET(request: NextRequest) {
 }
 
 // Append-only enforcement: Prevent mutating or deleting audit history
-export async function POST() {
+export async function POST(request: NextRequest) {
+  const corsError = enforceCorsPolicy(request, ADMIN_PAYOUT_AUDIT_CORS_POLICY);
+  if (corsError) {
+    return corsError;
+  }
+
   return NextResponse.json(
     { error: 'Method Not Allowed: The payout audit ledger is append-only' },
     { status: 405, headers: { Allow: 'GET' } },
   );
 }
 
-export async function PUT() {
+export async function PUT(request: NextRequest) {
+  const corsError = enforceCorsPolicy(request, ADMIN_PAYOUT_AUDIT_CORS_POLICY);
+  if (corsError) {
+    return corsError;
+  }
+
   return NextResponse.json(
     { error: 'Method Not Allowed: The payout audit ledger is append-only' },
     { status: 405, headers: { Allow: 'GET' } },
   );
 }
 
-export async function DELETE() {
+export async function DELETE(request: NextRequest) {
+  const corsError = enforceCorsPolicy(request, ADMIN_PAYOUT_AUDIT_CORS_POLICY);
+  if (corsError) {
+    return corsError;
+  }
+
   return NextResponse.json(
     { error: 'Method Not Allowed: The payout audit ledger is append-only' },
     { status: 405, headers: { Allow: 'GET' } },
   );
 }
 
-export async function PATCH() {
+export async function PATCH(request: NextRequest) {
+  const corsError = enforceCorsPolicy(request, ADMIN_PAYOUT_AUDIT_CORS_POLICY);
+  if (corsError) {
+    return corsError;
+  }
+
   return NextResponse.json(
     { error: 'Method Not Allowed: The payout audit ledger is append-only' },
     { status: 405, headers: { Allow: 'GET' } },

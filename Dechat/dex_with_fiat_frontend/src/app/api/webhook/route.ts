@@ -2,7 +2,13 @@ import { NextRequest, NextResponse } from 'next/server';
 import crypto from 'crypto';
 import { serverEnv } from '@/lib/serverEnv';
 import { telemetry } from '@/lib/telemetry';
-import { getTransferStatus, setTransferStatus } from '@/lib/transferStore';
+import { redactForLog } from '@/lib/logging/redaction';
+import {
+  isReplayEvent,
+  getTransferStatus,
+  transitionPayoutStatus,
+  InvalidPayoutTransitionError,
+} from '@/lib/transferStore';
 import { publishPaymentStatus } from '@/lib/paymentStatusEvents';
 import { credentialManager } from '@/lib/payout/credentialManager';
 import {
@@ -151,7 +157,14 @@ export async function POST(request: NextRequest) {
     const matchedCredential = candidateKeys.find((credential) =>
       isValidSignature(payload, signature, credential.secretKey),
     );
+
     if (!matchedCredential) {
+      telemetry.addLog(
+        span.spanId,
+        'error',
+        'Invalid webhook signature',
+        redactForLog({ receivedSignature: signature }) as Record<string, unknown>,
+      );
       telemetry.finishSpan(span.spanId, {
         success: false,
         error: 'Invalid signature',
@@ -199,6 +212,22 @@ export async function POST(request: NextRequest) {
       .createHash('sha256')
       .update(payload)
       .digest('hex');
+
+    telemetry.addLog(
+      span.spanId,
+      'info',
+      'Webhook signature verified',
+      redactForLog({
+        eventType: event.event,
+        reference: event.data?.reference,
+        eventId,
+        credentialVersion: matchedCredential.version,
+      }) as Record<string, unknown>,
+    );
+
+    console.log('Received Paystack webhook:', event.event);
+
+    // Durable deduplication and replay protection (Issue #35)
     const { acquired, isDuplicate } =
       await webhookDeduplicationService.acquireOrCheck(
         eventId,
@@ -253,7 +282,7 @@ export async function POST(request: NextRequest) {
 
       const status = reconciliation.effectiveStatus;
       const updatedAt = receivedAt;
-      const nextRecord = setTransferStatus({
+      const nextRecord = transitionPayoutStatus({
         reference: payoutReference,
         status,
         amount: Number(data.amount ?? existingRecord?.amount ?? 0),
@@ -268,6 +297,7 @@ export async function POST(request: NextRequest) {
         payoutReservationLedger.getReservationByProviderReference(
           payoutReference,
         );
+
       if (reservation) {
         if (status === 'success') {
           payoutReservationLedger.settle(reservation.payoutId, receivedAt);
@@ -305,9 +335,14 @@ export async function POST(request: NextRequest) {
       throw error;
     }
   } catch (error) {
-    telemetry.addLog(span.spanId, 'error', 'Webhook processing error', {
-      error: error instanceof Error ? error.message : 'Unknown error',
-    });
+    telemetry.addLog(
+      span.spanId,
+      'error',
+      'Webhook processing error',
+      redactForLog({
+        error: error instanceof Error ? error.message : 'Unknown error',
+      }) as Record<string, unknown>,
+    );
     telemetry.finishSpan(span.spanId, {
       success: false,
       error: 'Webhook processing failed',
