@@ -25,6 +25,7 @@ Scope: durable payout state — payout **intents**, **idempotency records**, and
   - Daily full snapshots: **35 days**.
   - Monthly archives (audit history): **13 months**.
 - **Dependencies:** managed database PITR/snapshot service, KMS key availability, object storage bucket, and the audit-log sink. Each dependency has its own owner and is listed in the service dependency register.
+- **FX quote provenance:** configure `PAYOUT_FX_QUOTE_SECRET` as a secret-manager value of at least 32 characters, shared by every application instance. In production, set `PAYOUT_DATA_DIR` to durable storage and back up the append-only `payout_audit_ledger.jsonl`; it contains quote inputs, provider response identifiers, rounding policy, expiry, and final transfer values. Do not store signed quote tokens in application logs. Retain the signing secret for the lifetime of every unexpired quote and any required audit verification period.
 
 ## 3. Restore permissions
 
@@ -46,6 +47,7 @@ Scope: durable payout state — payout **intents**, **idempotency records**, and
 - **Counts:** intent counts by state, idempotency record counts, and audit entry counts match the pre-incident baseline within the RPO window.
 - **Audit continuity:** audit log is append-only and gap-free across the restore boundary; no reordering or mutation of prior entries.
 - **Idempotency:** replaying a known request key returns the original stored response and does **not** create a new transfer.
+- **Quote linkage:** verify each in-flight payout's audited quote ID, quote inputs, expiry at initiation, currency, minor-unit amount, and provider reference/transfer identifiers against provider state. A quote may not be edited or reused to authorize a different amount.
 - **In-flight transfers:** every intent in a non-terminal state is enumerated and matched to a provider/chain reference (Section 6).
 
 ## 6. Reconciliation before writes resume

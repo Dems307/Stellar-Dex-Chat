@@ -8,6 +8,16 @@ import {
   getProviderCircuitBreaker,
   handlePayoutApiError,
 } from '@/lib/payout/circuitBreaker';
+import {
+  extractOrGenerateCorrelationId,
+  validationError,
+  authorizationError,
+} from '@/lib/payout/errors';
+import { resolveCallerIdentity } from '@/lib/payout/auth';
+import {
+  getWalletIdentityScope,
+  issueBeneficiaryVerification,
+} from '@/lib/payout/beneficiaryVerification';
 
 const RATE_LIMIT = { maxRequests: 10, windowMs: 60_000 };
 
@@ -24,8 +34,11 @@ export async function POST(request: NextRequest) {
   // rate limiting, parsing, or provider calls.
   const securityBlocked = enforcePayoutRouteSecurity(request);
   if (securityBlocked) return securityBlocked;
+  const apiVersionBlocked = enforcePayoutApiVersion(request);
+  if (apiVersionBlocked) return apiVersionBlocked;
 
   const ip = getClientIp(request);
+  const correlationId = extractOrGenerateCorrelationId(request.headers);
 
   const limited = applyRateLimit(ip, '/api/verify-account', RATE_LIMIT);
   if (limited) return limited;
@@ -38,6 +51,17 @@ export async function POST(request: NextRequest) {
   );
 
   try {
+    const identity = await resolveCallerIdentity(request);
+    const identityScope = getWalletIdentityScope(identity);
+    if (!identityScope) {
+      return authorizationError({
+        status: 401,
+        message:
+          'A verified wallet session is required to verify payout details',
+        correlationId,
+      });
+    }
+
     telemetry.addLog(span.spanId, 'info', 'Starting account verification', {
       endpoint: '/api/verify-account',
       correlationId,
@@ -68,7 +92,10 @@ export async function POST(request: NextRequest) {
 
     if (!validationResult.success) {
       telemetry.addLog(span.spanId, 'warn', 'Zod validation failed', {
-        errors: validationResult.error.issues,
+        errors: validationResult.error.issues.map(({ path, code }) => ({
+          path,
+          code,
+        })),
         correlationId,
       });
       telemetry.finishSpan(span.spanId, {
@@ -88,55 +115,84 @@ export async function POST(request: NextRequest) {
     telemetry.addLog(span.spanId, 'info', 'Request validated', {
       hasAccountNumber: !!accountNumber,
       hasBankCode: !!bankCode,
-      bankCode: bankCode,
       correlationId,
     });
 
     const provider = getPayoutProvider();
-    const breaker = getProviderCircuitBreaker(provider.name);
+    const breaker = getProviderCircuitBreaker(
+      provider.name,
+      'account_verification',
+    );
 
     const data = await breaker.execute(() =>
       provider.verifyAccount({ accountNumber, bankCode }),
     );
+    const accountName =
+      'accountName' in data && typeof data.accountName === 'string'
+        ? data.accountName
+        : 'account_name' in data && typeof data.account_name === 'string'
+          ? data.account_name
+          : '';
+    if (!accountName) {
+      throw new Error('Verification provider returned no account name');
+    }
+
+    const authorization = issueBeneficiaryVerification({
+      accountNumber,
+      bankCode,
+      currency: 'NGN',
+      identityScope,
+      accountName,
+    });
 
     telemetry.finishSpan(span.spanId, { success: true });
 
-    const apiResponse = NextResponse.json({ success: true, data });
+    const apiResponse = NextResponse.json({
+      success: true,
+      data: {
+        account_name: accountName,
+        accountNumberMasked: authorization.accountNumberMasked,
+        verificationToken: authorization.verificationToken,
+        verificationExpiresAt: authorization.expiresAt,
+      },
+    });
     apiResponse.headers.set('X-Correlation-Id', correlationId);
     telemetry.setTraceHeaders(apiResponse.headers, traceContext);
     return apiResponse;
   } catch (error: unknown) {
-    logStructuredError('verify-account', error, {
-      endpoint: '/api/verify-account',
-      correlationId,
-      ip: getClientIp(request),
-    });
-
     telemetry.addLog(
       span.spanId,
       'error',
       'Unhandled error in account verification',
       {
-        error: error instanceof Error ? error.message : 'Unknown error',
+        errorType: error instanceof Error ? error.name : 'UnknownError',
         correlationId,
       },
     );
 
-    console.error('Account verification error:', error);
-
     const errorDetails = handlePayoutApiError(
       error,
-      'Account verification failed. Please try again.',
+      'Account verification failed. Check the details and try again.',
     );
+    const safeMessage =
+      errorDetails.status >= 500
+        ? 'Account verification is temporarily unavailable. Please try again.'
+        : 'Account verification failed. Check the details and try again.';
 
     telemetry.finishSpan(span.spanId, {
       success: false,
-      error: errorDetails.body.message,
+      error: safeMessage,
     });
 
-    return NextResponse.json(errorDetails.body, {
+    return NextResponse.json(
+      {
+        ...errorDetails.body,
+        message: safeMessage,
+      },
+      {
       status: errorDetails.status,
       headers: errorDetails.headers,
-    });
+      },
+    );
   }
 }

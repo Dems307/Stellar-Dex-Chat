@@ -4,6 +4,11 @@
  * Decouples provider-specific transport, headers, secrets, and response shapes from domain logic.
  */
 
+import type {
+  ProviderSettlementCalendar,
+  SettlementEstimate,
+} from '../settlementCalendar';
+
 export type PayoutProviderName = 'paystack' | 'fake';
 
 /**
@@ -11,11 +16,7 @@ export type PayoutProviderName = 'paystack' | 'fake';
  * Every provider adapter maps proprietary provider statuses to this canonical set.
  */
 export type NormalizedPayoutStatus =
-  | 'pending'
-  | 'success'
-  | 'failed'
-  | 'reversed'
-  | 'cancelled';
+  'pending' | 'success' | 'failed' | 'reversed' | 'cancelled';
 
 /**
  * Standardized error categories returned by provider adapters.
@@ -115,7 +116,35 @@ export interface InitiateTransferInput {
   amount: number | string;
   recipient: string;
   reference?: string;
+  idempotencyKey?: string;
+  currency?: string;
   credentialVersion?: string;
+}
+
+export interface InitiatedTransfer {
+  reference: string;
+  status: NormalizedPayoutStatus;
+  providerReference?: string;
+  transferCode?: string;
+  amountMinor?: bigint;
+  currency?: string;
+  recipientCode?: string;
+  credentialVersion?: string;
+  settlementEstimate?: SettlementEstimate;
+  rawResponse?: unknown;
+}
+
+export interface InitiatedTransfer {
+  reference: string;
+  status?: string;
+  id?: string | number;
+  transfer_code?: string;
+  transferCode?: string;
+  providerReference?: string;
+  amount?: number;
+  amountMinor?: number | bigint;
+  currency?: string;
+  rawResponse?: unknown;
 }
 
 // Backward compatibility alias
@@ -163,6 +192,7 @@ export interface CancelTransferResult {
 
 export interface PayoutProvider {
   name: PayoutProviderName;
+  settlementCalendars?: readonly ProviderSettlementCalendar[];
 
   verifyAccount(input: VerifyAccountInput): Promise<VerifyAccountResult>;
   createRecipient(input: CreateRecipientInput): Promise<CreateRecipientResult>;
@@ -172,7 +202,5 @@ export interface PayoutProvider {
   checkTransferStatus(
     input: TransferStatusInput,
   ): Promise<TransferStatusResult>;
-  cancelTransfer?(
-    input: CancelTransferInput,
-  ): Promise<CancelTransferResult>;
+  cancelTransfer?(input: CancelTransferInput): Promise<CancelTransferResult>;
 }

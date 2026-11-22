@@ -6,6 +6,7 @@ import {
   isOriginAllowed,
   rejectDisallowedOrigin,
 } from '@/lib/security/cors';
+import { generateCsrfToken } from '@/lib/payout/security';
 
 const TIMESTAMP_TOLERANCE_MS = 5 * 60 * 1000; // 5 minutes
 
@@ -67,6 +68,7 @@ export async function POST(request: NextRequest) {
 
     // Bind the session to the verified address only; never echo client input.
     const session = createWalletSessionToken(address);
+    const csrfToken = generateCsrfToken();
 
     const response = NextResponse.json({
       success: true,
@@ -74,6 +76,7 @@ export async function POST(request: NextRequest) {
         sessionToken: session.sessionToken,
         expiresAt: session.expiresAt,
         address: session.address,
+        csrfToken,
       },
     });
 

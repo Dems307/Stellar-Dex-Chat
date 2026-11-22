@@ -42,6 +42,7 @@ export const serverSchema = z.object({
   ADMIN_IP_ALLOWLIST: z.string().optional(),
   ADMIN_IP_ALLOWLIST_BYPASS_LOCAL: z.preprocess(parseBooleanFlag, z.boolean().default(false)),
   ADMIN_SECRET: z.string().optional(),
+  PAYOUT_FX_QUOTE_SECRET: z.string().optional(),
   GEMINI_API_KEY: z.string().optional(),
   // Comma-separated list of trusted browser origins allowed to call financial routes.
   CORS_ALLOWED_ORIGINS: z.preprocess(parseAllowedOrigins, z.array(z.string()).default([])),
@@ -51,14 +52,36 @@ export const serverSchema = z.object({
 
 const processServerEnvVars = () => {
   const serverVars = {
-    PAYSTACK_SECRET_KEY: typeof process !== 'undefined' ? process.env.PAYSTACK_SECRET_KEY : undefined,
-    PAYOUT_PROVIDER: typeof process !== 'undefined' ? process.env.PAYOUT_PROVIDER : undefined,
-    ADMIN_IP_ALLOWLIST: typeof process !== 'undefined' ? process.env.ADMIN_IP_ALLOWLIST : undefined,
-    ADMIN_IP_ALLOWLIST_BYPASS_LOCAL: typeof process !== 'undefined' ? process.env.ADMIN_IP_ALLOWLIST_BYPASS_LOCAL : undefined,
-    ADMIN_SECRET: typeof process !== 'undefined' ? process.env.ADMIN_SECRET : undefined,
-    GEMINI_API_KEY: typeof process !== 'undefined' ? process.env.GEMINI_API_KEY : undefined,
-    CORS_ALLOWED_ORIGINS: typeof process !== 'undefined' ? process.env.CORS_ALLOWED_ORIGINS : undefined,
-    CORS_ALLOW_CREDENTIALS: typeof process !== 'undefined' ? process.env.CORS_ALLOW_CREDENTIALS : undefined,
+    PAYSTACK_SECRET_KEY:
+      typeof process !== 'undefined'
+        ? process.env.PAYSTACK_SECRET_KEY
+        : undefined,
+    PAYOUT_PROVIDER:
+      typeof process !== 'undefined' ? process.env.PAYOUT_PROVIDER : undefined,
+    ADMIN_IP_ALLOWLIST:
+      typeof process !== 'undefined'
+        ? process.env.ADMIN_IP_ALLOWLIST
+        : undefined,
+    ADMIN_IP_ALLOWLIST_BYPASS_LOCAL:
+      typeof process !== 'undefined'
+        ? process.env.ADMIN_IP_ALLOWLIST_BYPASS_LOCAL
+        : undefined,
+    ADMIN_SECRET:
+      typeof process !== 'undefined' ? process.env.ADMIN_SECRET : undefined,
+    PAYOUT_FX_QUOTE_SECRET:
+      typeof process !== 'undefined'
+        ? process.env.PAYOUT_FX_QUOTE_SECRET
+        : undefined,
+    GEMINI_API_KEY:
+      typeof process !== 'undefined' ? process.env.GEMINI_API_KEY : undefined,
+    CORS_ALLOWED_ORIGINS:
+      typeof process !== 'undefined'
+        ? process.env.CORS_ALLOWED_ORIGINS
+        : undefined,
+    CORS_ALLOW_CREDENTIALS:
+      typeof process !== 'undefined'
+        ? process.env.CORS_ALLOW_CREDENTIALS
+        : undefined,
   };
 
   const parsed = serverSchema.safeParse(serverVars);
