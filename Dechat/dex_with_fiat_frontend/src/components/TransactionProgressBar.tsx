@@ -1,6 +1,7 @@
 'use client';
 
 import React from 'react';
+import { useRtlDirection } from '@/hooks/useRtlDirection';
 
 export type TransactionStep =
   | 'idle'
@@ -42,6 +43,7 @@ export const TransactionProgressBar: React.FC<TransactionProgressBarProps> = ({
   onRetry,
   onCancel,
 }) => {
+  const { dir } = useRtlDirection();
   const isFailed = currentStep === 'failed';
   const isRetryable = currentStep === 'retryable_error';
   const isSettled = currentStep === 'settled';

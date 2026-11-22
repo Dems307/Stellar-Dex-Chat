@@ -152,7 +152,7 @@ export const beneficiaryTypeSchema = z.preprocess(
  */
 export const beneficiaryCurrencySchema = z.preprocess(
   (val) => (typeof val === 'string' ? val.trim().toUpperCase() : val),
-  z.enum(['NGN', 'GHS', 'KES', 'ZAR', 'USD']),
+  z.enum(['NGN']),
 );
 
 /**
@@ -180,6 +180,7 @@ export const strictCreateRecipientSchema = z
     account_number: nubanAccountNumberSchema,
     bank_code: paystackBankCodeSchema,
     currency: beneficiaryCurrencySchema,
+    verificationToken: z.string().min(1).max(512).optional(),
     country: countrySchema.optional(),
     description: z
       .preprocess(

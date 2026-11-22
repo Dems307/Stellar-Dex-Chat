@@ -1,19 +1,21 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { telemetry } from '@/lib/telemetry';
-import {
-  isReplayEvent,
-  getTransferStatus,
-  setTransferStatus,
-  transitionPayoutStatus,
-  InvalidPayoutTransitionError,
-} from '@/lib/transferStore';
-import { publishPaymentStatus } from '@/lib/paymentStatusEvents';
-import { webhookDeduplicationService } from '@/lib/payout/webhookDeduplication';
-import { payoutReconciliationService } from '@/lib/payout/reconciliation';
-import { serverEnv as env } from '@/lib/serverEnv';
 import crypto from 'crypto';
+import { serverEnv } from '@/lib/serverEnv';
+import { telemetry } from '@/lib/telemetry';
+import { getTransferStatus, setTransferStatus } from '@/lib/transferStore';
+import { publishPaymentStatus } from '@/lib/paymentStatusEvents';
 import { credentialManager } from '@/lib/payout/credentialManager';
-import { applyRateLimit, getClientIp, ROUTE_COST_BUCKETS } from '@/lib/rateLimit';
+import {
+  payoutReconciliationService,
+  type DomainPayoutStatus,
+} from '@/lib/payout/reconciliation';
+import { webhookDeduplicationService } from '@/lib/payout/webhookDeduplication';
+import { payoutReservationLedger } from '@/lib/payout/reservationLedger';
+import {
+  applyRateLimit,
+  getClientIp,
+  ROUTE_COST_BUCKETS,
+} from '@/lib/rateLimit';
 
 interface PaystackWebhookData {
   id?: string | number;
@@ -22,11 +24,41 @@ interface PaystackWebhookData {
   recipient?: string;
   status?: string;
   failure_reason?: string;
+  created_at?: string;
+  updated_at?: string;
 }
 
 interface PaystackWebhookEvent {
   event: string;
+  created_at?: string;
   data: PaystackWebhookData;
+}
+
+function isValidSignature(payload: string, signature: string, secret: string) {
+  if (!/^[\da-f]{128}$/i.test(signature)) return false;
+  const expected = crypto.createHmac('sha512', secret).update(payload).digest();
+  const received = Buffer.from(signature, 'hex');
+  return (
+    received.length === expected.length &&
+    crypto.timingSafeEqual(received, expected)
+  );
+}
+
+function toDomainStatus(
+  status: string | undefined,
+): DomainPayoutStatus | undefined {
+  switch (status) {
+    case 'initiated':
+      return 'pending';
+    case 'pending':
+    case 'success':
+    case 'failed':
+    case 'reversed':
+    case 'cancelled':
+      return status;
+    default:
+      return undefined;
+  }
 }
 
 export async function POST(request: NextRequest) {
@@ -38,140 +70,68 @@ export async function POST(request: NextRequest) {
   );
 
   try {
-    const secretKey = env.PAYSTACK_SECRET_KEY;
-    // Fail-closed: reject immediately if the secret key is not configured.
-    // Never process a webhook without a verified signature.
+    const secretKey = serverEnv.PAYSTACK_SECRET_KEY;
     if (!secretKey) {
-      telemetry.addLog(
-        span.spanId,
-        'error',
-        'Webhook rejected: PAYSTACK_SECRET_KEY is not configured',
-        { endpoint: '/api/webhook' },
-      );
       telemetry.finishSpan(span.spanId, {
         success: false,
         error: 'Missing PAYSTACK_SECRET_KEY',
       });
-      console.error(
-        'PAYSTACK_SECRET_KEY is not configured. Rejecting webhook.',
-      );
       return NextResponse.json(
         { message: 'Webhook processing is not configured' },
         { status: 400 },
       );
     }
 
-    telemetry.addLog(span.spanId, 'info', 'Starting webhook processing', {
-      endpoint: '/api/webhook',
-    });
-
     const payload = await request.text();
     const signature = request.headers.get('x-paystack-signature');
-    const timestamp =
-      request.headers.get('x-paystack-signature-timestamp') ||
-      request.headers.get('x-webhook-timestamp');
-
-    telemetry.addLog(span.spanId, 'info', 'Webhook request parsed', {
-      hasSignature: !!signature,
-      payloadLength: payload.length,
-    });
-
     if (!signature) {
-      // Apply abuse controls to unverified requests
-      const ip = getClientIp(request);
       const limited = applyRateLimit(
-        ip,
+        getClientIp(request),
         '/api/webhook',
-        ROUTE_COST_BUCKETS['/api/webhook'] ?? { maxRequests: 20, windowMs: 60_000 },
+        ROUTE_COST_BUCKETS['/api/webhook'],
       );
       if (limited) return limited;
-
-      telemetry.addLog(span.spanId, 'warn', 'No signature provided', {
-        endpoint: '/api/webhook',
-      });
       telemetry.finishSpan(span.spanId, {
         success: false,
         error: 'No signature provided',
       });
-
       return NextResponse.json(
         { message: 'No signature provided' },
         { status: 401 },
       );
     }
 
-    // Verify signature across active and retiring credentials during bounded rotation overlap (#105)
-    telemetry.addLog(span.spanId, 'info', 'Verifying webhook signature', {
-      endpoint: '/api/webhook',
-    });
-
-    const candidateCreds = credentialManager.getAllWebhookCredentials();
-    const candidateKeys: Array<{ version: string; secretKey: string }> = [];
-
-    for (const cred of candidateCreds) {
-      candidateKeys.push({ version: cred.version, secretKey: cred.secretKey });
-    }
-
-    if (!candidateKeys.some((k) => k.secretKey === secretKey)) {
+    const candidateKeys = credentialManager
+      .getAllWebhookCredentials()
+      .map((credential) => ({
+        version: credential.version,
+        secretKey: credential.secretKey,
+      }));
+    if (!candidateKeys.some((candidate) => candidate.secretKey === secretKey)) {
       candidateKeys.push({ version: 'v1', secretKey });
     }
 
-    let matchedVersion: string | null = null;
-    for (const cred of candidateKeys) {
-      const candidateHash = crypto
-        .createHmac('sha512', cred.secretKey)
-        .update(payload)
-        .digest('hex');
-      if (candidateHash === signature) {
-        matchedVersion = cred.version;
-        break;
-      }
-    }
-
-    if (!matchedVersion) {
-      telemetry.addLog(span.spanId, 'error', 'Invalid webhook signature', {
-        receivedSignature: signature,
-      });
+    const matchedCredential = candidateKeys.find((credential) =>
+      isValidSignature(payload, signature, credential.secretKey),
+    );
+    if (!matchedCredential) {
       telemetry.finishSpan(span.spanId, {
         success: false,
         error: 'Invalid signature',
       });
-
-      console.error('Webhook signature verification failed');
       return NextResponse.json(
         { message: 'Invalid signature' },
         { status: 401 },
       );
     }
-    // Signature verified: request is recognized as a trusted provider callback and excluded from rate limiting
 
-    telemetry.addLog(span.spanId, 'info', 'Webhook signature verified', {
-      endpoint: '/api/webhook',
-      ...credentialManager.logContext(matchedVersion),
-    });
-
-    telemetry.addLog(span.spanId, 'info', 'Webhook signature verified', {
-      endpoint: '/api/webhook',
-    });
-
-    // Step 2: Parse payload into domain state only AFTER signature verification has passed
     let event: PaystackWebhookEvent;
     try {
       event = JSON.parse(payload) as PaystackWebhookEvent;
     } catch {
-      telemetry.addLog(
-        span.spanId,
-        'warn',
-        'Webhook payload is not valid JSON',
-        {
-          endpoint: '/api/webhook',
-          payloadLength: payload.length,
-        },
-      );
       telemetry.finishSpan(span.spanId, {
         success: false,
         error: 'Invalid JSON payload',
-        errorType: 'parse_error',
       });
       return NextResponse.json(
         { message: 'Webhook payload must be valid JSON' },
@@ -179,276 +139,133 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const payloadHash = crypto
-      .createHash('sha256')
-      .update(payload)
-      .digest('hex');
-    const dataId = event?.data?.id;
-    const dataRef = event?.data?.reference;
-    if (!dataId && !dataRef) {
-      telemetry.addLog(
-        span.spanId,
-        'error',
-        'Missing event data id and reference',
-        {
-          eventType: event.event,
-        },
+    if (!event || typeof event.event !== 'string' || !event.data) {
+      return NextResponse.json(
+        { message: 'Webhook event and data are required' },
+        { status: 400 },
       );
-      telemetry.finishSpan(span.spanId, {
-        success: false,
-        error: 'Missing event data id and reference',
-      });
+    }
+
+    const data = event.data;
+    const eventId = String(data.id ?? data.reference ?? '');
+    if (!eventId) {
       return NextResponse.json(
         { message: 'Event data must contain id or reference' },
         { status: 400 },
       );
     }
-    const replayKey = `${event.event}:${dataId ?? dataRef}`;
-    const dedupeEventId = String(dataId ?? dataRef);
 
-    telemetry.addLog(span.spanId, 'info', 'Webhook signature verified', {
-      eventType: event.event,
-      reference: event.data?.reference,
-      replayKey,
-      dedupeEventId,
-    });
-
-    console.log('Received Paystack webhook:', event.event);
-
-    // Durable deduplication and replay protection (Issue #35)
+    const receivedAt = new Date().toISOString();
+    const providerEventAt =
+      data.updated_at || data.created_at || event.created_at || receivedAt;
+    const payloadHash = crypto
+      .createHash('sha256')
+      .update(payload)
+      .digest('hex');
     const { acquired, isDuplicate } =
       await webhookDeduplicationService.acquireOrCheck(
-        dedupeEventId,
+        eventId,
         event.event,
         payloadHash,
-        dataRef,
+        data.reference,
       );
 
     if (!acquired && isDuplicate) {
-      telemetry.addLog(
-        span.spanId,
-        'info',
-        'Durable duplicate webhook recognized',
-        {
-          dedupeEventId,
-          eventType: event.event,
-        },
-      );
-      telemetry.finishSpan(span.spanId, { success: true, duplicate: true });
-
-      const duplicateResponse = NextResponse.json({
+      const response = NextResponse.json({
         received: true,
         duplicate: true,
       });
-      telemetry.setTraceHeaders(duplicateResponse.headers, traceContext);
-      return duplicateResponse;
+      telemetry.setTraceHeaders(response.headers, traceContext);
+      return response;
     }
 
     try {
-      const data = event.data ?? {};
       const payoutReference = data.reference ?? '';
       const existingRecord = getTransferStatus(payoutReference);
-
-      // Reconcile out-of-order events with monotonic domain transitions (Issue #36)
       const reconciliation = payoutReconciliationService.reconcileEvent({
-        eventId: dedupeEventId,
+        eventId,
         payoutReference,
         eventType: event.event,
-        currentStatus:
-          existingRecord?.status && existingRecord.status !== 'initiated'
-            ? existingRecord.status
-            : undefined,
+        currentStatus: toDomainStatus(existingRecord?.status),
         payload: data as Record<string, unknown>,
         correlationId: traceContext.traceId,
+        providerEventAt,
+        receivedAt,
       });
 
-      const evidenceStatus = payoutReconciliationService.mapEventToStatus(
-        event.event,
-      );
-      if (evidenceStatus) {
-        payoutReconciliationService.reconcileEvidence({
+      if (
+        (reconciliation.decision === 'REJECTED_OUT_OF_ORDER' &&
+          reconciliation.effectiveStatus ===
+            (toDomainStatus(existingRecord?.status) || 'pending')) ||
+        reconciliation.decision === 'IDEMPOTENT_NOOP' ||
+        reconciliation.decision === 'UNRECOGNIZED_EVENT'
+      ) {
+        webhookDeduplicationService.commit(eventId);
+        const response = NextResponse.json({
+          received: true,
+          status:
+            reconciliation.decision === 'REJECTED_OUT_OF_ORDER'
+              ? 'ignored_out_of_order'
+              : reconciliation.decision === 'IDEMPOTENT_NOOP'
+                ? 'already_applied'
+                : 'ignored',
+        });
+        telemetry.setTraceHeaders(response.headers, traceContext);
+        return response;
+      }
+
+      const status = reconciliation.effectiveStatus;
+      const updatedAt = receivedAt;
+      const nextRecord = setTransferStatus({
+        reference: payoutReference,
+        status,
+        amount: Number(data.amount ?? existingRecord?.amount ?? 0),
+        failureReason: status === 'failed' ? data.failure_reason : undefined,
+        updatedAt,
+        clientSessionId: existingRecord?.clientSessionId,
+        providerEventAt: new Date(providerEventAt).toISOString(),
+        webhookReceivedAt: receivedAt,
+      });
+
+      const reservation =
+        payoutReservationLedger.getReservationByProviderReference(
           payoutReference,
-          evidence: [
-            {
-              source: 'signed_webhook',
-              status: evidenceStatus,
-              observedAt: new Date().toISOString(),
-              reference: payoutReference,
-              evidenceId: dedupeEventId,
-              signatureVerified: true,
-              amountMinor:
-                typeof data.amount === 'number'
-                  ? String(data.amount)
-                  : undefined,
-              payload: data as Record<string, unknown>,
-            },
-          ],
-        });
-      }
-
-      if (reconciliation.decision === 'REJECTED_OUT_OF_ORDER') {
-        telemetry.addLog(
-          span.spanId,
-          'warn',
-          'Out-of-order webhook event rejected',
-          {
-            eventId: dedupeEventId,
-            reference: payoutReference,
-            currentStatus: existingRecord?.status,
-            targetStatus: reconciliation.targetStatus,
-            reason: reconciliation.reason,
-          },
         );
-
-        // Commit dedupe record atomically to prevent repeated rejection churn
-        webhookDeduplicationService.commit(dedupeEventId);
-        telemetry.finishSpan(span.spanId, {
-          success: true,
-          rejectedOutOfOrder: true,
-        });
-
-        const resp = NextResponse.json({
-          received: true,
-          status: 'ignored_out_of_order',
-        });
-        telemetry.setTraceHeaders(resp.headers, traceContext);
-        return resp;
-      }
-
-      if (reconciliation.decision === 'IDEMPOTENT_NOOP') {
-        webhookDeduplicationService.commit(dedupeEventId);
-        telemetry.finishSpan(span.spanId, { success: true, idempotent: true });
-
-        const resp = NextResponse.json({
-          received: true,
-          status: 'already_applied',
-        });
-        telemetry.setTraceHeaders(resp.headers, traceContext);
-        return resp;
-      }
-
-      // Handle valid domain transitions
-      const updatedAt = new Date().toISOString();
-
-      switch (event.event) {
-        case 'transfer.success': {
-          telemetry.addLog(span.spanId, 'info', 'Processing transfer success', {
-            reference: data.reference,
-            amount: data.amount,
-            recipient: data.recipient,
-            status: data.status,
-          });
-          console.log('Transfer successful:', {
-            reference: data.reference,
-            amount: data.amount,
-            recipient: data.recipient,
-            status: data.status,
-          });
-          const nextRecord = setTransferStatus({
-            reference: data.reference ?? '',
-            status: 'success',
-            amount: Number(data.amount ?? 0),
-            updatedAt,
-            clientSessionId: existingRecord?.clientSessionId,
-          });
-          publishPaymentStatus(nextRecord.clientSessionId, {
-            reference: nextRecord.reference,
-            status: nextRecord.status,
-            amount: nextRecord.amount,
-            updatedAt,
-          });
-          break;
-        }
-
-        case 'transfer.failed': {
-          telemetry.addLog(span.spanId, 'warn', 'Processing transfer failure', {
-            reference: data.reference,
-            amount: data.amount,
-            recipient: data.recipient,
-            status: data.status,
-            failureReason: data.failure_reason,
-          });
-          console.log('Transfer failed:', {
-            reference: data.reference,
-            amount: data.amount,
-            recipient: data.recipient,
-            status: data.status,
-            failure_reason: data.failure_reason,
-          });
-          const nextRecord = setTransferStatus({
-            reference: data.reference ?? '',
-            status: 'failed',
-            amount: Number(data.amount ?? 0),
-            failureReason: data.failure_reason,
-            updatedAt,
-            clientSessionId: existingRecord?.clientSessionId,
-          });
-          publishPaymentStatus(nextRecord.clientSessionId, {
-            reference: nextRecord.reference,
-            status: nextRecord.status,
-            amount: nextRecord.amount,
-            updatedAt,
-            failureReason: nextRecord.failureReason,
-          });
-          break;
-        }
-
-        case 'transfer.reversed': {
-          telemetry.addLog(
-            span.spanId,
-            'info',
-            'Processing transfer reversal',
-            {
-              reference: data.reference,
-              amount: data.amount,
-              recipient: data.recipient,
-              status: data.status,
-            },
+      if (reservation) {
+        if (status === 'success') {
+          payoutReservationLedger.settle(reservation.payoutId, receivedAt);
+        } else if (status === 'failed') {
+          payoutReservationLedger.release(reservation.payoutId, receivedAt);
+        } else if (status === 'reversed') {
+          payoutReservationLedger.markUnderReview(
+            reservation.payoutId,
+            receivedAt,
           );
-          console.log('Transfer reversed:', {
-            reference: data.reference,
-            amount: data.amount,
-            recipient: data.recipient,
-            status: data.status,
-          });
-          const nextRecord = setTransferStatus({
-            reference: data.reference ?? '',
-            status: 'reversed',
-            amount: Number(data.amount ?? 0),
-            updatedAt,
-            clientSessionId: existingRecord?.clientSessionId,
-          });
-          publishPaymentStatus(nextRecord.clientSessionId, {
-            reference: nextRecord.reference,
-            status: nextRecord.status,
-            amount: nextRecord.amount,
-            updatedAt,
-          });
-          break;
         }
-
-        default:
-          telemetry.addLog(span.spanId, 'info', 'Unhandled webhook event', {
-            eventType: event.event,
-          });
-          console.log('Unhandled webhook event:', event.event);
       }
 
-      // Commit dedupe record atomically with state transition
-      webhookDeduplicationService.commit(dedupeEventId);
-      isReplayEvent(replayKey);
-
-      telemetry.addLog(span.spanId, 'info', 'Webhook processing completed', {
-        eventType: event.event,
+      publishPaymentStatus(nextRecord.clientSessionId, {
+        reference: nextRecord.reference,
+        status: nextRecord.status,
+        amount: nextRecord.amount,
+        updatedAt,
+        ...(nextRecord.failureReason
+          ? { failureReason: nextRecord.failureReason }
+          : {}),
       });
-      telemetry.finishSpan(span.spanId, { success: true });
+
+      webhookDeduplicationService.commit(eventId);
+      telemetry.finishSpan(span.spanId, {
+        success: true,
+        credentialVersion: matchedCredential.version,
+      });
 
       const response = NextResponse.json({ received: true });
       telemetry.setTraceHeaders(response.headers, traceContext);
       return response;
-    } catch (processError) {
-      webhookDeduplicationService.releaseOnError(dedupeEventId);
-      throw processError;
+    } catch (error) {
+      webhookDeduplicationService.releaseOnError(eventId);
+      throw error;
     }
   } catch (error) {
     telemetry.addLog(span.spanId, 'error', 'Webhook processing error', {
@@ -457,9 +274,7 @@ export async function POST(request: NextRequest) {
     telemetry.finishSpan(span.spanId, {
       success: false,
       error: 'Webhook processing failed',
-      errorType: 'processing_error',
     });
-
     console.error('Webhook processing error:', error);
     return NextResponse.json(
       { message: 'Webhook processing failed' },
