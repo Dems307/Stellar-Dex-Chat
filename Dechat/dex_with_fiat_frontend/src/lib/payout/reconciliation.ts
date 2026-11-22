@@ -52,6 +52,96 @@ export interface ReconciliationDecision {
   reason?: string;
 }
 
+export type ReconciliationAlertState =
+  | 'OK'
+  | 'PENDING_AGING'
+  | 'FAILED_UNRESOLVED'
+  | 'REVERSED_UNRESOLVED'
+  | 'TOTALS_MISMATCH';
+
+export interface ReconciliationSourceEvidence {
+  providerReferences: string[];
+  transactionHashes: string[];
+  auditEntryIds: string[];
+}
+
+export interface UnresolvedPayoutRecord {
+  payoutReference: string;
+  status: DomainPayoutStatus;
+  amountMinor: number;
+  currency?: string;
+  createdAt: string;
+  providerReference?: string;
+  transactionHash?: string;
+  auditEntryIds?: string[];
+}
+
+export interface ReconciliationSloEntry {
+  payoutReference: string;
+  status: DomainPayoutStatus;
+  ageSeconds: number;
+  ageHours: number;
+  amountAtRiskMinor: number;
+  currency?: string;
+  nextAction: string;
+  alertState: ReconciliationAlertState;
+  runbookUrl: string;
+  evidence: ReconciliationSourceEvidence;
+}
+
+export interface ReconciliationSloThresholds {
+  pendingAgingSeconds: number;
+  failedUnresolvedSeconds: number;
+  reversedUnresolvedSeconds: number;
+}
+
+export const DEFAULT_RECONCILIATION_SLO_THRESHOLDS: ReconciliationSloThresholds =
+  {
+    pendingAgingSeconds: 60 * 60,
+    failedUnresolvedSeconds: 24 * 60 * 60,
+    reversedUnresolvedSeconds: 24 * 60 * 60,
+  };
+
+export const RECONCILIATION_RUNBOOK_BASE_URL =
+  'https://github.com/Dechat/dex_with_fiat_frontend/blob/main/docs/runbooks/payout-reconciliation.md';
+
+export function getRunbookUrlForAlertState(
+  alertState: ReconciliationAlertState,
+): string {
+  const anchorByState: Record<ReconciliationAlertState, string> = {
+    OK: 'healthy-state',
+    PENDING_AGING: 'pending-payout-aging',
+    FAILED_UNRESOLVED: 'failed-payout-unresolved',
+    REVERSED_UNRESOLVED: 'reversed-payout-unresolved',
+    TOTALS_MISMATCH: 'reconciliation-totals-mismatch',
+  };
+  return `${RECONCILIATION_RUNBOOK_BASE_URL}#${anchorByState[alertState]}`;
+}
+
+export interface ReconciliationTotals {
+  pendingCount: number;
+  pendingAmountMinor: number;
+  failedCount: number;
+  failedAmountMinor: number;
+  atRiskCount: number;
+  atRiskAmountMinor: number;
+}
+
+export interface ReconciliationTotalsMismatch {
+  field: keyof ReconciliationTotals;
+  expected: number;
+  actual: number;
+  delta: number;
+}
+
+export interface ReconciliationTotalsVerification {
+  ok: boolean;
+  computed: ReconciliationTotals;
+  db: ReconciliationTotals;
+  mismatches: ReconciliationTotalsMismatch[];
+  runbookUrl: string;
+}
+
 export class PayoutReconciliationService {
   private rejectedEvents: RejectedEventRecord[] = [];
   private webhookEvents: PayoutWebhookEventRecord[] = [];
