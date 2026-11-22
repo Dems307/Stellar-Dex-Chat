@@ -89,6 +89,12 @@ fixtures deterministic and free of secrets so the corpus can run in CI.
 
 ## Pull request checklist
 
+Every pull request is prefilled with the [PR template](../.github/PULL_REQUEST_TEMPLATE.md).
+Complete all sections that apply; a CI job (`PR Checklist Validation`) will
+fail if required items are left unchecked when the corresponding paths change.
+
+### Contract / ABI changes
+
 - [ ] Contract interface changes include regenerated bindings.
 - [ ] The CI drift check passes with no ABI diff.
 - [ ] Breaking changes are documented and versioned as described above.
