@@ -452,6 +452,7 @@ Repo Avatar
 - **integration:** Catch integration failures across intent, signing, and payout
 - **contract:** Event schemas, resource budgets, upgrade compatibility, and adversarial fixtures
 - **api:** Harden payout lifecycle with reconciliation, minor units, ownership auth, and provider adapters
+- Add signed release attestations for contract and frontend artifacts
 - **i18n:** Add localization QA fixtures for financial edge cases
 - Add rollback-safe frontend and API release health gates
 - **security:** Add release-time secret scanning with exception policy
@@ -1346,6 +1347,7 @@ Repo Avatar
 - **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
 - **fault-injection:** Add fault-injection tests for DB, RPC, and provider outages
+- **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
