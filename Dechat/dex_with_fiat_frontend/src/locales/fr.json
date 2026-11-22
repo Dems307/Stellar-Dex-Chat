@@ -61,6 +61,21 @@
     "yesterday": "Hier"
   },
   "errors": {
+    "wallet": {
+      "disconnected": "Votre portefeuille n'est pas connecte. Connectez Freighter pour continuer.",
+      "session_expired": "Votre session de portefeuille a expire. Reconnectez Freighter pour continuer.",
+      "user_declined": "Vous avez refuse la transaction dans Freighter. Revisez et approuvez-la quand vous etes pret.",
+      "context_changed": "Votre compte ou reseau a change pendant la transaction. Confirmez le nouveau contexte et reconstruisez.",
+      "unknown": "Une erreur de portefeuille inattendue s'est produite. Veuillez reessayer."
+    },
+    "api": {
+      "network": "La requete reseau a echoue. Verifiez votre connexion et reessayez.",
+      "rate_limited": "Trop de requetes. Attendez un moment et reessayez.",
+      "server": "Le serveur a rencontre une erreur. Reessayez ou contactez le support.",
+      "unauthorized": "Vous n'etes pas autorise. Reconnectez votre portefeuille et reessayez.",
+      "validation": "Les donnees soumises sont invalides. Verifiez le formulaire et reessayez.",
+      "unknown": "Une erreur inattendue s'est produite. Veuillez reessayer."
+    },
     "101": "Le contrat n'a pas été initialisé.",
     "102": "Le contrat a déjà été initialisé.",
     "103": "Un invariant interne a été violé.",

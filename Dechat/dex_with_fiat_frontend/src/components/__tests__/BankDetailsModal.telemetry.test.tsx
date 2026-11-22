@@ -169,7 +169,12 @@ describe('BankDetailsModal - Telemetry Tracking', () => {
         ok: true,
         json: async () => ({
           success: true,
-          data: { account_name: 'John Doe' },
+          data: {
+            account_name: 'John Doe',
+            accountNumberMasked: '******7890',
+            verificationToken: 'test-verification-token',
+            verificationExpiresAt: new Date(Date.now() + 300_000).toISOString(),
+          },
         }),
       });
 
