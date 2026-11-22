@@ -456,6 +456,7 @@ Repo Avatar
 - **a11y:** Standardize accessible error summaries for API and wallet failures
 - **rtl:** Add right-to-left layout support for wallet and payout flows
 - **payout:** Stream status updates with bounded replay
+- **perf:** Enforce audit and chat performance budgets
 
 ### Fixed
 
@@ -953,6 +954,7 @@ Repo Avatar
 - #124 ops: automate production readiness and canary verification
 - #125 ci: enforce least-privilege path-aware workflows and required
 - #126 test(e2e): run full-stack flows against disposable Soroban and
+- **payout:** Isolate circuits by provider operation
 - #217 Add tenant-aware AI budget accounting with atomic reservations
 - #218 Support cancellation and timeout propagation through every mod
 - #219 Add privacy-safe retention controls for model traces and evalu
@@ -1322,6 +1324,7 @@ Repo Avatar
 - **changelog:** Update changelog [skip ci]
 - **wallet:** Cover freighter transitions and account isolation
 - **locale:** Cover timezone and localized numeric boundaries
+- **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
 
 ### Deprecated
