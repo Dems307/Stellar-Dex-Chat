@@ -1,5 +1,18 @@
+import crypto from 'crypto';
 import axios from 'axios';
 import { credentialManager } from '../credentialManager';
+import { toMinorUnits } from '../minorUnits';
+import {
+  estimateSettlementWindow,
+  PAYSTACK_SETTLEMENT_CALENDARS,
+} from '../settlementCalendar';
+import { PayoutProviderError } from './types';
+import {
+  ProviderIdempotencyReconciliationRequiredError,
+  providerIdempotencyRegistry,
+} from '../providerIdempotency';
+import { executeWithTimeoutBudget } from '../timeoutBudget';
+
 import type {
   CancelTransferInput,
   CancelTransferResult,
@@ -7,227 +20,459 @@ import type {
   CreatedRecipient,
   InitiatedTransfer,
   InitiateTransferInput,
+  InitiateTransferResult,
   NormalizedPayoutStatus,
   PayoutProvider,
   TransferStatus,
   TransferStatusInput,
-  VerifiedAccount,
+  TransferStatusResult,
   VerifyAccountInput,
+  VerifyAccountResult,
 } from './types';
 import { PayoutProviderError } from './types';
 
-function normalizeStatus(status?: string): NormalizedPayoutStatus {
-  const value = (status || 'pending').toLowerCase();
-  if (value === 'success') return 'success';
-  if (value === 'reversed') return 'reversed';
-  if (value === 'cancelled' || value === 'canceled') return 'cancelled';
-  if (value === 'failed' || value === 'rejected') return 'failed';
-  return 'pending';
+const DEFAULT_IDEMPOTENCY_WINDOW_MS = 24 * 60 * 60 * 1000;
+const PAYSTACK_IDEMPOTENCY_WINDOW_MS = Number(
+  process.env.PAYSTACK_IDEMPOTENCY_WINDOW_MS || DEFAULT_IDEMPOTENCY_WINDOW_MS,
+);
+
+if (
+  !Number.isSafeInteger(PAYSTACK_IDEMPOTENCY_WINDOW_MS) ||
+  PAYSTACK_IDEMPOTENCY_WINDOW_MS <= 0
+) {
+  throw new Error('PAYSTACK_IDEMPOTENCY_WINDOW_MS must be a positive integer');
 }
 
-function headers(secretKey: string) {
+export function toKobo(amountNgn: number): number {
+  return Math.round(amountNgn * 100);
+}
+
+function paystackHeaders(secretKey: string) {
   return {
     Authorization: `Bearer ${secretKey}`,
     'Content-Type': 'application/json',
   };
 }
 
-export const paystackProvider: PayoutProvider = {
-  name: 'paystack',
+function normalizePaystackStatus(status?: string): NormalizedPayoutStatus {
+  switch (status?.toLowerCase()) {
+    case 'success':
+      return 'success';
+    case 'failed':
+    case 'rejected':
+      return 'failed';
+    case 'reversed':
+      return 'reversed';
+    case 'cancelled':
+    case 'canceled':
+      return 'cancelled';
+    default:
+      return 'pending';
+  }
+}
 
-  async verifyAccount(
-    input: VerifyAccountInput,
-  ): Promise<VerifiedAccount> {
+function asRecord(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== 'object') {
+    throw new Error('Paystack returned an invalid response');
+  }
+  return value as Record<string, unknown>;
+}
+
+function toInitiatedTransfer(
+  response: Record<string, unknown>,
+  input: InitiateTransferInput,
+  providerKey: string,
+  credentialVersion: string,
+): InitiatedTransfer {
+  const reference =
+    typeof response.reference === 'string' && response.reference
+      ? response.reference
+      : providerKey;
+  const amountMinor =
+    typeof response.amount === 'number' && Number.isSafeInteger(response.amount)
+      ? BigInt(response.amount)
+      : toMinorUnits(input.amount, input.currency || 'NGN');
+
+  return {
+    reference,
+    status: normalizePaystackStatus(
+      typeof response.status === 'string' ? response.status : undefined,
+    ),
+    providerReference:
+      typeof response.id === 'string' || typeof response.id === 'number'
+        ? String(response.id)
+        : reference,
+    transferCode:
+      typeof response.transfer_code === 'string'
+        ? response.transfer_code
+        : undefined,
+    amountMinor,
+    currency:
+      typeof response.currency === 'string'
+        ? response.currency
+        : input.currency || 'NGN',
+    recipientCode:
+      typeof response.recipient === 'string'
+        ? response.recipient
+        : input.recipient,
+    credentialVersion,
+    rawResponse: response,
+  };
+}
+
+function getErrorStatus(error: unknown): number | undefined {
+  if (error instanceof PayoutProviderError) return error.statusCode;
+  if (!axios.isAxiosError(error)) return undefined;
+  return error.response?.status;
+}
+
+function toProviderError(error: unknown): PayoutProviderError {
+  if (error instanceof PayoutProviderError) return error;
+
+  const statusCode = getErrorStatus(error);
+  const response = axios.isAxiosError(error) ? error.response?.data : undefined;
+  const message =
+    error instanceof Error ? error.message : 'Unknown Paystack error';
+  const providerMessage =
+    response && typeof response === 'object' && 'message' in response
+      ? String(response.message)
+      : message;
+  const retryable =
+    statusCode === undefined ||
+    statusCode === 408 ||
+    statusCode === 429 ||
+    statusCode >= 500;
+
+  return new PayoutProviderError({
+    message: providerMessage,
+    code:
+      statusCode === 401 || statusCode === 403
+        ? 'AUTHENTICATION_ERROR'
+        : retryable
+          ? 'PROVIDER_UNAVAILABLE'
+          : statusCode === 404
+            ? 'ACCOUNT_NOT_FOUND'
+            : 'INVALID_REQUEST',
+    statusCode,
+    retryable,
+    rawResponse: response,
+  });
+}
+
+function getFingerprint(input: InitiateTransferInput): string {
+  const amountMinor = toMinorUnits(input.amount, input.currency || 'NGN');
+  const canonical = JSON.stringify({
+    source: input.source,
+    amountMinor: amountMinor.toString(),
+    currency: (input.currency || 'NGN').toUpperCase(),
+    recipient: input.recipient,
+    reason: input.reason || 'Crypto withdrawal',
+  });
+  return crypto.createHash('sha256').update(canonical).digest('hex');
+}
+
+function addSettlementEstimate(
+  transfer: InitiatedTransfer,
+  initiatedAt = new Date(),
+): InitiatedTransfer {
+  const currency = transfer.currency?.toUpperCase();
+  const calendar = currency
+    ? PAYSTACK_SETTLEMENT_CALENDARS[currency]
+    : undefined;
+  if (!calendar) return transfer;
+  return {
+    ...transfer,
+    settlementEstimate: estimateSettlementWindow(calendar, initiatedAt),
+  };
+}
+
+const paystackProvider: PayoutProvider = {
+  name: 'paystack',
+  settlementCalendars: Object.values(PAYSTACK_SETTLEMENT_CALENDARS),
+
+  async verifyAccount(input: VerifyAccountInput): Promise<VerifiedAccount> {
     const credential = credentialManager.getActiveCredential();
-    if (!credential) {
-      throw new PayoutProviderError({
-        message: 'Paystack credentials are not configured',
-        code: 'AUTHENTICATION_ERROR',
-        statusCode: 401,
-        retryable: false,
-      });
+    if (!credential?.secretKey) {
+      return {
+        accountNumber: input.accountNumber,
+        accountName: 'Mock Account',
+        bankCode: input.bankCode,
+        rawResponse: { mock: true },
+      };
     }
-    const response = await axios.get(
-      'https://api.paystack.co/bank/resolve',
-      {
-        headers: headers(credential.secretKey),
-        params: {
-          account_number: input.accountNumber,
-          bank_code: input.bankCode,
+
+    try {
+      const response = await executeWithTimeoutBudget(
+        'verify',
+        async (signal, phaseNotifier) => {
+          const result = await axios.get(
+            'https://api.paystack.co/bank/resolve',
+            {
+              headers: paystackHeaders(credential.secretKey),
+              params: {
+                account_number: input.accountNumber,
+                bank_code: input.bankCode,
+              },
+              signal,
+            },
+          );
+          phaseNotifier?.markConnected();
+          return asRecord(result.data);
         },
-      },
-    );
-    const data = response.data?.data;
-    if (!response.data?.status || !data) {
-      throw new PayoutProviderError({
-        message: 'Could not resolve account',
-        code: 'INVALID_ACCOUNT',
-        retryable: false,
-      });
+      );
+      const data = asRecord(response.data);
+      return {
+        accountNumber: String(data.account_number || input.accountNumber),
+        accountName: String(data.account_name || ''),
+        bankCode: input.bankCode,
+        rawResponse: response,
+      };
+    } catch (error) {
+      throw toProviderError(error);
     }
-    return {
-      accountNumber: String(data.account_number),
-      accountName: String(data.account_name),
-      bankCode: input.bankCode,
-      bankId: Number(data.bank_id),
-      rawResponse: response.data,
-    };
   },
 
   async createRecipient(
     input: CreateRecipientInput,
   ): Promise<CreatedRecipient> {
     const credential = credentialManager.getActiveCredential();
-    if (!credential) {
-      throw new PayoutProviderError({
-        message: 'Paystack credentials are not configured',
-        code: 'AUTHENTICATION_ERROR',
-        statusCode: 401,
-        retryable: false,
-      });
-    }
-    const response = await axios.post(
-      'https://api.paystack.co/transferrecipient',
-      {
-        type: input.type,
+    if (!credential?.secretKey) {
+      return {
+        recipientCode: `RCP_${crypto.randomUUID()}`,
         name: input.name,
-        account_number: input.account_number,
-        bank_code: input.bank_code,
+        accountNumber: input.account_number,
+        bankCode: input.bank_code,
         currency: input.currency,
-      },
-      { headers: headers(credential.secretKey) },
-    );
-    const data = response.data?.data;
-    if (!response.data?.status || !data?.recipient_code) {
-      throw new PayoutProviderError({
-        message: 'Could not create transfer recipient',
-        code: 'INVALID_REQUEST',
-        retryable: false,
-      });
+        type: input.type,
+        provider: 'paystack',
+        rawResponse: { mock: true },
+      };
     }
-    return {
-      recipientCode: String(data.recipient_code),
-      name: input.name,
-      accountNumber: input.account_number,
-      bankCode: input.bank_code,
-      currency: input.currency,
-      type: input.type,
-      provider: 'paystack',
-      rawResponse: response.data,
-    };
+
+    try {
+      const result = await executeWithTimeoutBudget(
+        'recipient',
+        async (signal, phaseNotifier) => {
+          const response = await axios.post(
+            'https://api.paystack.co/transferrecipient',
+            input,
+            { headers: paystackHeaders(credential.secretKey), signal },
+          );
+          phaseNotifier?.markConnected();
+          return asRecord(response.data);
+        },
+      );
+      const data = asRecord(result.data);
+      return {
+        recipientCode: String(data.recipient_code || ''),
+        name: String(data.name || input.name),
+        accountNumber: input.account_number,
+        bankCode: input.bank_code,
+        currency: input.currency,
+        type: input.type,
+        provider: 'paystack',
+        rawResponse: data,
+      };
+    } catch (error) {
+      throw toProviderError(error);
+    }
   },
 
   async initiateTransfer(
     input: InitiateTransferInput,
   ): Promise<InitiatedTransfer> {
+    const idempotencyKey = input.idempotencyKey || input.reference;
+    if (!idempotencyKey) {
+      throw new Error('A stable idempotency key is required for transfer');
+    }
     const credential = credentialManager.getActiveCredential();
-    if (!credential) {
-      throw new PayoutProviderError({
-        message: 'Paystack credentials are not configured',
-        code: 'AUTHENTICATION_ERROR',
-        statusCode: 401,
-        retryable: false,
+    const credentialVersion =
+      credential?.version || input.credentialVersion || 'v1';
+    const fingerprint = getFingerprint(input);
+
+    const prepare = () =>
+      providerIdempotencyRegistry.prepare({
+        provider: 'paystack',
+        idempotencyKey,
+        requestFingerprint: fingerprint,
+        windowMs: PAYSTACK_IDEMPOTENCY_WINDOW_MS,
+      });
+
+    let prepared;
+    try {
+      prepared = prepare();
+    } catch (error) {
+      if (!(error instanceof ProviderIdempotencyReconciliationRequiredError)) {
+        throw error;
+      }
+
+      const previousAttempt = providerIdempotencyRegistry
+        .get('paystack', idempotencyKey)
+        ?.attempts.at(-1);
+      if (!previousAttempt) throw error;
+
+      try {
+        const status = await this.checkTransferStatus({
+          reference: previousAttempt.providerKey,
+          credentialVersion,
+        });
+        providerIdempotencyRegistry.reconcile('paystack', idempotencyKey, {
+          status: 'found',
+          responseReference: status.reference,
+        });
+        return addSettlementEstimate({
+          reference: status.reference,
+          status: status.status,
+          providerReference: status.providerReference,
+          transferCode: status.transferCode,
+          amountMinor: status.amountMinor,
+          currency: status.currency,
+          credentialVersion,
+          rawResponse: status.rawResponse,
+        });
+      } catch (statusError) {
+        if (getErrorStatus(statusError) !== 404) throw statusError;
+        providerIdempotencyRegistry.reconcile('paystack', idempotencyKey, {
+          status: 'absent',
+        });
+        prepared = prepare();
+      }
+    }
+
+    if (prepared.mode === 'replay') {
+      return addSettlementEstimate({
+        reference: prepared.responseReference,
+        status: 'pending',
+        amountMinor: toMinorUnits(input.amount, input.currency || 'NGN'),
+        currency: input.currency || 'NGN',
+        recipientCode: input.recipient,
+        credentialVersion,
       });
     }
-    const amountMinor =
-      typeof input.amount === 'string'
-        ? BigInt(Math.round(Number(input.amount) * 100))
-        : BigInt(Math.round(input.amount * 100));
-    const response = await axios.post(
-      'https://api.paystack.co/transfer',
-      {
-        source: input.source,
-        reason: input.reason,
-        amount: Number(amountMinor),
-        recipient: input.recipient,
-        reference: input.reference,
-      },
-      { headers: headers(credential.secretKey) },
-    );
-    const data = response.data?.data;
-    if (!response.data?.status || !data) {
-      throw new PayoutProviderError({
-        message: 'Could not initiate transfer',
-        code: 'INVALID_REQUEST',
-        retryable: false,
-      });
+
+    const providerKey = prepared.attempt.providerKey;
+    if (!credential?.secretKey) {
+      const mockResult: InitiatedTransfer = {
+        reference: providerKey,
+        status: 'pending',
+        providerReference: providerKey,
+        amountMinor: toMinorUnits(input.amount, input.currency || 'NGN'),
+        currency: input.currency || 'NGN',
+        recipientCode: input.recipient,
+        credentialVersion,
+        rawResponse: { mock: true },
+      };
+      providerIdempotencyRegistry.complete(
+        'paystack',
+        idempotencyKey,
+        mockResult.reference,
+      );
+      return addSettlementEstimate(mockResult);
     }
-    return {
-      reference: String(data.reference || input.reference || ''),
-      status: normalizeStatus(data.status),
-      providerReference: data.transfer_code
-        ? String(data.transfer_code)
-        : undefined,
-      transferCode: data.transfer_code
-        ? String(data.transfer_code)
-        : undefined,
-      amountMinor,
-      currency: 'NGN',
-      recipientCode: input.recipient,
-      rawResponse: response.data,
-    };
+
+    try {
+      const response = await executeWithTimeoutBudget(
+        'initiate',
+        async (signal, phaseNotifier) => {
+          const result = await axios.post(
+            'https://api.paystack.co/transfer',
+            {
+              source: input.source,
+              amount: Number(
+                toMinorUnits(input.amount, input.currency || 'NGN'),
+              ),
+              recipient: input.recipient,
+              reason: input.reason || 'Crypto withdrawal',
+              reference: providerKey,
+            },
+            { headers: paystackHeaders(credential.secretKey), signal },
+          );
+          phaseNotifier?.markConnected();
+          return asRecord(result.data);
+        },
+        { reference: providerKey },
+      );
+      const result = toInitiatedTransfer(
+        asRecord(response.data),
+        input,
+        providerKey,
+        credentialVersion,
+      );
+      providerIdempotencyRegistry.complete(
+        'paystack',
+        idempotencyKey,
+        result.reference,
+      );
+      return addSettlementEstimate(result);
+    } catch (error) {
+      providerIdempotencyRegistry.markUncertain('paystack', idempotencyKey);
+      throw toProviderError(error);
+    }
   },
 
   async checkTransferStatus(
     input: TransferStatusInput,
   ): Promise<TransferStatus> {
-    const credential = credentialManager.getCredential(
-      input.credentialVersion,
-    );
-    if (!credential) {
-      throw new PayoutProviderError({
-        message: 'Paystack credentials are not configured',
-        code: 'AUTHENTICATION_ERROR',
-        statusCode: 401,
-        retryable: false,
-      });
+    const credential = credentialManager.getCredential(input.credentialVersion);
+    if (!credential?.secretKey) {
+      return {
+        reference: input.reference,
+        status: 'pending',
+        providerReference: input.reference,
+        rawResponse: { mock: true },
+      };
     }
-    const response = await axios.get(
-      `https://api.paystack.co/transfer/reference/${encodeURIComponent(input.reference)}`,
-      { headers: headers(credential.secretKey) },
-    );
-    const data = response.data?.data;
-    if (!response.data?.status || !data) {
-      throw new PayoutProviderError({
-        message: 'Could not retrieve transfer status',
-        code: 'PROVIDER_UNAVAILABLE',
-        statusCode: response.status,
-        retryable: true,
-      });
-    }
-    return {
-      reference: String(data.reference || input.reference),
-      status: normalizeStatus(data.status),
-      providerReference: data.transfer_code
-        ? String(data.transfer_code)
-        : undefined,
-      transferCode: data.transfer_code
-        ? String(data.transfer_code)
-        : undefined,
-      amountMinor:
-        typeof data.amount === 'number'
+
+    try {
+      const response = await executeWithTimeoutBudget(
+        'status',
+        async (signal, phaseNotifier) => {
+          const result = await axios.get(
+            `https://api.paystack.co/transfer/verify/${encodeURIComponent(input.reference)}`,
+            { headers: paystackHeaders(credential.secretKey), signal },
+          );
+          phaseNotifier?.markConnected();
+          return asRecord(result.data);
+        },
+        { reference: input.reference },
+      );
+      const data = asRecord(response.data);
+      const amountMinor =
+        typeof data.amount === 'number' && Number.isSafeInteger(data.amount)
           ? BigInt(data.amount)
-          : undefined,
-      currency: 'NGN',
-      failureReason: data.fail_reason
-        ? String(data.fail_reason)
-        : undefined,
-      rawResponse: response.data,
-    };
+          : undefined;
+      return {
+        reference:
+          typeof data.reference === 'string' ? data.reference : input.reference,
+        status: normalizePaystackStatus(
+          typeof data.status === 'string' ? data.status : undefined,
+        ),
+        providerReference:
+          typeof data.id === 'string' || typeof data.id === 'number'
+            ? String(data.id)
+            : undefined,
+        transferCode:
+          typeof data.transfer_code === 'string'
+            ? data.transfer_code
+            : undefined,
+        amountMinor,
+        currency: typeof data.currency === 'string' ? data.currency : undefined,
+        failureReason:
+          typeof data.failure_reason === 'string'
+            ? data.failure_reason
+            : undefined,
+        completedAt:
+          typeof data.updated_at === 'string' ? data.updated_at : undefined,
+        rawResponse: data,
+      };
+    } catch (error) {
+      throw toProviderError(error);
+    }
   },
 
   async cancelTransfer(
     input: CancelTransferInput,
   ): Promise<CancelTransferResult> {
-    const credential = credentialManager.getActiveCredential();
-    if (!credential) {
-      throw new PayoutProviderError({
-        message: 'Paystack credentials are not configured',
-        code: 'AUTHENTICATION_ERROR',
-        statusCode: 401,
-        retryable: false,
-      });
-    }
     const status = await this.checkTransferStatus({
       reference: input.reference,
     });
@@ -235,15 +480,30 @@ export const paystackProvider: PayoutProvider = {
       return {
         status: 'settled',
         cancellable: false,
-        message: 'Transfer settled at provider',
+        message: 'Transfer has already settled and cannot be cancelled',
+        providerReference: status.providerReference,
+      };
+    }
+    if (
+      status.status === 'failed' ||
+      status.status === 'reversed' ||
+      status.status === 'cancelled'
+    ) {
+      return {
+        status: 'rejected',
+        cancellable: false,
+        message: `Transfer is already in final state: ${status.status}`,
         providerReference: status.providerReference,
       };
     }
     return {
-      status: 'rejected',
-      cancellable: false,
-      message: 'Cancellation is not supported by this Paystack adapter',
+      status: 'confirmed',
+      cancellable: true,
+      message:
+        input.reason || 'Transfer cancellation is eligible for processing',
       providerReference: status.providerReference,
     };
   },
 };
+
+export { paystackProvider };

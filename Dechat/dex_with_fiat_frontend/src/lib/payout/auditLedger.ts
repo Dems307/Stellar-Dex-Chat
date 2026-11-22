@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 
 export type PayoutAuditAction =
+  | 'fx_quote_created'
   | 'payout_initiated'
   | 'payout_provider_accepted'
   | 'payout_succeeded'

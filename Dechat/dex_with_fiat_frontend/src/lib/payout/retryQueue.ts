@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { payoutAuditLedger, PayoutAuditLedger } from './auditLedger';
 import { PayoutProvider } from './providers/types';
-import { getProviderCircuitBreaker } from './circuitBreaker';
+import type { FxQuoteRecord } from './fxQuoteProvenance';
 
 export interface RetryJobPayload {
   source: string;
@@ -10,6 +10,8 @@ export interface RetryJobPayload {
   recipient: string;
   reason?: string;
   reference: string;
+  fxQuote?: FxQuoteRecord;
+  amountMinorUnits?: string;
 }
 
 export interface RetryJob {
@@ -126,6 +128,8 @@ export class PayoutRetryQueue {
       amount: number;
       recipient: string;
       reason?: string;
+      fxQuote?: FxQuoteRecord;
+      amountMinorUnits?: string;
     };
     error?: string;
     initialDelayMs?: number;

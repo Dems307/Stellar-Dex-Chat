@@ -9,17 +9,24 @@ import {
 } from '@/lib/payout/circuitBreaker';
 import {
   extractOrGenerateCorrelationId,
-  logStructuredError,
   validationError,
+  logStructuredError,
+  authorizationError,
+  createPayoutErrorResponse,
 } from '@/lib/payout/errors';
 import {
+  enforcePayoutApiVersion,
+  payoutSuccessResponse,
+} from '@/lib/payout/schemaEvolution';
+import {
   authorizeTransferAccess,
-  isTransferAuthorized,
-  nonEnumeratingNotFoundResponse,
   uniformNotFoundResponse,
 } from '@/lib/auth/authorizationMatrix';
-import { resolveCallerIdentity } from '@/lib/payout/auth';
-import { unauthorizedResponse } from '@/lib/payout/auth';
+import {
+  resolveCallerIdentity,
+  unauthorizedResponse,
+  nonEnumeratingNotFoundResponse,
+} from '@/lib/payout/auth';
 import { getTransferStatus } from '@/lib/transferStore';
 
 const RATE_LIMIT = {
@@ -40,6 +47,8 @@ export async function POST(request: NextRequest) {
   // Enforce payout API security
   const securityBlocked = enforcePayoutRouteSecurity(request);
   if (securityBlocked) return securityBlocked;
+  const apiVersionBlocked = enforcePayoutApiVersion(request);
+  if (apiVersionBlocked) return apiVersionBlocked;
 
   const ip = getClientIp(request);
   const correlationId = extractOrGenerateCorrelationId(request.headers);
@@ -101,7 +110,12 @@ export async function POST(request: NextRequest) {
 
     // Verify ownership if tracked in store; return non-enumerating 404 for unauthorized
     const existing = getTransferStatus(reference);
-    if (existing && !isTransferAuthorized(existing, caller)) {
+    if (
+      existing &&
+      !caller.isOperator &&
+      existing.clientSessionId &&
+      existing.clientSessionId !== caller.address
+    ) {
       return nonEnumeratingNotFoundResponse('Transfer');
     }
 
@@ -115,17 +129,16 @@ export async function POST(request: NextRequest) {
       provider.checkTransferStatus({ reference }),
     );
 
-    const response = NextResponse.json({
-      success: true,
-      data: {
+    const response = payoutSuccessResponse(
+      {
         ...data,
         amountMinor:
           data.amountMinor !== undefined
             ? data.amountMinor.toString()
             : undefined,
       },
-    });
-    response.headers.set('X-Correlation-Id', correlationId);
+      { correlationId },
+    );
     return response;
   } catch (error: unknown) {
     logStructuredError('transfer-status', error, {
