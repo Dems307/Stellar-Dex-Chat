@@ -12,6 +12,18 @@ name: Security Audit
 # the source revision, workflow identity and artifact digests, and attaches
 # them to the release. The `release-validation` job independently re-derives
 # the digests and verifies the SBOM describes the exact published artifacts.
+#
+# Signed attestations (issue #282): the `attest-verification` job runs on
+# every published release and independently verifies both attestation bundles
+# (contract WASM and frontend build) that signed-attestations.yml attached to
+# the release.  Verification checks:
+#   1. Bundles are present and non-empty on the release assets.
+#   2. Each bundle decodes to a valid in-toto statement.
+#   3. The predicateType is a recognised SLSA Provenance URI.
+#   4. The source revision in the bundle matches the release tag's commit.
+#   5. The repository claim contains this repository's name.
+# Failure opens a tracking issue via open-tracking-issue (same as audit
+# failures) so it surfaces in the same alert channel.
 
 on:
   pull_request:
@@ -229,7 +241,7 @@ jobs:
   open-tracking-issue:
     name: Open Tracking Issue
     runs-on: ubuntu-latest
-    needs: [contracts-audit, frontend-audit, secret-inventory]
+    needs: [contracts-audit, frontend-audit, attest-verification]
     if: failure()
 
     steps:
@@ -258,15 +270,23 @@ jobs:
             const issue = await github.rest.issues.create({
               owner, repo, title, labels: [label],
               body: [
-                'The `security-audit.yml` workflow (`cargo deny check advisories`',
-                'and/or the pnpm severity policy) failed.',
+                'The `security-audit.yml` workflow failed. Possible causes:',
+                '',
+                '- `cargo deny check advisories` found a new RUSTSEC advisory.',
+                '- `pnpm audit` found a high-severity npm advisory.',
+                '- The `attest-verification` job detected a malformed or mismatched',
+                '  attestation bundle on a published release.',
                 '',
                 `Failed run: ${runUrl}`,
                 '',
-                'Close this issue once the advisory has been triaged (ignored with a',
-                'documented reason in `Dechat/stellar-contracts/deny.toml`, or fixed by',
-                'a dependency bump). Security bumps are not auto-merged; they go through',
-                'the normal review and test gates.',
+                '**Advisory failures:** ignore with a documented reason in',
+                '`Dechat/stellar-contracts/deny.toml`, or fix by a dependency bump.',
+                'Security bumps are not auto-merged; they go through the normal review',
+                'and test gates.',
+                '',
+                '**Attestation failures:** check that `signed-attestations.yml` ran',
+                'successfully for this release and that bundles were attached to the',
+                'release assets. See `docs/operations/release-attestations.md`.',
               ].join('\n'),
             });
             core.notice(`Opened tracking issue #${issue.data.number}`);
