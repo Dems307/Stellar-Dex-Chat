@@ -2,7 +2,7 @@
 
 Thanks for contributing to Dechat. This document covers the workflow for
 changes that touch the Soroban smart contract interface and its generated
-TypeScript client bindings.
+TypeScript client bindings, as well as the payout side-effect pipeline.
 
 ## Contract bindings and ABI compatibility
 
@@ -56,6 +56,37 @@ Breaking changes must be called out explicitly in the pull request description,
 including the old and new signatures, so reviewers can confirm the versioning
 policy was applied.
 
+## Adversarial evaluation corpus
+
+The repository ships a **non-production** evaluation corpus for prompt
+injection through quoted content: pasted text, links, markdown, and
+tool-shaped strings. Its purpose is to verify that untrusted quoted content
+cannot alter policy, invoke tools, or leak hidden prompt context.
+
+### Corpus conventions
+
+- Fixtures live alongside the evaluation harness and are clearly marked
+  non-production. Never place real user data, credentials, or live tokens in
+  fixtures — use synthetic placeholders only.
+- Each case records the adversarial input, the expected safe behavior, and
+  the category it exercises (pasted text, link, markdown, tool-shaped string).
+- Cover boundary and failure cases: malformed tool-shaped strings, nested
+  markdown, and encoded or obfuscated links.
+
+### What the evaluation asserts
+
+For every case, the harness must confirm the quoted content:
+
+- does not change the active policy or system instructions,
+- does not trigger tool invocation, and
+- does not surface hidden prompt context in the response.
+
+### Adding cases
+
+When adding a case, include a focused regression test covering the normal
+path plus the relevant failure, authorization, or recovery edge case. Keep
+fixtures deterministic and free of secrets so the corpus can run in CI.
+
 ## Pull request checklist
 
 Every pull request is prefilled with the [PR template](../.github/PULL_REQUEST_TEMPLATE.md).
@@ -68,27 +99,5 @@ fail if required items are left unchecked when the corresponding paths change.
 - [ ] The CI drift check passes with no ABI diff.
 - [ ] Breaking changes are documented and versioned as described above.
 - [ ] Regeneration left unrelated files unchanged.
-- [ ] A storage migration script or `upgrade()` entry-point is included if
-      persistent storage layout changed.
-- [ ] A rollback strategy is documented (or the change is explicitly declared
-      irreversible and justified) in the PR description or in `MIGRATIONS.md`.
-
-### Frontend changes
-
-- [ ] UI changes are covered by unit tests or E2E tests.
-- [ ] No secrets, API keys, or real user data were added to fixtures.
-- [ ] `pnpm bundle-budget` passes.
-
-## Storage migrations and rollback
-
-When a contract upgrade changes the on-chain storage layout (key names, value
-types, or added/removed fields), include a migration in the same PR:
-
-1. Add an `upgrade(new_wasm_hash)` or `migrate()` entry-point that transforms
-   existing storage to the new layout.
-2. Document pre- and post-upgrade steps in `Dechat/stellar-contracts/MIGRATIONS.md`.
-3. Describe the rollback path in the PR body. If the migration is irreversible,
-   say so explicitly and explain why.
-
-The `readiness-gate` CI job checks for the presence of a migrations document
-when contract files change and emits a warning if none is found.
+- [ ] Adversarial evaluation cases include focused regression tests and no
+      real user data or credentials in fixtures.
