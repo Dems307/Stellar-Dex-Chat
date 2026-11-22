@@ -28,6 +28,24 @@ export async function POST(request: NextRequest) {
     const body = await request.json().catch(() => ({}));
     const { address, signature, timestamp, message } = body;
 
+    // Validate all redirect/callback destinations before any session work.
+    const destinations = collectDestinations(request, body);
+    const validatedDestinations: Record<string, string> = {};
+
+    for (const { field, value } of destinations) {
+      const result: DestinationValidationResult = validateRedirectDestination(value);
+      if (!result.ok) {
+        return NextResponse.json(
+          {
+            success: false,
+            message: `Invalid ${field} destination: ${result.reason}`,
+          },
+          { status: 400 },
+        );
+      }
+      validatedDestinations[field] = result.url;
+    }
+
     if (!address || !signature || !timestamp) {
       return NextResponse.json(
         {
@@ -77,6 +95,9 @@ export async function POST(request: NextRequest) {
         expiresAt: session.expiresAt,
         address: session.address,
         csrfToken,
+        ...(Object.keys(validatedDestinations).length > 0
+          ? { destinations: validatedDestinations }
+          : {}),
       },
     });
 

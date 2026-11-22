@@ -375,3 +375,5 @@ describe('auditLog indexer reorg and backfill entries', () => {
     expect(after[1].actionType).toBe('indexer_backfill');
   });
 });
+  });
+});

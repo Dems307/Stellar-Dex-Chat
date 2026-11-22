@@ -9,7 +9,8 @@
  * Exit codes:
  *   0 - All variables match
  *   1 - Missing variables or extra variables found
- *   2 - Sensitive payout encryption variables are misconfigured
+ *   2 - Sensitive payout encryption variables are misconfigured, or
+ *       wildcard / unnecessary production permissions were detected
  */
 
 import { readFileSync } from 'fs';
