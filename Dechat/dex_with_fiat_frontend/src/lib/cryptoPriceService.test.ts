@@ -9,6 +9,7 @@ const {
   getTokenPrice,
   clearPriceCache,
   fetchTickerData,
+  fetchLockedQuote,
 } = await import('./cryptoPriceService');
 
 describe('cryptoPriceService', () => {
@@ -21,6 +22,10 @@ describe('cryptoPriceService', () => {
     it('deduplicates concurrent requests for the same token+currency', async () => {
       mockFetch.mockResolvedValue({
         ok: true,
+        headers: {
+          get: (name: string) =>
+            name === 'x-cg-request-id' ? 'cg-request-1' : null,
+        },
         json: () =>
           Promise.resolve({ stellar: { usd: 0.12, usd_24h_change: 1.5 } }),
       });
@@ -69,6 +74,10 @@ describe('cryptoPriceService', () => {
     it('returns mapped prices on success', async () => {
       mockFetch.mockResolvedValue({
         ok: true,
+        headers: {
+          get: (name: string) =>
+            name === 'x-cg-request-id' ? 'cg-request-1' : null,
+        },
         json: () =>
           Promise.resolve({
             stellar: { usd: 0.11, eur: 0.1 },
@@ -85,6 +94,7 @@ describe('cryptoPriceService', () => {
         },
         stale: false,
         source: 'live',
+        providerResponseId: 'cg-request-1',
       });
     });
 
@@ -100,6 +110,7 @@ describe('cryptoPriceService', () => {
         prices: { XLM: { usd: 0.11 } },
         stale: true,
         source: 'fallback',
+        providerResponseId: null,
       });
     });
 
@@ -117,12 +128,74 @@ describe('cryptoPriceService', () => {
         prices: { XLM: { usd: 0.14 } },
         stale: true,
         source: 'cache',
+        providerResponseId: null,
       });
     });
 
     it('returns fallback for unknown symbols', async () => {
       const result = await fetchCryptoPrices(['FAKECOIN'], ['usd']);
-      expect(result).toEqual({ prices: {}, stale: true, source: 'fallback' });
+      expect(result).toEqual({
+        prices: {},
+        stale: true,
+        source: 'fallback',
+        providerResponseId: null,
+      });
+    });
+
+    describe('fetchLockedQuote', () => {
+      it('requests a server-issued quote instead of calculating one in the browser', async () => {
+        const quote = {
+          quoteId: '01234567-89ab-4cde-8fab-0123456789ab',
+          quoteToken: 'signed-quote-token',
+          tokenSymbol: 'XLM',
+          tokenAmountDecimal: '10',
+          currency: 'NGN',
+          exchangeRateDecimal: '150.005',
+          fiatAmountMinorUnits: '150005',
+          roundingPolicy: 'HALF_UP_TO_MINOR_UNIT',
+          provider: 'coingecko',
+          providerRequestId: '11234567-89ab-4cde-8fab-0123456789ab',
+          providerResponseId: 'coingecko-request-1',
+          ngnAmount: 1500.05,
+          lockedAt: 1_000,
+          expiresAt: 121_000,
+          stale: false,
+          source: 'live' as const,
+        };
+        mockFetch.mockResolvedValue({
+          ok: true,
+          json: async () => ({ success: true, data: quote }),
+        });
+
+        await expect(fetchLockedQuote('XLM', 10, 'ngn')).resolves.toEqual(
+          quote,
+        );
+        expect(mockFetch).toHaveBeenCalledWith(
+          '/api/fx-quote',
+          expect.objectContaining({
+            method: 'POST',
+            body: JSON.stringify({
+              tokenSymbol: 'XLM',
+              tokenAmount: 10,
+              currency: 'ngn',
+            }),
+          }),
+        );
+      });
+
+      it('rejects an unsuccessful quote response', async () => {
+        mockFetch.mockResolvedValue({
+          ok: false,
+          json: async () => ({
+            success: false,
+            message: 'A current FX quote is unavailable.',
+          }),
+        });
+
+        await expect(fetchLockedQuote('XLM', 10, 'ngn')).rejects.toThrow(
+          'A current FX quote is unavailable.',
+        );
+      });
     });
   });
 
