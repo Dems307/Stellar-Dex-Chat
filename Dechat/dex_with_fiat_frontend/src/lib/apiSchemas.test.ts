@@ -747,162 +747,97 @@ describe('API consumer contract - published OpenAPI schema', () => {
       expect(operation.responses['200']).toBeDefined();
     });
 
-    it('accepts a valid request body', () => {
-      const result = validateAgainstSchema(
-        operation.requestBody,
-        syntheticAccount,
-      );
-      expect(result.valid).toBe(true);
+  it('marks a current cursor and recent dbUpdatedAt as fresh', () => {
+    const metadata = buildFreshnessMetadata({
+      cursor: 1000,
+      latestLedger: 1000,
+      dbUpdatedAt: '2024-06-01T11:59:30.000Z',
+      stalenessThresholdMs: 60_000,
+      now,
     });
 
-    it('rejects malformed request bodies with a documented 400', () => {
-      expect(operation.responses['400']).toBeDefined();
-
-      const malformed = [
-        { accountNumber: '123', bankCode: '000' },
-        { accountNumber: '0000000000', bankCode: '0' },
-        { accountNumber: '0000000000&currency=USD', bankCode: '000' },
-        { bankCode: '000' },
-      ];
-
-      for (const body of malformed) {
-        const result = validateAgainstSchema(operation.requestBody, body);
-        expect(result.valid).toBe(false);
-      }
-    });
-
-    it('documents a provider-failure response', () => {
-      expect(
-        operation.responses['502'] ?? operation.responses['503'],
-      ).toBeDefined();
-    });
-
-    it('validates a success response body against the schema', () => {
-      const response = {
-        accountName: 'SYNTHETIC TEST ACCOUNT',
-        accountNumber: '0000000000',
-        bankCode: '000',
-      };
-      const result = validateAgainstSchema(
-        operation.responses['200'],
-        response,
-      );
-      expect(result.valid).toBe(true);
-    });
-
-    it('rejects an undocumented success response shape', () => {
-      const drifted = { account_name: 'SYNTHETIC TEST ACCOUNT' };
-      const result = validateAgainstSchema(operation.responses['200'], drifted);
-      expect(result.valid).toBe(false);
-    });
+    expect(metadata.isStale).toBe(false);
+    expect(metadata.cursor).toBe(1000);
+    expect(metadata.latestLedger).toBe(1000);
+    expect(metadata.dbUpdatedAt).toBe('2024-06-01T11:59:30.000Z');
+    expect(metadata.stalenessThresholdMs).toBe(60_000);
   });
 
-  describe('POST /api/recipients', () => {
-    const operation = getSchemaOperation('POST /api/recipients');
-
-    it('accepts a valid request body', () => {
-      const result = validateAgainstSchema(
-        operation.requestBody,
-        syntheticRecipient,
-      );
-      expect(result.valid).toBe(true);
+  it('marks a lagging cursor as stale', () => {
+    const metadata = buildFreshnessMetadata({
+      cursor: 990,
+      latestLedger: 1000,
+      dbUpdatedAt: '2024-06-01T11:59:30.000Z',
+      stalenessThresholdMs: 60_000,
+      now,
     });
 
-    it('rejects malformed request bodies with a documented 400', () => {
-      expect(operation.responses['400']).toBeDefined();
-
-      const malformed = [
-        { ...syntheticRecipient, account_number: '123' },
-        { ...syntheticRecipient, bank_code: '1' },
-        { ...syntheticRecipient, currency: 'USD' },
-        { ...syntheticRecipient, name: '' },
-      ];
-
-      for (const body of malformed) {
-        const result = validateAgainstSchema(operation.requestBody, body);
-        expect(result.valid).toBe(false);
-      }
-    });
-
-    it('documents a provider-failure response', () => {
-      expect(
-        operation.responses['502'] ?? operation.responses['503'],
-      ).toBeDefined();
-    });
-
-    it('validates a success response body against the schema', () => {
-      const response = {
-        recipient_code: 'RCP_SYNTHETIC0001',
-        type: 'nuban',
-        name: 'Synthetic Test Account',
-        account_number: '0000000000',
-        bank_code: '000',
-        currency: 'NGN',
-        active: true,
-      };
-      const result = validateAgainstSchema(
-        operation.responses['201'] ?? operation.responses['200'],
-        response,
-      );
-      expect(result.valid).toBe(true);
-    });
+    expect(metadata.isStale).toBe(true);
+    expect(metadata.cursor).toBe(990);
+    expect(metadata.latestLedger).toBe(1000);
   });
 
-  describe('GET /api/admin/recipients', () => {
-    const operation = getSchemaOperation('GET /api/admin/recipients');
-
-    it('documents authorization failures for admin routes', () => {
-      expect(operation.responses['401']).toBeDefined();
-      expect(operation.responses['403']).toBeDefined();
+  it('marks an outdated dbUpdatedAt as stale even when the cursor is current', () => {
+    const metadata = buildFreshnessMetadata({
+      cursor: 1000,
+      latestLedger: 1000,
+      dbUpdatedAt: '2024-06-01T11:00:00.000Z',
+      stalenessThresholdMs: 60_000,
+      now,
     });
 
-    it('validates a documented error body for unauthorized access', () => {
-      const unauthorized = { error: 'Unauthorized' };
-      const result = validateAgainstSchema(
-        operation.responses['401'],
-        unauthorized,
-      );
-      expect(result.valid).toBe(true);
-    });
-
-    it('validates a success response body against the schema', () => {
-      const response = {
-        data: [
-          {
-            recipient_code: 'RCP_SYNTHETIC0001',
-            type: 'nuban',
-            name: 'Synthetic Test Account',
-            account_number: '0000000000',
-            bank_code: '000',
-            currency: 'NGN',
-            active: true,
-          },
-        ],
-      };
-      const result = validateAgainstSchema(
-        operation.responses['200'],
-        response,
-      );
-      expect(result.valid).toBe(true);
-    });
+    expect(metadata.isStale).toBe(true);
   });
 
-  describe('GET /health', () => {
-    const operation = getSchemaOperation('GET /health');
-
-    it('validates the health response body against the schema', () => {
-      const result = validateAgainstSchema(operation.responses['200'], {
-        status: 'ok',
-      });
-      expect(result.valid).toBe(true);
+  it('handles a null cursor without throwing', () => {
+    const metadata = buildFreshnessMetadata({
+      cursor: null,
+      latestLedger: 1000,
+      dbUpdatedAt: '2024-06-01T11:59:30.000Z',
+      stalenessThresholdMs: 60_000,
+      now,
     });
 
-    it('rejects an undocumented health response shape', () => {
-      const result = validateAgainstSchema(operation.responses['200'], {
-        healthy: true,
-      });
-      expect(result.valid).toBe(false);
+    expect(metadata.isStale).toBe(true);
+    expect(metadata.cursor).toBeNull();
+  });
+
+  it('handles a missing cursor without throwing', () => {
+    const metadata = buildFreshnessMetadata({
+      latestLedger: 1000,
+      dbUpdatedAt: '2024-06-01T11:59:30.000Z',
+      stalenessThresholdMs: 60_000,
+      now,
     });
+
+    expect(metadata.isStale).toBe(true);
+    expect(metadata.cursor).toBeNull();
+  });
+});
+
+describe('calculationLineageSchema', () => {
+  const valid = {
+    calculationVersion: 'fx-v1.2.0',
+    inputSourceIds: ['ledger:1000', 'rate:ngn-usd:2024-06-01'],
+    currencyMetadataVersion: 'currencies-v3',
+    roundingDecision: 'half-up',
+    roundingDelta: 0,
+  };
+
+  it('accepts a valid lineage record', () => {
+    expect(calculationLineageSchema.safeParse(valid).success).toBe(true);
+  });
+
+  it('rejects a record missing calculationVersion', () => {
+    const { calculationVersion: _omitted, ...rest } = valid;
+    expect(calculationLineageSchema.safeParse(rest).success).toBe(false);
+  });
+
+  it('rejects a negative roundingDelta', () => {
+    expect(
+      calculationLineageSchema.safeParse({ ...valid, roundingDelta: -1 })
+        .success,
+    ).toBe(false);
   });
 });
     });

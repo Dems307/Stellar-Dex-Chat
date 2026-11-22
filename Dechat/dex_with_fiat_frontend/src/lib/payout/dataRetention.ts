@@ -354,175 +354,127 @@ export function evaluateRetention(
  * Each horizon defines how long rows remain in the hot (queryable) partition
  * before being moved to archive storage. Audit evidence is never destroyed.
  */
-export type RetentionHorizon = 'HOT' | 'WARM' | 'ARCHIVE';
+export type EvidenceClass = 'audit' | 'webhook' | 'provider_evidence';
 
-export interface RetentionHorizonPolicy {
-  horizon: RetentionHorizon;
-  /** Maximum age (ms) of rows kept in this horizon. */
+/**
+ * Storage tiers for evidence. `hot` is queryable online, `warm` is retained for
+ * operational lookups, and `archive` is retained for compliance/export only.
+ */
+export type RetentionTier = 'hot' | 'warm' | 'archive';
+
+export interface RetentionTierPolicy {
+  tier: RetentionTier;
+  /** Age (ms) at which evidence enters this tier. */
+  minAgeMs: number;
+  /** Age (ms) at which evidence leaves this tier; Infinity for archive. */
   maxAgeMs: number;
-  /** Whether rows in this horizon are still served by default queries. */
-  queryable: boolean;
+  /** Whether the evidence is expected to be exported to cold storage. */
+  exportable: boolean;
   description: string;
 }
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 /**
- * Declarative retention horizon registry for audit/event tables.
- * - HOT: last 30 days, fully queryable.
- * - WARM: 30-180 days, queryable with explicit horizon selection.
- * - ARCHIVE: older than 180 days, retrievable only via archive lookups.
+ * Declarative retention tier boundaries per evidence class.
+ * Boundaries are inclusive of `minAgeMs` and exclusive of `maxAgeMs`.
  */
-export const RETENTION_HORIZONS: Record<RetentionHorizon, RetentionHorizonPolicy> = {
-  HOT: {
-    horizon: 'HOT',
-    maxAgeMs: 30 * DAY_MS,
-    queryable: true,
-    description: 'Recent audit/event rows served by default queries',
-  },
-  WARM: {
-    horizon: 'WARM',
-    maxAgeMs: 180 * DAY_MS,
-    queryable: true,
-    description: 'Aged rows queryable only with explicit horizon selection',
-  },
-  ARCHIVE: {
-    horizon: 'ARCHIVE',
-    maxAgeMs: Number.POSITIVE_INFINITY,
-    queryable: false,
-    description: 'Archived audit evidence retrievable via archive lookups only',
-  },
+export const RETENTION_TIERS: Record<EvidenceClass, RetentionTierPolicy[]> = {
+  audit: [
+    {
+      tier: 'hot',
+      minAgeMs: 0,
+      maxAgeMs: 30 * DAY_MS,
+      exportable: false,
+      description: 'Audit summaries queryable online for 30 days',
+    },
+    {
+      tier: 'warm',
+      minAgeMs: 30 * DAY_MS,
+      maxAgeMs: 365 * DAY_MS,
+      exportable: true,
+      description: 'Audit summaries retained for operational lookups up to 1 year',
+    },
+    {
+      tier: 'archive',
+      minAgeMs: 365 * DAY_MS,
+      maxAgeMs: Number.POSITIVE_INFINITY,
+      exportable: true,
+      description: 'Audit summaries retained indefinitely for compliance',
+    },
+  ],
+  webhook: [
+    {
+      tier: 'hot',
+      minAgeMs: 0,
+      maxAgeMs: 7 * DAY_MS,
+      exportable: false,
+      description: 'Webhook payloads queryable online for 7 days',
+    },
+    {
+      tier: 'warm',
+      minAgeMs: 7 * DAY_MS,
+      maxAgeMs: 90 * DAY_MS,
+      exportable: true,
+      description: 'Webhook payloads retained for replay/debugging up to 90 days',
+    },
+    {
+      tier: 'archive',
+      minAgeMs: 90 * DAY_MS,
+      maxAgeMs: Number.POSITIVE_INFINITY,
+      exportable: true,
+      description: 'Webhook payloads archived for dispute resolution',
+    },
+  ],
+  provider_evidence: [
+    {
+      tier: 'hot',
+      minAgeMs: 0,
+      maxAgeMs: 14 * DAY_MS,
+      exportable: false,
+      description: 'Provider evidence queryable online for 14 days',
+    },
+    {
+      tier: 'warm',
+      minAgeMs: 14 * DAY_MS,
+      maxAgeMs: 180 * DAY_MS,
+      exportable: true,
+      description: 'Provider evidence retained for reconciliation up to 180 days',
+    },
+    {
+      tier: 'archive',
+      minAgeMs: 180 * DAY_MS,
+      maxAgeMs: Number.POSITIVE_INFINITY,
+      exportable: true,
+      description: 'Provider evidence archived for financial audit',
+    },
+  ],
 };
 
 /**
- * Resolves the retention horizon for a row based on its age relative to `now`.
- * Boundary semantics: a row exactly at a horizon boundary belongs to the
- * *older* horizon (age >= maxAgeMs moves it out of the current horizon).
+ * Resolves the retention tier for a piece of evidence of the given class and age.
+ * Throws on unknown evidence classes or invalid (negative/non-finite) ages.
  */
-export function resolveRetentionHorizon(
-  timestamp: number,
-  now: number = Date.now(),
-): RetentionHorizon {
-  const age = now - timestamp;
-  if (age < RETENTION_HORIZONS.HOT.maxAgeMs) {
-    return 'HOT';
+export function getRetentionTier(
+  evidenceClass: EvidenceClass,
+  ageMs: number,
+): RetentionTier {
+  const policies = RETENTION_TIERS[evidenceClass];
+  if (!policies) {
+    throw new Error(`Unknown evidence class: ${String(evidenceClass)}`);
   }
-  if (age < RETENTION_HORIZONS.WARM.maxAgeMs) {
-    return 'WARM';
+  if (typeof ageMs !== 'number' || Number.isNaN(ageMs) || ageMs < 0) {
+    throw new Error(`Invalid evidence age: ${String(ageMs)}`);
   }
-  return 'ARCHIVE';
-}
 
-export interface PartitionBoundary {
-  horizon: RetentionHorizon;
-  /** Inclusive lower bound (epoch ms) of rows in this partition. */
-  fromMs: number;
-  /** Exclusive upper bound (epoch ms) of rows in this partition. */
-  toMs: number;
-}
+  for (const policy of policies) {
+    if (ageMs >= policy.minAgeMs && ageMs < policy.maxAgeMs) {
+      return policy.tier;
+    }
+  }
 
-/**
- * Computes time-based partition boundaries for the given reference time.
- * Partitions are contiguous and non-overlapping: [fromMs, toMs).
- */
-export function computePartitionBoundaries(
-  now: number = Date.now(),
-): PartitionBoundary[] {
-  return [
-    {
-      horizon: 'HOT',
-      fromMs: now - RETENTION_HORIZONS.HOT.maxAgeMs,
-      toMs: now,
-    },
-    {
-      horizon: 'WARM',
-      fromMs: now - RETENTION_HORIZONS.WARM.maxAgeMs,
-      toMs: now - RETENTION_HORIZONS.HOT.maxAgeMs,
-    },
-    {
-      horizon: 'ARCHIVE',
-      fromMs: Number.NEGATIVE_INFINITY,
-      toMs: now - RETENTION_HORIZONS.WARM.maxAgeMs,
-    },
-  ];
-}
-
-/**
- * A single audit/event row subject to retention partitioning.
- */
-export interface AuditEventRow {
-  id: string;
-  reference: string;
-  eventType: string;
-  occurredAt: number;
-  payload: Record<string, unknown>;
-}
-
-export interface ArchivedRow extends AuditEventRow {
-  archivedAt: string;
-  horizon: RetentionHorizon;
-}
-
-export interface ArchiveManifestEntry {
-  id: string;
-  reference: string;
-  occurredAt: number;
-  rowHash: string;
-}
-
-export interface ArchiveManifest {
-  manifestId: string;
-  createdAt: string;
-  cutoffMs: number;
-  rowCount: number;
-  entries: ArchiveManifestEntry[];
-  /** SHA-256 over the canonical manifest content for integrity verification. */
-  integrityHash: string;
-}
-
-/**
- * Computes a deterministic SHA-256 hash of an audit row's canonical content.
- */
-export function hashAuditRow(row: AuditEventRow): string {
-  const canonical = JSON.stringify({
-    id: row.id,
-    reference: row.reference,
-    eventType: row.eventType,
-    occurredAt: row.occurredAt,
-    payload: row.payload,
-  });
-  return crypto.createHash('sha256').update(canonical).digest('hex');
-}
-
-/**
- * Computes the integrity hash of an archive manifest from its entries.
- */
-export function computeManifestIntegrityHash(
-  manifestId: string,
-  createdAt: string,
-  cutoffMs: number,
-  entries: ArchiveManifestEntry[],
-): string {
-  const canonical = JSON.stringify({
-    manifestId,
-    createdAt,
-    cutoffMs,
-    entries,
-  });
-  return crypto.createHash('sha256').update(canonical).digest('hex');
-}
-
-/**
- * Verifies that a manifest's integrity hash matches its entries.
- */
-export function verifyArchiveManifest(manifest: ArchiveManifest): boolean {
-  const expected = computeManifestIntegrityHash(
-    manifest.manifestId,
-    manifest.createdAt,
-    manifest.cutoffMs,
-    manifest.entries,
-  );
-  return expected === manifest.integrityHash;
+  // Only reachable for non-finite ages beyond the final tier.
+  return policies[policies.length - 1].tier;
 }
 
 export interface EncryptedPayload {

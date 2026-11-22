@@ -130,6 +130,25 @@ export class SorobanEventIndexer {
   }
 
   /**
+   * Highest ledger the indexer has observed (0 when nothing has been ingested).
+   */
+  public getLatestKnownLedger(): number {
+    return this.cursor.lastLedger;
+  }
+
+  /**
+   * Read-model freshness metadata for API responses. `sourceLedgerCursor` is the
+   * ledger the indexed projection is current through; `indexedAt` is when that
+   * cursor last advanced (0 if the indexer has never ingested an event).
+   */
+  public getFreshness(): { sourceLedgerCursor: number; indexedAt: number } {
+    return {
+      sourceLedgerCursor: this.cursor.lastLedger,
+      indexedAt: this.cursor.updatedAt,
+    };
+  }
+
+  /**
    * Ingest a batch of events idempotently without duplicates or gaps.
    * When an adapter is configured, events and the cursor are committed atomically.
    * Pass a cancellation token for backfill batches to abort between records.

@@ -173,6 +173,13 @@ export async function GET(
 
     const transferRecord = auth.record;
 
+    // Read-model freshness metadata: expose the database update time backing this
+    // projection so clients never present a stale record as confirmed settlement.
+    const freshness = buildFreshnessEnvelope({
+      dbUpdatedAt: transferRecord?.updatedAt,
+      thresholdMs: DEFAULT_FRESHNESS_THRESHOLD_MS,
+    });
+
     if (cancelledTransfers.has(reference)) {
       const cancelledResponse = NextResponse.json({
         success: true,
@@ -182,6 +189,7 @@ export async function GET(
           amount: transferRecord?.amount ?? 0,
           message: 'Transfer cancellation requested successfully',
         },
+        freshness,
       });
       cancelledResponse.headers.set('X-Correlation-Id', correlationId);
       applyCorsHeaders(request, cancelledResponse, CORS_ROUTE, {
@@ -193,6 +201,7 @@ export async function GET(
     const response = NextResponse.json({
       success: true,
       data: transferRecord,
+      freshness,
     });
     response.headers.set('X-Correlation-Id', correlationId);
     applyCorsHeaders(request, response, CORS_ROUTE, {

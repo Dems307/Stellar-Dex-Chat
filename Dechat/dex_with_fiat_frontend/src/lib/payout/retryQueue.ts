@@ -160,6 +160,11 @@ export class PayoutRetryQueue {
     initialDelayMs?: number;
     correlationId?: string;
   }): RetryJob {
+    // Synchronous critical section: the lookup and insertion below run without
+    // any await/yield, so concurrent callers (including parallel requests that
+    // resolve to the same event-loop tick) observe at most one job per
+    // idempotency key. This mirrors the DB-level unique constraint on
+    // (provider, idempotency_key) enforced by the production engine.
     const existing = Array.from(this.jobs.values()).find(
       (j) => j.idempotencyKey === params.idempotencyKey,
     );
@@ -228,16 +233,27 @@ export class PayoutRetryQueue {
     let failed = 0;
     let deadLetter = 0;
 
+    // Claim due jobs synchronously before any await so that concurrent
+    // processDueJobs invocations cannot both pick up the same job. The
+    // pending -> processing transition acts as an in-memory row lock,
+    // matching the SELECT ... FOR UPDATE SKIP LOCKED semantics used by the
+    // production database worker.
+    const claimed: RetryJob[] = [];
     for (const job of this.jobs.values()) {
       if (job.status !== 'pending' || job.nextRunAt > now) {
         continue;
       }
-
-      processed++;
       job.status = 'processing';
       job.attempts++;
       job.updatedAt = new Date().toISOString();
+      claimed.push(job);
+    }
+    if (claimed.length > 0) {
       this.persistToFile();
+    }
+
+    for (const job of claimed) {
+      processed++;
 
       try {
         const breaker = getProviderCircuitBreaker(
@@ -343,49 +359,13 @@ export class PayoutRetryQueue {
   }
 
   /**
-   * Operator action (dry-run): Preview the records a dead-letter replay would
-   * affect without mutating any state. Lets the operator confirm scope before
-   * committing to a replay that reuses the original idempotency key.
+   * Look up a job by its idempotency key. Used by concurrency tests and by
+   * callers that need to verify at most one retry job exists per key.
    */
-  public previewDeadLetterReplay(jobId: string): DeadLetterReplayPreview {
-    const job = this.jobs.get(jobId);
-    if (!job) {
-      throw new Error(`Retry job not found: ${jobId}`);
-    }
-
-    const eligible = job.status === 'dead_letter';
-
-    return {
-      jobId: job.id,
-      eligible,
-      ineligibleReason: eligible
-        ? undefined
-        : `Only dead-letter jobs can be replayed. Current status: ${job.status}`,
-      payoutId: job.payoutId,
-      idempotencyKey: job.idempotencyKey,
-      payload: job.payload,
-      attempts: job.attempts,
-      maxAttempts: job.maxAttempts,
-      lastError: job.lastError,
-      affectedRecords: [
-        {
-          kind: 'retry_job',
-          id: job.id,
-          detail: `Retry job ${job.id} (status: ${job.status}) will be rescheduled for immediate execution`,
-        },
-        {
-          kind: 'payout_intent',
-          id: job.payoutId,
-          detail: `Payout ${job.payoutId} for ${job.payload.amount} to ${job.payload.recipient}`,
-        },
-        {
-          kind: 'idempotency_record',
-          id: job.idempotencyKey,
-          detail: `Original idempotency key ${job.idempotencyKey} will be reused, preserving provider dedupe`,
-        },
-      ],
-      note: 'Replay reschedules this job using its original idempotency key. The provider dedupes on that key, so the operator action cannot cause a duplicate transfer.',
-    };
+  public getJobByIdempotencyKey(idempotencyKey: string): RetryJob | undefined {
+    return Array.from(this.jobs.values()).find(
+      (j) => j.idempotencyKey === idempotencyKey,
+    );
   }
 
   /**

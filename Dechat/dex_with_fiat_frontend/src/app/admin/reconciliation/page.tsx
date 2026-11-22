@@ -4,73 +4,10 @@ import { useState, useEffect, useCallback } from 'react';
 import { ReconciliationRecord } from '../../../types';
 import AdminGuard from '@/components/AdminGuard';
 
-interface ReconciliationTotals {
-  unresolvedCount: number;
-  amountAtRisk: number;
-  currency: string;
-}
-
-interface ReconciliationResponse {
-  records: ReconciliationRecord[];
-  totals?: ReconciliationTotals;
-  verifiedTotals?: ReconciliationTotals;
-}
-
-const RUNBOOK_BASE_URL = '/docs/runbooks/reconciliation';
-
-function getRunbookUrl(status: string): string {
-  switch (status) {
-    case 'unmatched':
-      return `${RUNBOOK_BASE_URL}#unmatched-payout`;
-    case 'error':
-      return `${RUNBOOK_BASE_URL}#payout-error`;
-    default:
-      return `${RUNBOOK_BASE_URL}#overview`;
-  }
-}
-
-function getNextAction(record: ReconciliationRecord): string {
-  if (record.status === 'matched') {
-    return 'No action required';
-  }
-  if (record.status === 'error') {
-    return 'Investigate payout error and retry or refund';
-  }
-  if (!record.payoutId) {
-    return 'Initiate payout for unmatched deposit';
-  }
-  return 'Reconcile deposit against payout';
-}
-
-function getAgeInHours(date: string): number {
-  const parsed = new Date(date).getTime();
-  if (Number.isNaN(parsed)) {
-    return 0;
-  }
-  return Math.max(0, (Date.now() - parsed) / (1000 * 60 * 60));
-}
-
-function formatAge(hours: number): string {
-  if (hours < 1) {
-    return `${Math.round(hours * 60)}m`;
-  }
-  if (hours < 48) {
-    return `${Math.round(hours)}h`;
-  }
-  return `${Math.round(hours / 24)}d`;
-}
-
-function totalsMismatch(
-  displayed: ReconciliationTotals | undefined,
-  verified: ReconciliationTotals | undefined,
-): boolean {
-  if (!displayed || !verified) {
-    return false;
-  }
-  return (
-    displayed.unresolvedCount !== verified.unresolvedCount ||
-    Math.abs(displayed.amountAtRisk - verified.amountAtRisk) > 0.000001
-  );
+export interface ReadModelFreshness {
+  isStale: boolean;
+  sourceLedgerCursor?: string | number | null;
+  dbUpdatedAt?: string | null;
 }
 
 export default function ReconciliationDashboard() {
@@ -88,7 +25,7 @@ export default function ReconciliationDashboard() {
   const [endDate, setEndDate] = useState<string>('');
   const [loading, setLoading] = useState(true);
   const [showReauthPrompt, setShowReauthPrompt] = useState(false);
-  const [conflictCount, setConflictCount] = useState(0);
+  const [freshness, setFreshness] = useState<ReadModelFreshness | null>(null);
 
   useEffect(() => {
     fetchReconciliationData();
@@ -107,16 +44,19 @@ export default function ReconciliationDashboard() {
       }
       
       if (response.ok) {
-        const data: ReconciliationResponse | ReconciliationRecord[] =
-          await response.json();
+        const data = await response.json();
+        // Support both the legacy bare-array payload and the freshness-aware
+        // envelope { records, isStale, sourceLedgerCursor, dbUpdatedAt }.
         if (Array.isArray(data)) {
           setRecords(data);
-          setTotals(undefined);
-          setVerifiedTotals(undefined);
+          setFreshness(null);
         } else {
           setRecords(data.records ?? []);
-          setTotals(data.totals);
-          setVerifiedTotals(data.verifiedTotals);
+          setFreshness({
+            isStale: Boolean(data.isStale),
+            sourceLedgerCursor: data.sourceLedgerCursor ?? null,
+            dbUpdatedAt: data.dbUpdatedAt ?? null,
+          });
         }
       } else {
         console.error('Failed to fetch data');
@@ -315,6 +255,41 @@ export default function ReconciliationDashboard() {
           </div>
         </div>
 
+        {/* Read-model freshness metadata */}
+        {freshness && (
+          <div
+            data-testid="reconciliation-freshness"
+            className="mb-8 flex flex-wrap items-center gap-4 text-sm text-gray-600 dark:text-gray-400"
+          >
+            {freshness.isStale ? (
+              <span
+                data-testid="reconciliation-stale-badge"
+                className="inline-flex px-2 py-1 text-xs font-semibold rounded-full bg-yellow-100 text-yellow-800 dark:bg-yellow-800 dark:text-yellow-200"
+              >
+                Stale projection — not confirmed settlement state
+              </span>
+            ) : (
+              <span
+                data-testid="reconciliation-fresh-badge"
+                className="inline-flex px-2 py-1 text-xs font-semibold rounded-full bg-green-100 text-green-800 dark:bg-green-800 dark:text-green-200"
+              >
+                Fresh
+              </span>
+            )}
+            {freshness.sourceLedgerCursor !== null &&
+              freshness.sourceLedgerCursor !== undefined && (
+                <span data-testid="reconciliation-ledger-cursor">
+                  Ledger cursor: {String(freshness.sourceLedgerCursor)}
+                </span>
+              )}
+            {freshness.dbUpdatedAt && (
+              <span data-testid="reconciliation-db-updated-at">
+                DB updated: {new Date(freshness.dbUpdatedAt).toLocaleString()}
+              </span>
+            )}
+          </div>
+        )}
+
         {/* Filters */}
         <div className="bg-white dark:bg-gray-800 rounded-lg shadow p-6 mb-8">
           <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
@@ -478,33 +453,42 @@ export default function ReconciliationDashboard() {
                       </div>
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap">
-                      <span
-                        className={`inline-flex px-2 py-1 text-xs font-semibold rounded-full ${
-                          record.status === 'matched'
-                            ? 'bg-green-100 text-green-800 dark:bg-green-800 dark:text-green-200'
-                            : record.status === 'ambiguous'
-                              ? 'bg-yellow-100 text-yellow-800 dark:bg-yellow-800 dark:text-yellow-200'
-                              : record.status === 'unmatched'
-                                ? 'bg-orange-100 text-orange-800 dark:bg-orange-800 dark:text-orange-200'
-                                : 'bg-red-100 text-red-800 dark:bg-red-800 dark:text-red-200'
-                        }`}
-                      >
-                        {record.status}
-                      </span>
-                      {record.payoutId && (
-                        <div className="mt-1">
+                      {freshness?.isStale ? (
+                        <span
+                          data-testid="reconciliation-record-stale"
+                          className="inline-flex px-2 py-1 text-xs font-semibold rounded-full bg-yellow-100 text-yellow-800 dark:bg-yellow-800 dark:text-yellow-200"
+                        >
+                          Stale — unconfirmed
+                        </span>
+                      ) : (
+                        <>
                           <span
                             className={`inline-flex px-2 py-1 text-xs font-semibold rounded-full ${
-                              record.payoutStatus === 'completed'
+                              record.status === 'matched'
                                 ? 'bg-green-100 text-green-800 dark:bg-green-800 dark:text-green-200'
-                                : record.payoutStatus === 'pending'
+                                : record.status === 'unmatched'
                                   ? 'bg-yellow-100 text-yellow-800 dark:bg-yellow-800 dark:text-yellow-200'
                                   : 'bg-red-100 text-red-800 dark:bg-red-800 dark:text-red-200'
                             }`}
                           >
-                            {record.payoutStatus}
+                            {record.status}
                           </span>
-                        </div>
+                          {record.payoutId && (
+                            <div className="mt-1">
+                              <span
+                                className={`inline-flex px-2 py-1 text-xs font-semibold rounded-full ${
+                                  record.payoutStatus === 'completed'
+                                    ? 'bg-green-100 text-green-800 dark:bg-green-800 dark:text-green-200'
+                                    : record.payoutStatus === 'pending'
+                                      ? 'bg-yellow-100 text-yellow-800 dark:bg-yellow-800 dark:text-yellow-200'
+                                      : 'bg-red-100 text-red-800 dark:bg-red-800 dark:text-red-200'
+                                }`}
+                              >
+                                {record.payoutStatus}
+                              </span>
+                            </div>
+                          )}
+                        </>
                       )}
                       {record.status !== 'matched' && (
                         <div className="mt-1">

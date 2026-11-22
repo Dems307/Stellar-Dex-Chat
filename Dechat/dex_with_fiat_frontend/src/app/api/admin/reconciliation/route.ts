@@ -207,10 +207,24 @@ export async function GET(request: NextRequest) {
       return authError;
     }
 
+    // Read-only reconciliation job by default (Issue #39)
+    const deposits = reconciliationStore.getDeposits();
+    const payouts = reconciliationStore.getPayouts();
+    const report = reconcileRecords(deposits, payouts);
+
+    // Read-model freshness metadata (Issue #249): expose the source ledger
+    // cursor and database update time so stale projections are never
+    // represented as confirmed settlement state.
+    const freshness = await buildReadModelFreshness({
+      dbUpdatedAt: report.evaluatedAt,
+    });
+
+    // If caller requests structured report format
     const format = request.nextUrl.searchParams.get('format');
-    if (format === 'conflicts') {
+    if (format === 'report') {
       return NextResponse.json({
-        conflicts: payoutReconciliationService.getEvidenceConflicts(),
+        ...serializeReconciliationReport(report),
+        freshness,
       });
     }
 
@@ -243,7 +257,30 @@ export async function GET(request: NextRequest) {
       });
     }
 
-    return NextResponse.json(records);
+    for (const dup of report.duplicated) {
+      for (const d of dup.deposits) {
+        records.push({
+          id: String(counter++),
+          depositTxHash: d.txHash,
+          depositAmount: fromMinorUnits(d.amountMinor, d.currency),
+          depositUser: d.wallet,
+          depositDate: d.timestamp,
+          payoutId: dup.payouts[0]?.payoutId || '',
+          payoutAmount: dup.payouts[0]
+            ? fromMinorUnits(
+                dup.payouts[0].amountMinor,
+                dup.payouts[0].currency,
+              )
+            : '',
+          payoutRecipient: dup.payouts[0]?.recipient || '',
+          payoutStatus: dup.payouts[0]?.payoutStatus || 'pending',
+          payoutDate: dup.payouts[0]?.payoutDate || '',
+          status: 'error',
+        });
+      }
+    }
+
+    return NextResponse.json({ data: records, freshness });
   } catch (error) {
     console.error('Error fetching reconciliation data:', error);
     return NextResponse.json(

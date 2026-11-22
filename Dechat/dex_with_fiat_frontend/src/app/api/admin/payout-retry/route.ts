@@ -2,6 +2,20 @@ import { NextRequest, NextResponse } from 'next/server';
 import { requireAdminAuth } from '../_utils/requireAdminAuth';
 import { enforceRouteCors } from '@/lib/security/routeCors';
 import { payoutRetryQueue } from '@/lib/payout/retryQueue';
+import { getIndexerCursor } from '@/lib/indexer/cursor';
+
+function buildFreshness(jobs: Array<{ updatedAt?: string }>) {
+  const latestUpdatedAt = jobs.reduce<string | undefined>((latest, job) => {
+    if (!job.updatedAt) return latest;
+    if (!latest) return job.updatedAt;
+    return job.updatedAt > latest ? job.updatedAt : latest;
+  }, undefined);
+
+  return {
+    dbUpdatedAt: latestUpdatedAt ?? null,
+    sourceLedgerCursor: getIndexerCursor(),
+  };
+}
 
 // Contract tests for this route live in
 // src/app/api/admin/payout-retry/__tests__/route.contract.test.ts and assert
@@ -28,6 +42,7 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({
         jobs: deadLetterJobs,
         count: deadLetterJobs.length,
+        freshness: buildFreshness(deadLetterJobs),
       });
     }
 
@@ -35,7 +50,11 @@ export async function GET(request: NextRequest) {
       status as
         'pending' | 'processing' | 'dead_letter' | 'completed' | undefined,
     );
-    return NextResponse.json({ jobs, count: jobs.length });
+    return NextResponse.json({
+      jobs,
+      count: jobs.length,
+      freshness: buildFreshness(jobs),
+    });
   } catch (err: unknown) {
     console.error('Error fetching retry queue jobs:', err);
     return NextResponse.json(

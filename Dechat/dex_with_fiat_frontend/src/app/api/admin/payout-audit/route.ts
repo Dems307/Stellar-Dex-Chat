@@ -98,13 +98,42 @@ export async function GET(request: NextRequest) {
       partition,
     });
 
+    // Read-model freshness: expose the source ledger cursor and the latest
+    // audit entry timestamp so clients never present stale projections as
+    // confirmed settlement state.
+    const latestEntry = result.entries.reduce<{ timestamp?: string } | null>(
+      (latest, entry) => {
+        const timestamp = (entry as { timestamp?: string }).timestamp;
+        if (!timestamp) return latest;
+        if (!latest?.timestamp) return { timestamp };
+        return new Date(timestamp).getTime() >
+          new Date(latest.timestamp).getTime()
+          ? { timestamp }
+          : latest;
+      },
+      null,
+    );
+
+    const freshness = buildFreshnessMetadata({
+      dbUpdatedAt: latestEntry?.timestamp ?? null,
+    });
+
+    // Data lineage (#252): attach persisted calculation lineage per payout
+    // entry when available so auditors can recompute displayed/paid amounts.
+    const entries = result.entries.map((entry) => {
+      const payoutId = (entry as { payoutId?: string }).payoutId;
+      const lineage = payoutId
+        ? getCalculationLineageForPayout(payoutId)
+        : undefined;
+      return lineage ? { ...entry, lineage } : entry;
+    });
+
     return NextResponse.json(
-      { ...result, archiveManifest: manifest },
+      { ...result, entries, freshness },
       {
         status: 200,
         headers: {
           'Cache-Control': 'no-store, no-cache, must-revalidate',
-          'X-Audit-Archive-Version': manifest.version,
         },
       },
     );
