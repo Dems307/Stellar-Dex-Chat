@@ -455,6 +455,7 @@ Repo Avatar
 - Add payout traceability and settlement safeguards (#228, #227, #226, #225)
 - **a11y:** Standardize accessible error summaries for API and wallet failures
 - **rtl:** Add right-to-left layout support for wallet and payout flows
+- **payout:** Stream status updates with bounded replay
 
 ### Fixed
 
@@ -952,6 +953,21 @@ Repo Avatar
 - #124 ops: automate production readiness and canary verification
 - #125 ci: enforce least-privilege path-aware workflows and required
 - #126 test(e2e): run full-stack flows against disposable Soroban and
+- #217 Add tenant-aware AI budget accounting with atomic reservations
+- #218 Support cancellation and timeout propagation through every mod
+- #219 Add privacy-safe retention controls for model traces and evalu
+- #209 Add keyboard-operable recovery flows for failed transactions
+- #210 Replace legacy admin page code with a supported route boundary
+- #211 Add visual regression coverage for critical financial states
+- #212 Add a typed, versioned schema for AI tool-call proposals
+- #213 Evaluate multi-turn intent retention and correction handling
+- #214 Add adversarial evaluation for prompt injection through quoted
+- #215 Make model failover preserve conversation and policy versions
+- #216 Add user-visible provenance for AI-generated financial claims
+- #205 Make transaction status subscriptions reconnect without gaps
+- #206 Add explicit transaction intent confirmation for AI handoff
+- #207 Provide stable URLs for shareable read-only transaction views
+- #208 Build a client-side cache invalidation policy for wallet event
 
 ### Changed
 
@@ -1299,6 +1315,9 @@ Repo Avatar
 - **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
+- **changelog:** Update changelog [skip ci]
+- **wallet:** Cover freighter transitions and account isolation
+- **locale:** Cover timezone and localized numeric boundaries
 
 ### Deprecated
 
