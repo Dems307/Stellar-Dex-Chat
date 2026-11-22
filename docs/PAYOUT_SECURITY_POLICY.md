@@ -64,34 +64,24 @@ This document specifies the threat model, enforcement strategy, and cross-origin
    - Requests with missing or invalid signatures are rejected immediately with `401 Unauthorized`.
    - If `PAYSTACK_SECRET_KEY` is not configured, the endpoint fails closed with a `400 Bad Request`.
 
-2. **Replay Protection**:
-   - Webhook events are checked against a bounded replay cache with a 15-minute TTL to prevent duplicate processing of replayed callback payloads.
+2. **Replay Protection and Event Ordering**:
+   - Webhook deliveries are deduplicated by provider event ID; committed duplicates receive a successful acknowledgement without applying another payout transition.
+   - The durable deduplication and event-order records use `PAYOUT_DATA_DIR` when configured. Deduplication records are retained for seven days by default, and abandoned in-flight processing locks expire after 30 seconds.
+   - Provider event time and server receipt time are stored for each event. Events are ordered by provider time with stable status and event-ID tie-breakers, and the payout state is reconciled against that ordered history so delivery order does not determine the final state.
+   - Terminal transitions are monotonic: delayed or contradictory events cannot downgrade a terminal payout state. Rejected events remain available for investigation.
 
----
+## 4. Payout Traceability and Settlement Estimates
 
-## 4. Payout Saga Transition Invariants
+1. **Provider Idempotency**:
+   - Each external transfer attempt stores its provider key, request fingerprint, expiration, and response reference in the durable provider idempotency registry.
+   - `PAYSTACK_IDEMPOTENCY_WINDOW_MS` configures the Paystack key window (24 hours by default). A retry after expiration first reconciles the provider status; a new provider key is issued only after the provider confirms that no transfer exists.
+   - Reusing an idempotency key with a different request is rejected.
 
-The deterministic saga property suite (`src/lib/payout/payoutSagaProperties.test.ts`)
-generates seeded event sequences containing settlements, retries, duplicate
-callbacks, cancellations, reversals, reconciliation polls, stale callbacks, and
-unauthorized transition attempts.
+2. **Reservation Ledger**:
+   - When `contractReceiptId` is supplied to `POST /api/initiate-transfer`, the ledger links that receipt and reserved minor-unit amount to the payout, provider transfer reference, and its final settlement/release/review action.
+   - Ledger entries are append-only and hash-linked. Duplicate settlement/release actions are idempotent, while conflicting receipt, amount, or provider-transfer links are rejected.
+   - The ledger uses `PAYOUT_DATA_DIR` when configured. Configure this directory on persistent storage in deployments that require payout records to survive restarts.
 
-### Enforced invariants
-
-| Invariant                   | Guarantee                                                                                                                                                   |
-| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Terminal-state monotonicity | Once a payout reaches `failed`, `cancelled`, or `reversed`, every later observation remains in that state.                                                  |
-| Exactly-once settlement     | At most one `pending -> success` transition is recorded per payout reference. Duplicate and retried settlement callbacks do not create a second settlement. |
-| Exactly-once release        | At most one release transition (`pending -> cancelled` or `success -> reversed`) is recorded per payout reference.                                          |
-| Authorization gate          | `attacker` actors cannot settle, cancel, or reverse a payout. Unauthorized events leave the transition history unchanged.                                   |
-| Retry bound                 | Repeated pending retries do not advance the lifecycle or produce side effects.                                                                              |
-
-`settle` and `release` are counted from persisted transition history, not from
-event deliveries, so retries and duplicate callbacks cannot inflate either
-counter. The generator is seeded and uses no credentials or real user data.
-
-`setTransferStatus` remains a compatibility wrapper, but real status changes now
-route through `transitionPayoutStatus` so terminal-state guards and transition
-history apply to every caller. Metadata-only updates preserve existing history.
-`clearTransferStore` also clears the replay cache so test isolation matches the
-lifecycle store.
+3. **Settlement Estimate**:
+   - Provider calendars define supported currencies, time zones, business days, non-processing dates, cutoff times, and settlement windows.
+   - For configured currencies, `POST /api/initiate-transfer` includes a `settlementEstimate` with earliest/latest timestamps, timezone, and configuration source. Estimates are indicative windows, not a guarantee of settlement time.
