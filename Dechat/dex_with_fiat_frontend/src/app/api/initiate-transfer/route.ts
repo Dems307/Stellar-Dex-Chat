@@ -4,7 +4,8 @@ import { getPayoutProvider } from '@/lib/payout/providers/registry';
 import { sanitizeProviderError } from '@/lib/payout/timeoutBudget';
 import { telemetry } from '@/lib/telemetry';
 import { applyRateLimit, getClientIp } from '@/lib/rateLimit';
-import { setTransferStatus } from '@/lib/transferStore';
+import { enforcePayoutRouteSecurity } from '@/lib/payout/routeSecurity';
+import { setTransferStatus, getTransferStatus } from '@/lib/transferStore';
 import { initiateTransferSchema } from '@/lib/apiSchemas';
 import { payoutAuditLedger } from '@/lib/payout/auditLedger';
 import {
@@ -55,13 +56,18 @@ function hashPayoutRequest(payload: {
 }
 
 export async function OPTIONS(request: NextRequest) {
-  return (
-    enforcePayoutRouteSecurity(request) ||
-    new NextResponse(null, { status: 204 })
-  );
+  // Reject untrusted preflight requests before any expensive work
+  const securityBlocked = enforcePayoutRouteSecurity(request);
+  if (securityBlocked) return securityBlocked;
+
+  return new NextResponse(null, {
+    status: 204,
+    headers: buildCorsHeaders(request),
+  });
 }
 
 export async function POST(request: NextRequest) {
+  // Enforce payout API security (CORS origin + credentials) before any work
   const securityBlocked = enforcePayoutRouteSecurity(request);
   if (securityBlocked) return securityBlocked;
   const apiVersionBlocked = enforcePayoutApiVersion(request);
@@ -447,7 +453,20 @@ export async function POST(request: NextRequest) {
     });
     return NextResponse.json(errorDetails.body, {
       status: errorDetails.status,
-      headers: errorDetails.headers,
+      headers: { ...errorDetails.headers, ...buildCorsHeaders(request) },
     });
   }
+}
+
+function buildCorsHeaders(request: NextRequest): Record<string, string> {
+  const origin = request.headers.get('origin');
+  if (!origin) return {};
+  return {
+    'Access-Control-Allow-Origin': origin,
+    'Access-Control-Allow-Credentials': 'true',
+    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+    'Access-Control-Allow-Headers':
+      'Content-Type, X-Idempotency-Key, X-Client-Session-Id',
+    Vary: 'Origin',
+  };
 }
