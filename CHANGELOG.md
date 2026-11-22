@@ -968,6 +968,10 @@ Repo Avatar
 - #206 Add explicit transaction intent confirmation for AI handoff
 - #207 Provide stable URLs for shareable read-only transaction views
 - #208 Build a client-side cache invalidation policy for wallet event
+- #221 Create deterministic replay fixtures for policy decisions
+- #222 Introduce a transactional outbox for payout side effects
+- #223 Define a provider capability contract for reversals and recall
+- #224 Add a first-class payout reversal and dispute lifecycle
 
 ### Changed
 
@@ -1318,6 +1322,7 @@ Repo Avatar
 - **changelog:** Update changelog [skip ci]
 - **wallet:** Cover freighter transitions and account isolation
 - **locale:** Cover timezone and localized numeric boundaries
+- **changelog:** Update changelog [skip ci]
 
 ### Deprecated
 
