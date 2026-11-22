@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { payoutAuditLedger, PayoutAuditLedger } from './auditLedger';
 import { PayoutProvider } from './providers/types';
+import type { FxQuoteRecord } from './fxQuoteProvenance';
 
 export interface RetryJobPayload {
   source: string;
@@ -9,6 +10,8 @@ export interface RetryJobPayload {
   recipient: string;
   reason?: string;
   reference: string;
+  fxQuote?: FxQuoteRecord;
+  amountMinorUnits?: string;
 }
 
 export interface RetryJob {
@@ -125,6 +128,8 @@ export class PayoutRetryQueue {
       amount: number;
       recipient: string;
       reason?: string;
+      fxQuote?: FxQuoteRecord;
+      amountMinorUnits?: string;
     };
     error?: string;
     initialDelayMs?: number;
@@ -210,13 +215,19 @@ export class PayoutRetryQueue {
       this.persistToFile();
 
       try {
-        await provider.initiateTransfer({
-          source: job.payload.source,
-          amount: job.payload.amount,
-          recipient: job.payload.recipient,
-          reason: job.payload.reason,
-          reference: job.idempotencyKey, // Reuses original idempotency key!
-        });
+        const breaker = getProviderCircuitBreaker(
+          provider.name,
+          'transfer_initiation',
+        );
+        await breaker.execute(() =>
+          provider.initiateTransfer({
+            source: job.payload.source,
+            amount: job.payload.amount,
+            recipient: job.payload.recipient,
+            reason: job.payload.reason,
+            reference: job.idempotencyKey,
+          }),
+        );
 
         job.status = 'completed';
         job.updatedAt = new Date().toISOString();

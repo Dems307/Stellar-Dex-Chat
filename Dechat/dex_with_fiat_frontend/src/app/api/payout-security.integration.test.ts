@@ -3,6 +3,8 @@ import { NextRequest } from 'next/server';
 import crypto from 'crypto';
 import { clearBeneficiaryStore } from '@/lib/payout/beneficiaryStore';
 import { clearTransferStore } from '@/lib/transferStore';
+import { createWalletSessionToken } from '@/lib/payout/auth';
+import { issueBeneficiaryVerification } from '@/lib/payout/beneficiaryVerification';
 
 vi.mock('server-only', () => ({}));
 
@@ -11,6 +13,7 @@ const TEST_SECRET = 'test_paystack_secret_key_1234567890';
 const mockEnv = {
   PAYSTACK_SECRET_KEY: TEST_SECRET,
   ADMIN_SECRET: 'test_admin_secret',
+  BENEFICIARY_DEDUPE_SECRET: 'test_beneficiary_dedupe_secret',
 };
 
 vi.mock('@/lib/serverEnv', () => ({
@@ -22,6 +25,9 @@ vi.mock('@/lib/serverEnv', () => ({
 vi.mock('@/lib/rateLimit', () => ({
   applyRateLimit: () => null,
   getClientIp: () => '127.0.0.1',
+  ROUTE_COST_BUCKETS: {
+    '/api/webhook': { maxRequests: 10, windowMs: 60_000 },
+  },
 }));
 
 vi.mock('@/lib/telemetry', () => ({
@@ -59,6 +65,20 @@ const RECIPIENT_PAYLOAD = {
   bank_code: '058',
   currency: 'NGN',
 };
+const WALLET_ADDRESS =
+  'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
+const WALLET_SESSION =
+  createWalletSessionToken(WALLET_ADDRESS).sessionToken;
+function getVerifiedRecipientPayload() {
+  const { verificationToken } = issueBeneficiaryVerification({
+    accountNumber: RECIPIENT_PAYLOAD.account_number,
+    bankCode: RECIPIENT_PAYLOAD.bank_code,
+    currency: RECIPIENT_PAYLOAD.currency,
+    identityScope: `wallet:${WALLET_ADDRESS}`,
+    accountName: RECIPIENT_PAYLOAD.name,
+  });
+  return { ...RECIPIENT_PAYLOAD, verificationToken };
+}
 
 describe('Payout API Security Integration Tests', () => {
   beforeEach(() => {
@@ -77,8 +97,9 @@ describe('Payout API Security Integration Tests', () => {
             'content-type': 'application/json',
             origin: 'http://localhost:3000',
             'sec-fetch-site': 'same-origin',
+            'x-wallet-session': WALLET_SESSION,
           },
-          body: JSON.stringify(RECIPIENT_PAYLOAD),
+          body: JSON.stringify(getVerifiedRecipientPayload()),
         },
       );
 
@@ -118,9 +139,9 @@ describe('Payout API Security Integration Tests', () => {
           method: 'POST',
           headers: {
             'content-type': 'application/json',
-            authorization: 'Bearer wallet_preflight_auth',
+            authorization: `Bearer ${WALLET_SESSION}`,
           },
-          body: JSON.stringify(RECIPIENT_PAYLOAD),
+          body: JSON.stringify(getVerifiedRecipientPayload()),
         },
       );
 
