@@ -452,6 +452,10 @@ Repo Avatar
 - **integration:** Catch integration failures across intent, signing, and payout
 - **contract:** Event schemas, resource budgets, upgrade compatibility, and adversarial fixtures
 - **api:** Harden payout lifecycle with reconciliation, minor units, ownership auth, and provider adapters
+- **security:** Add release-time secret scanning with exception policy
+- **ci:** Add migration and contract-upgrade checks to PR template
+- **ci:** Improve caching without weakening reproducibility
+- **ci:** Add ephemeral preview environments for high-risk frontend changes
 - **fixtures:** Add deterministic privacy-safe synthetic fixtures
 - Add payout traceability and settlement safeguards (#228, #227, #226, #225)
 - **a11y:** Standardize accessible error summaries for API and wallet failures
@@ -459,6 +463,7 @@ Repo Avatar
 - **payout:** Stream status updates with bounded replay
 - **perf:** Enforce audit and chat performance budgets
 - **payout:** Audited, idempotent dead-letter replay operator action
+- **fixtures:** Deterministic full-stack fixture with seeded ledger history
 
 ### Fixed
 
@@ -1325,6 +1330,8 @@ Repo Avatar
 - **deps:** Bump the actions group across 1 directory with 6 updates
 - **deps-dev:** Bump @types/node
 - **changelog:** Update changelog [skip ci]
+- **payout:** Add stateful saga property suite
+- **runbooks:** Add maintainer runbooks for failed release and deployment workflows
 - **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
@@ -1334,6 +1341,8 @@ Repo Avatar
 - **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
+- **changelog:** Update changelog [skip ci]
+- **fault-injection:** Add fault-injection tests for DB, RPC, and provider outages
 
 ### Deprecated
 
@@ -1898,3 +1907,6 @@ Fix/1455 1458 1478 1479 ci security hardening
 - Merge pull request #154 from softnationz/feat/issues-47-48-49-50
 
 feat(api): circuit breaker, race-safe recipients, reconciliation, and security hardening (#47, #48, #49, #50)
+- Merge pull request #311 from jolesonbethany1-dev/fix/265-release-secret-policy
+
+feat(security): release-time secret scanning with expiring exceptions
