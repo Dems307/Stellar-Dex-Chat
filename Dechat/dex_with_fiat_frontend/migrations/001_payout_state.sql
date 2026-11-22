@@ -4,6 +4,38 @@
 -- concurrency constraints (idempotency_key, provider_reference, webhook
 -- event id, retry job key).
 
+-- ---------------------------------------------------------------------------
+-- Migration metadata (Issue #247)
+-- ---------------------------------------------------------------------------
+-- Records every applied migration together with its checksum so that repeat
+-- applies are idempotent and drift is detected. `rollback_evidence` documents
+-- the forward-recovery / rollback procedure for the migration.
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version VARCHAR(64) PRIMARY KEY,
+  name VARCHAR(255) NOT NULL,
+  checksum VARCHAR(64) NOT NULL,
+  applied_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  rollback_evidence TEXT
+);
+
+-- Coordination lock so concurrent runners cannot apply migrations in
+-- parallel. A single row (id = 1) is used as an advisory lock; runners acquire
+-- it with `SELECT ... FOR UPDATE` inside a transaction and release it on
+-- commit/rollback.
+CREATE TABLE IF NOT EXISTS migration_lock (
+  id SMALLINT PRIMARY KEY,
+  locked_by VARCHAR(128),
+  locked_at TIMESTAMP WITH TIME ZONE,
+  CONSTRAINT migration_lock_singleton CHECK (id = 1)
+);
+
+INSERT INTO migration_lock (id, locked_by, locked_at)
+VALUES (1, NULL, NULL)
+ON CONFLICT (id) DO NOTHING;
+
+-- ---------------------------------------------------------------------------
+-- Payout schema (Issue #97)
+-- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS payout_intents (
   id VARCHAR(64) PRIMARY KEY,
   idempotency_key VARCHAR(128) UNIQUE NOT NULL,

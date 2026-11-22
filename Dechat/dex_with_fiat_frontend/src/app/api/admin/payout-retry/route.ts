@@ -16,6 +16,11 @@ function buildFreshness(jobs: Array<{ updatedAt?: string }>) {
   };
 }
 
+// Contract tests for this route live in
+// src/app/api/admin/payout-retry/__tests__/route.contract.test.ts and assert
+// every response (401/403 auth failures, 400 validation errors, 200 success)
+// against the published OpenAPI schema.
+
 export async function GET(request: NextRequest) {
   const authError = requireAdminAuth(request);
   if (authError) {
@@ -37,11 +42,7 @@ export async function GET(request: NextRequest) {
 
     const jobs = payoutRetryQueue.getJobs(
       status as
-        | 'pending'
-        | 'processing'
-        | 'dead_letter'
-        | 'completed'
-        | undefined,
+        'pending' | 'processing' | 'dead_letter' | 'completed' | undefined,
     );
     return NextResponse.json({
       jobs,
@@ -68,8 +69,9 @@ export async function POST(request: NextRequest) {
       jobId?: string;
       action?: string;
       actor?: string;
+      reason?: string;
     };
-    const { jobId, action, actor = 'operator:admin' } = body;
+    const { jobId, action, actor = 'operator:admin', reason } = body;
 
     if (!jobId) {
       return NextResponse.json(
@@ -78,14 +80,26 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    if (action === 'preview') {
+      const preview = payoutRetryQueue.previewDeadLetterReplay(jobId);
+      return NextResponse.json({ preview });
+    }
+
     if (action !== 'replay') {
       return NextResponse.json(
-        { error: 'Unsupported action. Supported actions: replay' },
+        { error: 'Unsupported action. Supported actions: preview, replay' },
         { status: 400 },
       );
     }
 
-    const job = payoutRetryQueue.replayDeadLetterJob(jobId, actor);
+    if (!reason || !reason.trim()) {
+      return NextResponse.json(
+        { error: 'Missing required field: reason' },
+        { status: 400 },
+      );
+    }
+
+    const job = payoutRetryQueue.replayDeadLetterJob(jobId, actor, reason);
 
     return NextResponse.json({
       success: true,

@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { payoutAuditLedger, PayoutAuditLedger } from './auditLedger';
 import { PayoutProvider } from './providers/types';
+import type { FxQuoteRecord } from './fxQuoteProvenance';
 
 export interface RetryJobPayload {
   source: string;
@@ -9,6 +10,8 @@ export interface RetryJobPayload {
   recipient: string;
   reason?: string;
   reference: string;
+  fxQuote?: FxQuoteRecord;
+  amountMinorUnits?: string;
 }
 
 export interface RetryJob {
@@ -31,6 +34,31 @@ export interface BackoffConfig {
   maxDelayMs: number;
   maxAttempts: number;
   jitterFactor: number;
+}
+
+export interface AffectedRecord {
+  kind: 'retry_job' | 'payout_intent' | 'idempotency_record';
+  id: string;
+  detail: string;
+}
+
+/**
+ * Dry-run preview of the records a dead-letter replay would touch. Returned
+ * without mutating any state so the operator can confirm scope before
+ * committing to a replay that reuses the original idempotency key.
+ */
+export interface DeadLetterReplayPreview {
+  jobId: string;
+  eligible: boolean;
+  ineligibleReason?: string;
+  payoutId: string;
+  idempotencyKey: string;
+  payload: RetryJobPayload;
+  attempts: number;
+  maxAttempts: number;
+  lastError?: string;
+  affectedRecords: AffectedRecord[];
+  note: string;
 }
 
 export const DEFAULT_BACKOFF_CONFIG: BackoffConfig = {
@@ -125,6 +153,8 @@ export class PayoutRetryQueue {
       amount: number;
       recipient: string;
       reason?: string;
+      fxQuote?: FxQuoteRecord;
+      amountMinorUnits?: string;
     };
     error?: string;
     initialDelayMs?: number;
@@ -226,13 +256,19 @@ export class PayoutRetryQueue {
       processed++;
 
       try {
-        await provider.initiateTransfer({
-          source: job.payload.source,
-          amount: job.payload.amount,
-          recipient: job.payload.recipient,
-          reason: job.payload.reason,
-          reference: job.idempotencyKey, // Reuses original idempotency key!
-        });
+        const breaker = getProviderCircuitBreaker(
+          provider.name,
+          'transfer_initiation',
+        );
+        await breaker.execute(() =>
+          provider.initiateTransfer({
+            source: job.payload.source,
+            amount: job.payload.amount,
+            recipient: job.payload.recipient,
+            reason: job.payload.reason,
+            reference: job.idempotencyKey,
+          }),
+        );
 
         job.status = 'completed';
         job.updatedAt = new Date().toISOString();
@@ -334,13 +370,26 @@ export class PayoutRetryQueue {
 
   /**
    * Operator action: Replay an exhausted dead-letter job.
-   * Resets status to pending with immediate execution schedule,
-   * reusing the original idempotency key to prevent double transfers.
+   *
+   * Requires a non-empty `reason` so every replay is attributable. Resets
+   * status to pending with immediate execution schedule, reusing the original
+   * idempotency key to prevent double transfers. Records the operator and the
+   * resulting provider state in the append-only audit ledger.
+   *
+   * Idempotent: only dead-letter jobs are eligible, so a repeated replay is a
+   * no-op error rather than a second provider call.
    */
   public replayDeadLetterJob(
     jobId: string,
     actor = 'operator:admin',
+    reason?: string,
   ): RetryJob {
+    if (!reason || !reason.trim()) {
+      throw new Error(
+        'A non-empty reason is required to replay a dead-letter job',
+      );
+    }
+
     const job = this.jobs.get(jobId);
     if (!job) {
       throw new Error(`Retry job not found: ${jobId}`);
@@ -366,7 +415,10 @@ export class PayoutRetryQueue {
       metadata: {
         jobId: job.id,
         action: 'operator_replay',
+        reason,
         originalIdempotencyKey: job.idempotencyKey,
+        resultingStatus: job.status,
+        nextRunAt: new Date(job.nextRunAt).toISOString(),
       },
     });
 

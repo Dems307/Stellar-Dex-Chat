@@ -94,9 +94,6 @@ export async function GET(request: NextRequest) {
       });
     }
 
-    const fileContent = fs.readFileSync(EVENTS_FILE, 'utf8');
-    const events: ContractEvent[] = JSON.parse(fileContent);
-    
     // Paginate and return
     const paginatedEvents = events.slice(offset, offset + limit);
 

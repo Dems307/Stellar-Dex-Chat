@@ -452,6 +452,22 @@ Repo Avatar
 - **integration:** Catch integration failures across intent, signing, and payout
 - **contract:** Event schemas, resource budgets, upgrade compatibility, and adversarial fixtures
 - **api:** Harden payout lifecycle with reconciliation, minor units, ownership auth, and provider adapters
+- Add signed release attestations for contract and frontend artifacts
+- **i18n:** Add localization QA fixtures for financial edge cases
+- Add rollback-safe frontend and API release health gates
+- **security:** Add release-time secret scanning with exception policy
+- **ci:** Add migration and contract-upgrade checks to PR template
+- **ci:** Improve caching without weakening reproducibility
+- **ci:** Add ephemeral preview environments for high-risk frontend changes
+- **fixtures:** Add deterministic privacy-safe synthetic fixtures
+- Add payout traceability and settlement safeguards (#228, #227, #226, #225)
+- **a11y:** Standardize accessible error summaries for API and wallet failures
+- **rtl:** Add right-to-left layout support for wallet and payout flows
+- **payout:** Stream status updates with bounded replay
+- **perf:** Enforce audit and chat performance budgets
+- **payout:** Audited, idempotent dead-letter replay operator action
+- **fixtures:** Deterministic full-stack fixture with seeded ledger history
+- Add staged contract deployment with preflight and post-deploy verification
 
 ### Fixed
 
@@ -949,6 +965,31 @@ Repo Avatar
 - #124 ops: automate production readiness and canary verification
 - #125 ci: enforce least-privilege path-aware workflows and required
 - #126 test(e2e): run full-stack flows against disposable Soroban and
+- #229 Implement dual control for high-risk manual payout actions
+- #230 Add typed provider reconciliation reports with row-level prove
+- #231 Make payout status polling adaptive and bounded
+- #232 Enforce payout amount and currency precision from provider met
+- **payout:** Add evidence conflict precedence
+- **payout:** Isolate circuits by provider operation
+- #217 Add tenant-aware AI budget accounting with atomic reservations
+- #218 Support cancellation and timeout propagation through every mod
+- #219 Add privacy-safe retention controls for model traces and evalu
+- #209 Add keyboard-operable recovery flows for failed transactions
+- #210 Replace legacy admin page code with a supported route boundary
+- #211 Add visual regression coverage for critical financial states
+- #212 Add a typed, versioned schema for AI tool-call proposals
+- #213 Evaluate multi-turn intent retention and correction handling
+- #214 Add adversarial evaluation for prompt injection through quoted
+- #215 Make model failover preserve conversation and policy versions
+- #216 Add user-visible provenance for AI-generated financial claims
+- #205 Make transaction status subscriptions reconnect without gaps
+- #206 Add explicit transaction intent confirmation for AI handoff
+- #207 Provide stable URLs for shareable read-only transaction views
+- #208 Build a client-side cache invalidation policy for wallet event
+- #221 Create deterministic replay fixtures for policy decisions
+- #222 Introduce a transactional outbox for payout side effects
+- #223 Define a provider capability contract for reversals and recall
+- #224 Add a first-class payout reversal and dispute lifecycle
 
 ### Changed
 
@@ -1292,6 +1333,24 @@ Repo Avatar
 - **changelog:** Update changelog [skip ci]
 - **deps:** Bump the actions group across 1 directory with 6 updates
 - **deps-dev:** Bump @types/node
+- **changelog:** Update changelog [skip ci]
+- **payout:** Add stateful saga property suite
+- **runbooks:** Add maintainer runbooks for failed release and deployment workflows
+- **changelog:** Update changelog [skip ci]
+- **changelog:** Update changelog [skip ci]
+- **changelog:** Update changelog [skip ci]
+- **changelog:** Update changelog [skip ci]
+- **wallet:** Cover freighter transitions and account isolation
+- **locale:** Cover timezone and localized numeric boundaries
+- **changelog:** Update changelog [skip ci]
+- **changelog:** Update changelog [skip ci]
+- **changelog:** Update changelog [skip ci]
+- **changelog:** Update changelog [skip ci]
+- **fault-injection:** Add fault-injection tests for DB, RPC, and provider outages
+- **changelog:** Update changelog [skip ci]
+- **changelog:** Update changelog [skip ci]
+- **changelog:** Update changelog [skip ci]
+- **changelog:** Update changelog [skip ci]
 
 ### Deprecated
 
@@ -1856,3 +1915,6 @@ Fix/1455 1458 1478 1479 ci security hardening
 - Merge pull request #154 from softnationz/feat/issues-47-48-49-50
 
 feat(api): circuit breaker, race-safe recipients, reconciliation, and security hardening (#47, #48, #49, #50)
+- Merge pull request #311 from jolesonbethany1-dev/fix/265-release-secret-policy
+
+feat(security): release-time secret scanning with expiring exceptions

@@ -36,77 +36,32 @@ export async function GET(request: NextRequest) {
       });
     }
 
-    // Default: map report to standard ReconciliationRecord[] for dashboard view
+    // Read-only dashboard view from the in-memory transfer store.
     const records: ReconciliationRecord[] = [];
     let counter = 1;
 
-    for (const m of report.matched) {
-      records.push({
-        id: String(counter++),
-        depositTxHash: m.deposit.txHash,
-        depositAmount: fromMinorUnits(
-          m.deposit.amountMinor,
-          m.deposit.currency,
-        ),
-        depositUser: m.deposit.wallet,
-        depositDate: m.deposit.timestamp,
-        payoutId: m.payout.payoutId,
-        payoutAmount: fromMinorUnits(m.payout.amountMinor, m.payout.currency),
-        payoutRecipient: m.payout.recipient,
-        payoutStatus: m.payout.payoutStatus,
-        payoutDate: m.payout.payoutDate,
-        status: 'matched',
-      });
-    }
-
-    for (const d of report.unmatched.depositsWithoutPayout) {
-      records.push({
-        id: String(counter++),
-        depositTxHash: d.txHash,
-        depositAmount: fromMinorUnits(d.amountMinor, d.currency),
-        depositUser: d.wallet,
-        depositDate: d.timestamp,
-        payoutId: '',
-        payoutAmount: '',
-        payoutRecipient: '',
-        payoutStatus: 'pending',
-        payoutDate: '',
-        status: 'unmatched',
-      });
-    }
-
-    for (const p of report.unmatched.payoutsWithoutDeposit) {
+    for (const payout of getAllTransfers()) {
+      const payoutStatus =
+        payout.status === 'success'
+          ? 'completed'
+          : payout.status === 'reversed'
+            ? 'warning'
+            : payout.status === 'initiated'
+              ? 'pending'
+              : payout.status;
       records.push({
         id: String(counter++),
         depositTxHash: '',
         depositAmount: '',
         depositUser: '',
-        depositDate: '',
-        payoutId: p.payoutId,
-        payoutAmount: fromMinorUnits(p.amountMinor, p.currency),
-        payoutRecipient: p.recipient,
-        payoutStatus: p.payoutStatus,
-        payoutDate: p.payoutDate,
-        status: 'unmatched',
-      });
-    }
-
-    for (const mm of report.amountMismatched) {
-      records.push({
-        id: String(counter++),
-        depositTxHash: mm.deposit.txHash,
-        depositAmount: fromMinorUnits(
-          mm.deposit.amountMinor,
-          mm.deposit.currency,
-        ),
-        depositUser: mm.deposit.wallet,
-        depositDate: mm.deposit.timestamp,
-        payoutId: mm.payout.payoutId,
-        payoutAmount: fromMinorUnits(mm.payout.amountMinor, mm.payout.currency),
-        payoutRecipient: mm.payout.recipient,
-        payoutStatus: mm.payout.payoutStatus,
-        payoutDate: mm.payout.payoutDate,
-        status: 'error',
+        depositDate: payout.updatedAt,
+        payoutId: payout.reference,
+        payoutAmount:
+          payout.amountMinor?.toString() ?? String(payout.amount || ''),
+        payoutRecipient: '',
+        payoutStatus,
+        payoutDate: payout.updatedAt,
+        status: payout.status === 'failed' ? 'error' : 'matched',
       });
     }
 
@@ -165,14 +120,54 @@ export async function POST(request: NextRequest) {
     const batchSize =
       typeof body.batchSize === 'number' ? body.batchSize : undefined;
 
+    if (
+      body.batchSize !== undefined &&
+      (typeof body.batchSize !== 'number' ||
+        !Number.isFinite(body.batchSize) ||
+        body.batchSize <= 0)
+    ) {
+      return NextResponse.json(
+        { error: 'batchSize must be a positive number' },
+        { status: 400 },
+      );
+    }
+
+    if (
+      body.staleAgeMs !== undefined &&
+      (typeof body.staleAgeMs !== 'number' ||
+        !Number.isFinite(body.staleAgeMs) ||
+        body.staleAgeMs < 0)
+    ) {
+      return NextResponse.json(
+        { error: 'staleAgeMs must be a non-negative number' },
+        { status: 400 },
+      );
+    }
+
     const summary = await reconcileStalePayouts({
       staleAgeMs,
       batchSize,
     });
 
+    // Cross-source reconciliation pass. This is classification only: it
+    // never settles ambiguous/unmatched/conflict entries. Callers must
+    // review the queue before any settlement action.
+    const crossSource = reconcileCrossSource({
+      contractEvents: reconciliationStore.getContractEvents?.() ?? [],
+      payoutRecords: reconciliationStore.getPayoutRecords?.() ?? [],
+      providerEvidence: reconciliationStore.getProviderEvidence?.() ?? [],
+    });
+    const confidenceCounts = countByConfidence(crossSource);
+    const reviewQueue = buildReviewQueue(crossSource);
+
     return NextResponse.json({
       success: true,
       data: summary,
+      crossSource: {
+        confidenceCounts,
+        reviewQueue,
+        autoSettled: false,
+      },
     });
   } catch (error) {
     console.error('Error running reconciliation:', error);
@@ -184,6 +179,7 @@ export async function POST(request: NextRequest) {
 }
 
 // Mock data - in production, this would come from a database
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 const mockReconciliationData: ReconciliationRecord[] = [
   {
     id: '1',
@@ -193,7 +189,7 @@ const mockReconciliationData: ReconciliationRecord[] = [
     depositDate: '2026-03-20T10:00:00Z',
     payoutId: 'TRF_123456',
     payoutAmount: '100.0',
-    payoutRecipient: 'John Doe - 1234567890',
+    payoutRecipient: 'Ada Synthetic - 0000006789',
     payoutStatus: 'completed',
     payoutDate: '2026-03-20T11:00:00Z',
     status: 'matched',
@@ -206,7 +202,7 @@ const mockReconciliationData: ReconciliationRecord[] = [
     depositDate: '2026-03-21T14:30:00Z',
     payoutId: 'TRF_789012',
     payoutAmount: '50.0',
-    payoutRecipient: 'Jane Smith - 0987654321',
+    payoutRecipient: 'Kojo Synthetic - 0000004321',
     payoutStatus: 'pending',
     payoutDate: '2026-03-21T15:00:00Z',
     status: 'matched',
@@ -238,3 +234,6 @@ const mockReconciliationData: ReconciliationRecord[] = [
     status: 'error',
   },
 ];
+
+// Re-exported for consumers that need the confidence state list.
+export { CONFIDENCE_STATES };

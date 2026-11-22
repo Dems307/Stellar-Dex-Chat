@@ -1,16 +1,39 @@
+import crypto from 'node:crypto';
+import { z } from 'zod';
+
 /**
  * FX Quote Provenance and Payout Amount Breakdowns
  * Addresses Issue #102: Make quote, fee, and rounding decisions explainable after settlement.
  */
 
+export const FX_QUOTE_TTL_MS = 120_000;
+export const FX_QUOTE_ROUNDING_POLICY = 'HALF_UP_TO_MINOR_UNIT' as const;
+
 export interface FxQuoteRecord {
   quoteId: string;
-  source: string; // e.g. "binance_oracle", "central_bank"
-  pair: string;   // e.g. "XLM/NGN"
+  provider: string;
+  providerRequestId: string;
+  providerResponseId: string | null;
+  source: string;
+  pair: string;
+  tokenAmountDecimal: string;
+  currency: string;
   exchangeRateDecimal: string;
+  fiatAmountMinorUnits: string;
+  roundingPolicy: typeof FX_QUOTE_ROUNDING_POLICY;
   quotedAt: number;
   expiresAt: number;
   precisionDecimals: number;
+  stale: boolean;
+}
+
+export interface FxQuoteTransferValues {
+  amountMinorUnits: string;
+  providerAmountMinorUnits: string;
+  currency: string;
+  providerReference: string;
+  providerTransferId: string | null;
+  providerTransferCode: string | null;
 }
 
 export interface AmountBreakdown {
@@ -81,7 +104,10 @@ export function calculatePayoutBreakdown(
 ): { isValid: boolean; snapshot?: PayoutProvenanceSnapshot; error?: string } {
   const now = Date.now();
   if (now > quote.expiresAt) {
-    return { isValid: false, error: 'FX Quote has expired. Please refresh quotes before proceeding.' };
+    return {
+      isValid: false,
+      error: 'FX Quote has expired. Please refresh quotes before proceeding.',
+    };
   }
 
   if (!Number.isFinite(grossAmount) || grossAmount < 0) {
@@ -97,7 +123,10 @@ export function calculatePayoutBreakdown(
   const netMinor = grossMinor - bridgeFeeMinor - providerFeeMinor;
 
   if (netMinor <= BigInt(0)) {
-    return { isValid: false, error: 'Gross payout amount is too small to cover fees.' };
+    return {
+      isValid: false,
+      error: 'Gross payout amount is too small to cover fees.',
+    };
   }
 
   const breakdown: AmountBreakdown = {

@@ -8,6 +8,12 @@ import {
   buildFreshnessMetadata,
   calculationLineageSchema,
 } from './apiSchemas';
+import {
+  loadOpenApiSchema,
+  validateAgainstSchema,
+  getSchemaOperation,
+  listSchemaOperations,
+} from './openApiContract';
 
 describe('apiSchemas - Request Retry with Exponential Backoff', () => {
   beforeEach(() => {
@@ -377,6 +383,49 @@ describe('verifyAccountSchema', () => {
       verifyAccountSchema.safeParse({
         accountNumber: '1234567890',
         bankCode: 'abc',
+      }).success,
+    ).toBe(false);
+  });
+});
+
+describe('initiateTransferSchema compatibility', () => {
+  const valid = {
+    source: 'wallet',
+    amount: '250.75',
+    recipient: 'RCP_TEST',
+  };
+
+  it('accepts legacy string amounts and normalizes them to numbers', () => {
+    const result = initiateTransferSchema.safeParse(valid);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.amount).toBe(250.75);
+      expect(result.data.currency).toBe('NGN');
+    }
+  });
+
+  it('accepts explicit v1 request schema markers', () => {
+    expect(
+      initiateTransferSchema.safeParse({
+        ...valid,
+        schemaVersion: 'v1',
+        apiVersion: 'v1',
+        currency: 'NGN',
+      }).success,
+    ).toBe(true);
+  });
+
+  it('rejects unsupported schema markers and unsafe string amounts', () => {
+    expect(
+      initiateTransferSchema.safeParse({
+        ...valid,
+        schemaVersion: 'v2',
+      }).success,
+    ).toBe(false);
+    expect(
+      initiateTransferSchema.safeParse({
+        ...valid,
+        amount: '250.001',
       }).success,
     ).toBe(false);
   });

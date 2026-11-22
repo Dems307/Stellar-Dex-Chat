@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import CopyButton from '@/components/ui/CopyButton';
 import { useMediaQuery } from '@/hooks/useMediaQuery';
+import { useRtlDirection } from '@/hooks/useRtlDirection';
 import SkeletonTimeline from '@/components/ui/skeleton/SkeletonTimeline';
 import type {
   StageState,
@@ -165,6 +166,7 @@ export default function TransferTimeline({
   state,
 }: TransferTimelineProps) {
   const prefersReducedMotion = useMediaQuery('(prefers-reduced-motion: reduce)');
+  const { isRtl, dir } = useRtlDirection();
 
   if (isLoading) {
     return <SkeletonTimeline />;
@@ -193,7 +195,7 @@ export default function TransferTimeline({
       : 'Transfer in progress');
 
   return (
-    <div className="relative space-y-4" aria-label="Transfer status timeline">
+    <div className="relative space-y-4" aria-label="Transfer status timeline" dir={dir}>
       {/* Accessibility: Live region to announce status changes */}
       <div
         aria-live="polite"
@@ -228,7 +230,7 @@ export default function TransferTimeline({
                 <span className="font-medium capitalize text-[var(--color-text-primary)]">
                   {effectiveStages.on_chain.label ?? effectiveStages.on_chain.status}
                 </span>
-                <span className="text-[11px] text-[var(--color-text-muted)]">
+                <span className="text-[11px] text-[var(--color-text-muted)] amount-ltr">
                   Updated: {formatEventTime(effectiveStages.on_chain.lastUpdated)}
                 </span>
               </div>
@@ -256,7 +258,7 @@ export default function TransferTimeline({
                 <span className="font-medium capitalize text-[var(--color-text-primary)]">
                   {effectiveStages.provider.label ?? effectiveStages.provider.status}
                 </span>
-                <span className="text-[11px] text-[var(--color-text-muted)]">
+                <span className="text-[11px] text-[var(--color-text-muted)] amount-ltr">
                   Updated: {formatEventTime(effectiveStages.provider.lastUpdated)}
                 </span>
               </div>
@@ -269,7 +271,7 @@ export default function TransferTimeline({
       <div className="relative">
         {/* Vertical connector line */}
         <span
-          className="absolute left-[19px] top-5 bottom-5 w-px bg-[var(--color-border)]"
+          className={`absolute top-5 bottom-5 w-px bg-[var(--color-border)] timeline-connector ${isRtl ? 'right-[19px]' : 'left-[19px]'}`}
           aria-hidden="true"
         />
 
@@ -318,7 +320,7 @@ export default function TransferTimeline({
                       </span>
                     )}
                   </div>
-                  <p className="theme-text-muted text-[11px] mt-0.5">
+                  <p className="theme-text-muted text-[11px] mt-0.5 amount-ltr">
                     {formatEventTime(event.timestamp)}
                   </p>
                 </div>

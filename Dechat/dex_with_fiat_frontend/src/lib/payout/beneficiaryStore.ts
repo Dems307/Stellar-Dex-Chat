@@ -19,7 +19,6 @@ export interface BeneficiaryRecord {
   verified: boolean;
   createdAt: string;
   updatedAt: string;
-  providerData?: Record<string, unknown>;
 }
 
 export interface DeriveDedupeKeyInput {
@@ -67,6 +66,10 @@ const inFlightRequests = new Map<
 // Failure injection hook for automated testing
 let simulatedCommitFailureTarget: string | null = null;
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 export function _injectCommitFailureOnce(targetKey?: string): void {
   simulatedCommitFailureTarget = targetKey || '__ANY__';
 }
@@ -110,8 +113,8 @@ export function deriveBeneficiaryDedupeKey(
   } = normalizeAccountDetails(input);
 
   const secret =
+    env.BENEFICIARY_DEDUPE_SECRET ||
     env.PAYSTACK_SECRET_KEY ||
-    process.env.BENEFICIARY_DEDUPE_SECRET ||
     'stellar-dex-chat-beneficiary-salt-v1';
 
   const payload = `${normalizedScope}:${normalizedBank}:${normalizedAccount}:${normalizedCurrency}`;
@@ -165,7 +168,7 @@ export function clearBeneficiaryStore(): void {
  */
 export async function getOrCreateBeneficiary(
   input: CreateBeneficiaryInput,
-  callRemoteProvider: () => Promise<Record<string, unknown>>,
+  callRemoteProvider: () => Promise<unknown>,
 ): Promise<BeneficiaryResolutionResult> {
   const dedupeKey = deriveBeneficiaryDedupeKey(input);
   const now = new Date().toISOString();
@@ -252,11 +255,13 @@ export async function getOrCreateBeneficiary(
   const creationPromise = (async (): Promise<BeneficiaryResolutionResult> => {
     try {
       // Call remote provider
-      const remoteResult = await callRemoteProvider();
+      const providerResult = await callRemoteProvider();
+      const remoteResult = isRecord(providerResult) ? providerResult : {};
+      const remoteData = isRecord(remoteResult.data) ? remoteResult.data : {};
       const recipientCode = String(
         remoteResult.recipient_code ||
-          (remoteResult.data as Record<string, unknown> | undefined)
-            ?.recipient_code ||
+          remoteResult.recipientCode ||
+          remoteData.recipient_code ||
           '',
       );
 
@@ -265,9 +270,8 @@ export async function getOrCreateBeneficiary(
       }
 
       const recipientName =
-        (remoteResult.name as string) ||
-        ((remoteResult.data as Record<string, unknown> | undefined)
-          ?.name as string) ||
+        (typeof remoteResult.name === 'string' ? remoteResult.name : '') ||
+        (typeof remoteData.name === 'string' ? remoteData.name : '') ||
         input.name;
 
       // Log into recovery journal immediately upon remote success
@@ -292,7 +296,6 @@ export async function getOrCreateBeneficiary(
         verified: true,
         createdAt: now,
         updatedAt: now,
-        providerData: remoteResult,
       };
 
       saveBeneficiary(newRecord);

@@ -2,7 +2,11 @@
  * Payout State Database Migration Definitions
  * Addresses Issue #97: Survive process restarts and coordinate payout operations
  * across application instances.
+ * Addresses Issue #247: Persist idempotent database migrations with rollback
+ * evidence (checksums, advisory locking, pre/post invariant checks).
  */
+
+import { createHash } from 'crypto';
 
 export interface MigrationStep {
   version: number;
