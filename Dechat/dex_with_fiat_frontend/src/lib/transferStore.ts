@@ -76,6 +76,9 @@ export interface TransferStatusRecord {
   updatedAt: string;
   updatedAtMs?: number;
   clientSessionId?: string;
+  credentialVersion?: string;
+  timeoutOutcome?: 'ambiguous' | 'known';
+  reconciled?: boolean;
   reconciliationAttempts?: number;
   lastReconciledAt?: string;
   providerEventAt?: string;
