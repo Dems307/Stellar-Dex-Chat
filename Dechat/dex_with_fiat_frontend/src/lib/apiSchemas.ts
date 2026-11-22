@@ -42,25 +42,58 @@ export const MAX_TRANSFER_AMOUNT_NGN = 10_000_000;
 
 export const initiateTransferSchema = z
   .object({
+    schemaVersion: z.literal('v1').optional(),
+    apiVersion: z.literal('v1').optional(),
     source: z.string().min(1, 'Source is required'),
     reason: z.string().optional(),
     amount: z
-      .number()
-      .positive('Amount must be positive')
-      .max(MAX_TRANSFER_AMOUNT_NGN, 'Amount exceeds the transfer limit')
-      .refine(
-        (amount) =>
-          Math.abs(amount * 100 - Math.round(amount * 100)) <=
-          Number.EPSILON * Math.max(1, Math.abs(amount * 100)) * 4,
-        'Amount must have at most 2 decimal places',
+      .union([
+        z.number(),
+        z
+          .string()
+          .regex(
+            /^(?:0|[1-9]\d*)(?:\.\d{1,2})?$/,
+            'Amount must be a decimal with at most 2 places',
+          ),
+      ])
+      .transform((value) => (typeof value === 'string' ? Number(value) : value))
+      .pipe(
+        z
+          .number()
+          .positive('Amount must be positive')
+          .max(MAX_TRANSFER_AMOUNT_NGN, 'Amount exceeds the transfer limit')
+          .refine(
+            (amount) =>
+              Math.abs(amount * 100 - Math.round(amount * 100)) <=
+              Number.EPSILON * Math.max(1, Math.abs(amount * 100)) * 4,
+            'Amount must have at most 2 decimal places',
+          ),
       ),
     recipient: z.string().min(1, 'Recipient is required'),
     reference: z.string().optional(),
+    currency: z
+      .string()
+      .regex(/^[A-Za-z]{3}$/)
+      .optional(),
+    contractReceiptId: z.string().min(1).max(256).optional(),
     clientSessionId: z.string().max(200).optional(),
+    currency: z.string().length(3).optional(),
+    quoteId: z.string().uuid().optional(),
+    quoteToken: z.string().min(1).max(4096).optional(),
   })
   .strict();
 
 export type InitiateTransferInput = z.infer<typeof initiateTransferSchema>;
+
+export const fxQuoteRequestSchema = z
+  .object({
+    tokenSymbol: z.literal('XLM'),
+    tokenAmount: z.number().positive().max(1_000_000),
+    currency: z.literal('ngn'),
+  })
+  .strict();
+
+export type FxQuoteRequest = z.infer<typeof fxQuoteRequestSchema>;
 
 // Schema for verify-account endpoint (strict validation, unknown keys rejected)
 export const verifyAccountSchema = strictVerifyAccountSchema;
@@ -95,6 +128,11 @@ export const paymentStatusStreamQuerySchema = z.object({
     .string()
     .min(1, 'sessionId is required')
     .max(200, 'sessionId is too long'),
+  lastEventId: z
+    .string()
+    .regex(/^\d+$/, 'lastEventId must contain only digits')
+    .max(100, 'lastEventId is too long')
+    .optional(),
 });
 
 export type PaymentStatusStreamQuery = z.infer<

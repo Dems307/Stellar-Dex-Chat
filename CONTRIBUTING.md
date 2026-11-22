@@ -1,6 +1,36 @@
 # Contributing
 
-Thanks for your interest in contributing to this project. This document describes how to set up your environment, run the repository's validation checks, and execute the focused regression suites that guard our contract, API, and frontend behavior.
+Thanks for contributing to Dechat. This document covers the workflow for
+changes that touch the Soroban smart contract interface and its generated
+TypeScript client bindings, as well as the payout side-effect pipeline.
+
+## Pinned build toolchain
+
+The Rust and Stellar build toolchain is pinned in a single canonical place so
+that CI, the devcontainer, and local setups all use identical versions. Do not
+install floating or `latest` tool versions.
+
+- `rust-toolchain.toml` — the Rust toolchain channel, the `wasm32-unknown-unknown`
+target, and the `rustfmt` and `clippy` components.
+- `toolchain-versions.toml` — the exact Stellar CLI and Soroban SDK versions
+used to build and test the contract.
+
+Before building, verify that your installed tools match the pinned manifest:
+
+```sh
+# from the repository root
+make verify-toolchain
+```
+
+The verification step compares the installed `rustc`, `cargo`, `rustfmt`,
+`cargo-clippy`, `stellar`, and Soroban SDK versions against the pinned
+manifest. On a mismatch it exits non-zero and prints the expected and installed
+versions so you can correct your environment. CI runs the same check, so a
+version drift fails the build with the same message.
+
+To update a pinned version, change the manifest (and `rust-toolchain.toml` for
+Rust components) in a dedicated pull request and regenerate the bindings as
+described below.
 
 ## Prerequisites
 
@@ -86,8 +116,48 @@ npm run test:e2e:smoke -- --project=webkit
 
 Do not add credentials, secrets, or real user data to fixtures. Use synthetic, deterministic test data only. Wallet mocks must not reference real accounts or keys.
 
-## Submitting changes
+## Adversarial evaluation corpus
 
-1. Run `npm run validate -- full` and confirm it exits `0`.
-2. Update related API, operational, and contributor documentation when your change affects it.
-3. Describe any intentional compatibility or behavior change explicitly in your pull request, including any threshold adjustments in the contract resource suite.
+The repository ships a **non-production** evaluation corpus for prompt
+injection through quoted content: pasted text, links, markdown, and
+tool-shaped strings. Its purpose is to verify that untrusted quoted content
+cannot alter policy, invoke tools, or leak hidden prompt context.
+
+### Corpus conventions
+
+- Fixtures live alongside the evaluation harness and are clearly marked
+  non-production. Never place real user data, credentials, or live tokens in
+  fixtures — use synthetic placeholders only.
+- Each case records the adversarial input, the expected safe behavior, and
+  the category it exercises (pasted text, link, markdown, tool-shaped string).
+- Cover boundary and failure cases: malformed tool-shaped strings, nested
+  markdown, and encoded or obfuscated links.
+
+### What the evaluation asserts
+
+For every case, the harness must confirm the quoted content:
+
+- does not change the active policy or system instructions,
+- does not trigger tool invocation, and
+- does not surface hidden prompt context in the response.
+
+### Adding cases
+
+When adding a case, include a focused regression test covering the normal
+path plus the relevant failure, authorization, or recovery edge case. Keep
+fixtures deterministic and free of secrets so the corpus can run in CI.
+
+## Pull request checklist
+
+Every pull request is prefilled with the [PR template](../.github/PULL_REQUEST_TEMPLATE.md).
+Complete all sections that apply; a CI job (`PR Checklist Validation`) will
+fail if required items are left unchecked when the corresponding paths change.
+
+### Contract / ABI changes
+
+- [ ] Contract interface changes include regenerated bindings.
+- [ ] The CI drift check passes with no ABI diff.
+- [ ] Breaking changes are documented and versioned as described above.
+- [ ] Regeneration left unrelated files unchanged.
+- [ ] Adversarial evaluation cases include focused regression tests and no
+      real user data or credentials in fixtures.

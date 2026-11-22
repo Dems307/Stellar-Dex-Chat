@@ -16,6 +16,7 @@ import {
 } from 'lucide-react';
 import EmptyState from '@/components/ui/EmptyState';
 import CopyButton from '@/components/ui/CopyButton';
+import { useRtlDirection } from '@/hooks/useRtlDirection';
 import { useStellarWallet } from '@/contexts/StellarWalletContext';
 import { useUserPreferences } from '@/contexts/UserPreferencesContext';
 import {
@@ -109,6 +110,7 @@ export default function StellarFiatModal({
   messages = [],
 }: StellarFiatModalProps) {
   const modalRef = useRef<HTMLDivElement>(null);
+  const { dir } = useRtlDirection();
   // Synchronous guard against rapid double-submits: state updates are batched,
   // so the submit button stays enabled across same-tick clicks. A ref closes
   // that window before React re-renders.
@@ -150,6 +152,7 @@ export default function StellarFiatModal({
   const [status, setStatus] = useState<TxStatus>('idle');
   const [txHash, setTxHash] = useState('');
   const [errorMsg, setErrorMsg] = useState('');
+  const [accessibleError, setAccessibleError] = useState<AccessibleError | null>(null);
   const [isLoadingUI, setIsLoadingUI] = useState(true);
   const [lastActionTimestamp, setLastActionTimestamp] = useState(0);
   const [showTwoFactorModal, setShowTwoFactorModal] = useState(false);
@@ -379,6 +382,21 @@ export default function StellarFiatModal({
     if (!pending) {
       return;
     }
+    // Account/network isolation: ignore pending records from other contexts.
+    if (
+      connection.publicKey &&
+      pending.account &&
+      pending.account !== connection.publicKey
+    ) {
+      return;
+    }
+    if (
+      connection.network &&
+      pending.network &&
+      pending.network !== connection.network
+    ) {
+      return;
+    }
 
     setPendingRecord(pending);
     setAmount(pending.amount);
@@ -396,7 +414,7 @@ export default function StellarFiatModal({
 
       if (outcome === 'confirmed') {
         setStatus('success');
-        clearPendingRecoveryRecord();
+        clearScopedPending();
         await refreshXlmBalance();
         addNotification(
           'tx_confirm',
@@ -405,7 +423,7 @@ export default function StellarFiatModal({
       } else if (outcome === 'failed') {
         setStatus('error');
         setErrorMsg('Recovered transaction failed on-chain');
-        clearPendingRecoveryRecord();
+        clearScopedPending();
       } else if (outcome === 'unknown') {
         setStatus('error');
         setErrorMsg(
@@ -418,7 +436,7 @@ export default function StellarFiatModal({
           if (cancelled) return;
           setStatus('success');
           setTxHash(finalHash);
-          clearPendingRecoveryRecord();
+          clearScopedPending();
           await refreshXlmBalance();
           addNotification(
             'tx_confirm',
@@ -428,7 +446,7 @@ export default function StellarFiatModal({
           if (cancelled) return;
           setStatus('error');
           setErrorMsg('Recovered transaction failed or timed out on-chain');
-          clearPendingRecoveryRecord();
+          clearScopedPending();
         }
       }
     })();
@@ -698,9 +716,7 @@ export default function StellarFiatModal({
   };
 
   const handleConfirmReplacement = () => {
-    const pendingKey = getPendingTxKey(connection.publicKey, connection.network);
-    localStorage.removeItem(pendingKey);
-    localStorage.removeItem('stellar_pending_tx');
+    clearScopedPending();
     setPendingRecord(null);
     setConfirmReplacementChecked(false);
     setStatusLookupOutcome(null);
@@ -722,22 +738,33 @@ export default function StellarFiatModal({
       : null;
   };
 
-  const handleAction = async () => {
+  const getScopedPendingKey = useCallback(() => {
+    if (!connection.publicKey) return null;
+    const net = connection.network || 'TESTNET';
+    return `stellar_pending_tx_${net}_${connection.publicKey}`;
+  }, [connection.publicKey, connection.network]);
+
+  const clearScopedPending = useCallback(() => {
+    const scoped = getScopedPendingKey();
+    if (scoped) localStorage.removeItem(scoped);
+    localStorage.removeItem('stellar_pending_tx');
+  }, [getScopedPendingKey]);
+
+  const handleAction = async (bypassReconfirmation = false) => {
     if (!connection.isConnected || sessionExpired) {
-      setErrorMsg(
-        sessionExpired
-          ? 'Wallet session has expired. Please reconnect to continue.'
-          : 'Wallet disconnected. Please reconnect to continue.',
-      );
+      const rawMsg = sessionExpired
+        ? 'Wallet session has expired. Please reconnect to continue.'
+        : 'Wallet disconnected. Please reconnect to continue.';
+      setErrorMsg(rawMsg);
+      setAccessibleError(classifyError(rawMsg, { safeValues: { amount, note: note.trim() } }));
       setStatus('error');
       return;
     }
 
     if (envVerification !== null && !envVerification.isValid) {
-      setErrorMsg(
-        envVerification.message ||
-          'Cannot execute transaction: Network or contract identity mismatch.',
-      );
+      const rawMsg = envVerification.message || 'Cannot execute transaction: Network or contract identity mismatch.';
+      setErrorMsg(rawMsg);
+      setAccessibleError(classifyError(rawMsg));
       setStatus('error');
       return;
     }
@@ -759,6 +786,14 @@ export default function StellarFiatModal({
     });
     if (zodMessage) {
       setErrorMsg(zodMessage);
+      const fieldId = zodMessage.toLowerCase().includes('amount')
+        ? 'sfm-amount'
+        : zodMessage.toLowerCase().includes('recipient')
+          ? 'sfm-recipient'
+          : zodMessage.toLowerCase().includes('note')
+            ? 'sfm-note'
+            : undefined;
+      setAccessibleError(classifyError(zodMessage, { fieldId, safeValues: { amount, note: note.trim() } }));
       setStatus('error');
       return;
     }
@@ -769,29 +804,30 @@ export default function StellarFiatModal({
       stroopsAmount === null ||
       stroopsAmount <= 0n
     ) {
-      setErrorMsg(amountFeedback || 'Invalid amount. Please enter a positive number.');
+      const rawMsg = amountFeedback || 'Invalid amount. Please enter a positive number.';
+      setErrorMsg(rawMsg);
+      setAccessibleError(classifyError(rawMsg, { fieldId: 'sfm-amount', safeValues: { amount, note: note.trim() } }));
       setStatus('error');
       return;
     }
     if (isDepositFlow && isLoadingBridgeLimit) {
-      setErrorMsg(
-        'Still loading the current bridge limit. Please wait a moment.',
-      );
+      const rawMsg = 'Still loading the current bridge limit. Please wait a moment.';
+      setErrorMsg(rawMsg);
+      setAccessibleError(classifyError(rawMsg));
       setStatus('error');
       return;
     }
     if (isDepositFlow && (bridgeLimit === null || bridgeLimitError)) {
-      setErrorMsg(
-        bridgeLimitError ||
-        'Unable to validate against the current bridge limit. Please try again.',
-      );
+      const rawMsg = bridgeLimitError || 'Unable to validate against the current bridge limit. Please try again.';
+      setErrorMsg(rawMsg);
+      setAccessibleError(classifyError(rawMsg, { safeValues: { amount, note: note.trim() } }));
       setStatus('error');
       return;
     }
     if (isDepositFlow && bridgeLimit !== null && stroopsAmount > bridgeLimit) {
-      setErrorMsg(
-        `Requested amount exceeds the current bridge limit of ${stroopsToDisplay(bridgeLimit ?? BigInt(0))} XLM.`,
-      );
+      const rawMsg = `Requested amount exceeds the current bridge limit of ${stroopsToDisplay(bridgeLimit ?? BigInt(0))} XLM.`;
+      setErrorMsg(rawMsg);
+      setAccessibleError(classifyError(rawMsg, { fieldId: 'sfm-amount', safeValues: { amount, note: note.trim() } }));
       setStatus('error');
       return;
     }
@@ -799,7 +835,9 @@ export default function StellarFiatModal({
     // Step 1: Pre-Sign Confirmation Requirement
     if (!requiresPreSignConfirmation) {
       if (simulationError) {
-        setErrorMsg(`Simulation failed: ${simulationError}. Signing blocked.`);
+        const rawMsg = `Simulation failed: ${simulationError}. Signing blocked.`;
+        setErrorMsg(rawMsg);
+        setAccessibleError(classifyError(simulationError, { safeValues: { amount, note: note.trim() } }));
         setStatus('error');
         return;
       }
@@ -821,6 +859,7 @@ export default function StellarFiatModal({
         const msg = err instanceof Error ? err.message : 'Simulation failed';
         setSimulationError(msg);
         setErrorMsg(`Simulation failed: ${msg}. Signing blocked.`);
+        setAccessibleError(classifyError(err, { safeValues: { amount, note: note.trim() } }));
         setStatus('error');
       } finally {
         setIsLoadingFee(false);
@@ -830,12 +869,16 @@ export default function StellarFiatModal({
 
     // Step 2: Ensure simulation is not stale or failed
     if (isSimulationStale) {
-      setErrorMsg('Account or network changed since simulation. Please re-simulate before signing.');
+      const rawMsg = 'Account or network changed since simulation. Please re-simulate before signing.';
+      setErrorMsg(rawMsg);
+      setAccessibleError(classifyError(rawMsg));
       setStatus('error');
       return;
     }
     if (simulationError) {
-      setErrorMsg(`Simulation failed: ${simulationError}. Signing blocked.`);
+      const rawMsg = `Simulation failed: ${simulationError}. Signing blocked.`;
+      setErrorMsg(rawMsg);
+      setAccessibleError(classifyError(simulationError, { safeValues: { amount, note: note.trim() } }));
       setStatus('error');
       return;
     }
@@ -845,7 +888,7 @@ export default function StellarFiatModal({
     }
 
     // Protect transaction forms from stale quotes and balances (#62)
-    if (!hasConfirmedUpdatedValues && !shouldBypass) {
+    if (!hasConfirmedUpdatedValues && !bypassReconfirmation) {
       const revalidation = await protectionModule.revalidateFormInputs({
         quoteSnapshot,
         balanceSnapshot,
@@ -894,10 +937,10 @@ export default function StellarFiatModal({
           `[StellarFiatModal] Initiating ${isAdminMode ? 'withdraw' : 'deposit'} with idempotencyKey: ${generatedIdempotencyKey}`,
         );
 
-        const pendingKey = getPendingTxKey(connection.publicKey, connection.network);
         let capturedHash: string | null = null;
         const onHashKnown = (hash: string) => {
-          savePendingRecoveryRecord({
+          capturedHash = hash;
+          const record = {
             hash,
             operation: isAdminMode ? 'withdraw' : 'deposit',
             amount,
@@ -906,9 +949,14 @@ export default function StellarFiatModal({
             network: connection.network || 'TESTNET',
             account: connection.publicKey,
             timestamp: Date.now(),
-            stage: 'pending_confirmation',
+            stage: 'pending_confirmation' as const,
             idempotencyKey: generatedIdempotencyKey,
-          });
+          };
+          savePendingRecoveryRecord(record);
+          const scoped = getScopedPendingKey();
+          if (scoped) {
+            try { localStorage.setItem(scoped, JSON.stringify(record)); } catch {}
+          }
         };
 
         const signTxWithContext = (xdr: string) =>
@@ -978,11 +1026,11 @@ export default function StellarFiatModal({
           if (errMsg.includes('WALLET_CONTEXT_CHANGED')) {
             setStatus('context_changed');
             setRecoverableContextMessage(
-              'Wallet account or network changed during transaction signing. Transaction context has been invalidated. Please confirm to rebuild.',
+              'Wallet account or network changed during transaction. No write was submitted for the new context. Please confirm to rebuild.',
             );
+            setAccessibleError(null);
             if (!capturedHash) {
-              localStorage.removeItem(pendingKey);
-              localStorage.removeItem('stellar_pending_tx');
+              clearScopedPending();
               setPendingRecord(null);
             }
             return;
@@ -994,6 +1042,7 @@ export default function StellarFiatModal({
           ) {
             setStatus('timeout');
             setErrorMsg(errMsg);
+            setAccessibleError(null);
             setStatusLookupOutcome('unknown');
             setStatusLookupMessage(
               'Confirmation timed out. Query authoritative status before attempting replacement.',
@@ -1002,8 +1051,9 @@ export default function StellarFiatModal({
           }
 
           setErrorMsg(errMsg || 'Transaction failed');
+          setAccessibleError(classifyError(err, { safeValues: { amount, note: note.trim() } }));
           setStatus('error');
-          clearPendingRecoveryRecord();
+          clearScopedPending();
         }
       },
       `stellar_${isAdminMode ? 'withdraw' : 'deposit'}`,
@@ -1014,6 +1064,7 @@ export default function StellarFiatModal({
     setStatus('idle');
     setTxHash('');
     setErrorMsg('');
+    setAccessibleError(null);
     setRequiresPreSignConfirmation(false);
     setSimulationResult(null);
     setSimulationError(null);
@@ -1089,3 +1140,760 @@ export default function StellarFiatModal({
                 {txHash}
               </a>
               <CopyButton value={txHash} />
+            </div>
+
+            <button
+              type="button"
+              data-testid="download-receipt-button"
+              onClick={async () => {
+                setIsDownloadingReceipt(true);
+                try {
+                  await downloadReceipt({
+                    txHash,
+                    amount: stroopsToDisplay(stroopsAmount ?? BigInt(0)),
+                    wallet: connection.publicKey,
+                    network: connection.network || 'TESTNET',
+                    timestamp: new Date().toLocaleString(),
+                    type: isAdminMode ? 'Withdrawal' : 'Deposit',
+                    note: note.trim() || undefined,
+                    messages,
+                  });
+                } finally {
+                  setIsDownloadingReceipt(false);
+                }
+              }}
+              disabled={isDownloadingReceipt}
+              className="mt-4 w-full flex items-center justify-center gap-2 py-2.5 rounded-lg border border-blue-500/30 text-blue-400 hover:bg-blue-500/10 transition-colors text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <Download className="w-4 h-4" />
+              {isDownloadingReceipt ? 'Generating...' : 'Download Receipt'}
+            </button>
+
+            {!isAdminMode && onDepositSuccess ? (
+              <button
+                onClick={() =>
+                  onDepositSuccess({
+                    xlmAmount: parseFloat(amount || '0'),
+                    note: note.trim() || undefined,
+                  })
+                }
+                className="theme-primary-button mt-6 w-full py-3 rounded-lg font-medium transition-colors"
+              >
+                Continue to Fiat Payout
+              </button>
+            ) : (
+              <button
+                onClick={handleClose}
+                className="theme-primary-button mt-6 w-full py-3 rounded-lg font-medium transition-colors"
+              >
+                Close
+              </button>
+            )}
+          </div>
+        ) : status === 'timeout' ? (
+          <div data-testid="timeout-view" className="py-4">
+            <div className="flex items-center gap-3 mb-4 text-amber-400">
+              <AlertTriangle className="w-8 h-8 flex-shrink-0" />
+              <div>
+                <h3 className="font-semibold text-base theme-text-primary">
+                  Transaction Timeout / In-Doubt
+                </h3>
+                <p className="theme-text-secondary text-xs">
+                  Confirmation timed out on the network.
+                </p>
+              </div>
+            </div>
+
+            {pendingRecord?.hash && (
+              <div className="theme-surface-muted theme-border rounded-lg border p-3 mb-4 text-xs font-mono break-all">
+                <span className="theme-text-muted block text-[10px] font-sans font-semibold uppercase tracking-wider mb-1">
+                  Transaction Reference
+                </span>
+                <span className="theme-text-primary">{pendingRecord.hash}</span>
+                <div className="mt-1">
+                  <CopyButton value={pendingRecord.hash} />
+                </div>
+              </div>
+            )}
+
+            <div className="mb-4">
+              <button
+                type="button"
+                data-testid="check-status-button"
+                onClick={() => void handleRetryStatusLookup()}
+                disabled={isCheckingStatus}
+                className="w-full flex items-center justify-center gap-2 py-2.5 rounded-lg border border-blue-500/40 text-blue-400 hover:bg-blue-500/10 transition-colors text-xs font-semibold disabled:opacity-50"
+              >
+                {isCheckingStatus ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    Querying network...
+                  </>
+                ) : (
+                  'Query Authoritative Status'
+                )}
+              </button>
+
+              {statusLookupMessage && (
+                <div
+                  data-testid="status-outcome"
+                  className={`mt-2 p-2.5 rounded-lg border text-xs ${
+                    statusLookupOutcome === 'confirmed'
+                      ? 'theme-soft-success border-green-500/40'
+                      : statusLookupOutcome === 'failed'
+                        ? 'theme-soft-danger border-red-500/40'
+                        : 'theme-soft-warning border-amber-500/40'
+                  }`}
+                >
+                  <p className="font-medium">
+                    Status:{' '}
+                    <span className="capitalize">{statusLookupOutcome ?? 'Unknown'}</span>
+                  </p>
+                  <p className="mt-0.5">{statusLookupMessage}</p>
+                </div>
+              )}
+            </div>
+
+            <div
+              data-testid="duplicate-risk-warning"
+              className="theme-soft-warning border border-amber-500/30 rounded-lg p-3 mb-4 text-xs"
+            >
+              <div className="flex items-center gap-2 font-semibold text-amber-300 mb-1">
+                <AlertTriangle className="w-4 h-4 flex-shrink-0" />
+                <span>Duplicate Risk Notice</span>
+              </div>
+              <p className="text-amber-200/90 leading-relaxed">
+                If the previous transaction was accepted by validators, submitting a replacement transaction could execute twice, causing duplicate funds to be transferred.
+              </p>
+              {statusLookupOutcome !== 'failed' && (
+                <label className="flex items-start gap-2.5 mt-3 pt-2 border-t border-amber-500/20 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    data-testid="duplicate-risk-checkbox"
+                    checked={confirmReplacementChecked}
+                    onChange={(e) => setConfirmReplacementChecked(e.target.checked)}
+                    className="mt-0.5 rounded border-gray-600 text-blue-600 focus:ring-blue-500"
+                  />
+                  <span className="text-amber-200 text-[11px] font-medium leading-tight">
+                    I understand the risk of duplicate transaction execution and want to proceed with replacement.
+                  </span>
+                </label>
+              )}
+            </div>
+
+            <div className="flex flex-col gap-2">
+              <button
+                type="button"
+                data-testid="confirm-replacement-button"
+                onClick={handleConfirmReplacement}
+                disabled={statusLookupOutcome !== 'failed' && !confirmReplacementChecked}
+                className="theme-primary-button w-full py-2.5 rounded-lg text-xs font-semibold disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+              >
+                Abandon & Submit Replacement
+              </button>
+              <button
+                type="button"
+                onClick={handleClose}
+                className="w-full py-2 text-xs theme-text-muted hover:theme-text-primary transition-colors text-center"
+              >
+                Close & Check Later
+              </button>
+            </div>
+          </div>
+        ) : status === 'context_changed' ? (
+          <div data-testid="context-changed-view" className="text-center py-6">
+            <AlertTriangle className="w-14 h-14 text-amber-400 mx-auto mb-4" />
+            <p className="theme-text-primary font-semibold text-lg mb-2">
+              Wallet Context Changed
+            </p>
+            <p
+              data-testid="recoverable-context-message"
+              className="theme-text-secondary text-xs mb-6 px-4 leading-relaxed"
+            >
+              {recoverableContextMessage ||
+                'Freighter wallet account or network changed during transaction processing. Simulation and confirmation state have been invalidated to protect your account.'}
+            </p>
+            <button
+              type="button"
+              data-testid="confirm-rebuild-button"
+              onClick={handleConfirmNewContext}
+              className="theme-primary-button w-full py-3 rounded-lg font-medium transition-colors text-sm mb-2"
+            >
+              Confirm & Rebuild for Current Context
+            </button>
+            <button
+              type="button"
+              onClick={handleClose}
+              className="w-full py-2 text-xs theme-text-muted hover:theme-text-primary transition-colors"
+            >
+              Cancel
+            </button>
+          </div>
+        ) : isTransactionBusy ? (
+          <div className="text-center py-6">
+            <Loader2 className="w-14 h-14 text-blue-400 mx-auto mb-4 animate-spin" />
+            <p className="text-white font-semibold text-lg mb-2">
+              {isAdminMode ? 'Withdrawal pending…' : 'Deposit pending…'}
+            </p>
+            <p className="text-gray-400 text-sm mb-4">
+              {isAdminMode
+                ? 'Your withdrawal is being submitted to the Stellar bridge.'
+                : 'Your deposit is being submitted to the Stellar bridge.'}
+            </p>
+            <p className="text-gray-500 text-xs">
+              {stroopsToDisplay(stroopsAmount ?? BigInt(0))} XLM is being processed. You will see confirmation once the transaction completes.
+            </p>
+          </div>
+        ) : isLoadingUI ? (
+          <SkeletonPayout />
+        ) : (
+          <>
+            {sessionExpired && (
+              <div
+                data-testid="session-expired-banner"
+                className="theme-soft-warning mb-4 rounded-xl border border-amber-500/40 px-4 py-3 flex items-center justify-between gap-3"
+              >
+                <div>
+                  <p className="font-semibold text-xs text-amber-300">
+                    Wallet Session Expired
+                  </p>
+                  <p className="text-[11px] text-amber-200/80">
+                    Your draft inputs have been preserved. Re-authenticate to proceed.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  data-testid="reconnect-button"
+                  onClick={() => void reconnect()}
+                  className="px-3 py-1.5 bg-amber-500 hover:bg-amber-400 text-black text-xs font-semibold rounded-lg transition-colors flex-shrink-0"
+                >
+                  Reconnect
+                </button>
+              </div>
+            )}
+            {!connection.isConnected && !sessionExpired && (
+              <div
+                data-testid="wallet-disconnected-banner"
+                className="theme-soft-warning mb-4 rounded-xl border border-blue-500/40 px-4 py-3 flex items-center justify-between gap-3"
+              >
+                <div>
+                  <p className="font-semibold text-xs text-blue-300">
+                    Wallet Disconnected
+                  </p>
+                  <p className="text-[11px] text-blue-200/80">
+                    Connect your wallet to sign this transaction.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  data-testid="connect-wallet-button"
+                  onClick={() => void reconnect()}
+                  className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold rounded-lg transition-colors flex-shrink-0"
+                >
+                  Connect
+                </button>
+              </div>
+            )}
+            <div className="mb-4">
+              <label className="theme-text-secondary block text-sm mb-1">
+                Amount (XLM)
+              </label>
+              <div className="flex gap-2 mb-2">
+                {AMOUNT_PRESETS.map((preset) => (
+                  <button
+                    key={preset}
+                    type="button"
+                    onClick={() => handlePreset(preset)}
+                    disabled={isTransactionBusy}
+                    className={`flex-1 py-1.5 rounded-md text-xs font-medium border transition-colors ${activePreset === preset
+                      ? 'bg-blue-600 border-blue-500 text-white'
+                      : 'bg-gray-800 border-gray-600 text-gray-300 hover:border-blue-500 hover:text-white'
+                      } ${isTransactionBusy ? 'opacity-60 cursor-not-allowed' : ''}`}
+                  >
+                    {preset}
+                  </button>
+                ))}
+              </div>
+              <input
+                type="text"
+                inputMode="decimal"
+                id="sfm-amount"
+                value={amount}
+                onChange={(e) => {
+                  setAmount(e.target.value);
+                  setActivePreset(null);
+                  setRequiresPreSignConfirmation(false);
+                }}
+                placeholder="0.00"
+                disabled={isTransactionBusy}
+                aria-invalid={isAmountInvalid || isOverLimit ? true : undefined}
+                className={`w-full bg-gray-800 border rounded-lg px-4 py-3 text-white placeholder-gray-500 focus:outline-none disabled:opacity-60 disabled:cursor-not-allowed input-numeric ${isAmountInvalid || isOverLimit
+                  ? 'border-red-500 focus:border-red-400'
+                  : 'border-gray-600 focus:border-blue-500'
+                  }`}
+              />
+              {amountFeedback && (
+                <p id="sfm-amount-error" role="alert" className="theme-soft-danger flex items-center gap-2 rounded-lg px-3 py-2 mt-2 text-xs">
+                  <AlertCircle className="w-3 h-3 flex-shrink-0" />
+                  {amountFeedback}
+                </p>
+              )}
+              {connection.isConnected && (
+                <p className="theme-text-secondary text-xs mt-2">
+                  Available:{' '}
+                  <span className="theme-text-primary font-medium">
+                    {xlmBalance ? `${xlmBalance} XLM` : 'Loading...'}
+                  </span>
+                </p>
+              )}
+            </div>
+
+            {fiatEstimate && (
+              <p className="theme-text-secondary text-xs -mt-2 mb-4">
+                ~={' '}
+                <span className="theme-text-primary font-medium">
+                  {fiatEstimate}
+                </span>{' '}
+                at current market rate
+              </p>
+            )}
+              {isFiatEstimateStale && (
+                <p role="status" className="text-amber-400 text-xs -mt-2 mb-4">
+                  Estimated rate: live market prices are unavailable.
+                </p>
+              )}
+
+            <div className="mb-4">
+              <label className="theme-text-secondary block text-sm mb-1">
+                Optional note
+              </label>
+              <textarea
+                id="sfm-note"
+                value={note}
+                onChange={(e) => setNote(e.target.value)}
+                placeholder={
+                  isAdminMode
+                    ? 'Add a label for this withdrawal'
+                    : 'Add a note for this deposit'
+                }
+                rows={2}
+                maxLength={160}
+                className="theme-input w-full border rounded-lg px-4 py-3 text-sm focus:outline-none focus:border-blue-500 resize-none"
+              />
+            </div>
+
+            {(isLoadingFee || feeEstimate) && (
+              <div className="theme-surface-muted theme-border mb-4 rounded-xl border p-4">
+                <div className="flex items-center justify-between mb-3">
+                  <h3 className="theme-text-muted text-[10px] font-bold uppercase tracking-widest">
+                    Simulation Results
+                  </h3>
+                  {isLoadingFee && (
+                    <Loader2 className="w-3 h-3 text-blue-500 animate-spin" />
+                  )}
+                </div>
+
+                <div className="space-y-2">
+                  <div className="flex justify-between text-[11px]">
+                    <span className="theme-text-muted">Base Fee</span>
+                    <span className="theme-text-secondary font-mono">
+                      {isLoadingFee
+                        ? '...'
+                        : feeEstimate
+                          ? `${feeEstimate.baseFee.toFixed(7)} XLM`
+                          : '0.0000100 XLM'}
+                    </span>
+                  </div>
+                  <div className="flex justify-between text-[11px]">
+                    <span className="theme-text-muted">Resource Fee</span>
+                    <span className="theme-text-secondary font-mono">
+                      {isLoadingFee
+                        ? '...'
+                        : feeEstimate
+                          ? `${feeEstimate.resourceFee.toFixed(7)} XLM`
+                          : '0.0000000 XLM'}
+                    </span>
+                  </div>
+                  <div className="theme-border pt-2 mt-1 border-t flex justify-between text-xs font-semibold">
+                    <span className="theme-text-secondary">
+                      Total Network Fee
+                    </span>
+                    <span className="text-blue-400 font-mono">
+                      {isLoadingFee
+                        ? 'Calculating...'
+                        : feeEstimate
+                          ? `${feeEstimate.fee.toFixed(7)} XLM`
+                          : 'N/A'}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {requiresPreSignConfirmation && !isStatusLoading && (
+              <div data-testid="pre-sign-summary" className="theme-surface-muted theme-border mb-4 rounded-xl border px-4 py-3">
+                <h3 className="theme-text-muted text-[10px] font-bold uppercase tracking-widest mb-3">
+                  Pre-Sign Transaction Summary
+                </h3>
+                <div className="space-y-2 text-xs">
+                  <div className="flex items-center justify-between">
+                    <span className="theme-text-secondary">Operation</span>
+                    <span className="theme-text-primary font-medium">
+                      {operationType}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="theme-text-secondary">Contract</span>
+                    <span className="theme-text-primary font-mono text-[10px] break-all text-right">
+                      {CONTRACT_ID}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="theme-text-secondary">Token</span>
+                    <span className="theme-text-primary font-medium">
+                      XLM
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="theme-text-secondary">Amount</span>
+                    <span className="theme-text-primary font-medium">
+                      {stroopsAmount ? formatAssetAmount(stroopsAmount, { decimals: 7 }) : amount} XLM
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="theme-text-secondary">Estimated Fees</span>
+                    <span className="theme-text-primary font-medium">
+                      {feeEstimate?.fee !== undefined
+                        ? `~${feeEstimate.fee.toFixed(7)} XLM`
+                        : 'Simulating...'}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="theme-text-secondary">Network</span>
+                    <span className="theme-text-primary font-medium">
+                      {txNetwork}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="theme-text-secondary">Signer</span>
+                    <span className="theme-text-primary font-mono text-[10px] break-all text-right">
+                      {connection.publicKey}
+                    </span>
+                  </div>
+                  {simulationResult?.expectedEffects && (
+                    <div className="mt-2 pt-2 border-t border-gray-700/40">
+                      <span className="theme-text-secondary block mb-1">Expected Effects:</span>
+                      <ul className="list-disc pl-4 space-y-0.5 text-[11px] theme-text-primary">
+                        {simulationResult.expectedEffects.map((eff, i) => (
+                          <li key={i}>{eff}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {isSimulationStale && (
+                    <div data-testid="stale-simulation-warning" className="mt-2 text-xs text-amber-400 bg-amber-400/10 p-2 rounded border border-amber-400/20">
+                      Account or network changed since simulation. Please re-simulate before signing.
+                    </div>
+                  )}
+                  {simulationError && (
+                    <div data-testid="simulation-error" className="mt-2 text-xs text-red-400 bg-red-400/10 p-2 rounded border border-red-400/20">
+                      Simulation failed: {simulationError}
+                    </div>
+                  )}
+                </div>
+                <div className="flex gap-2 mt-4">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setRequiresPreSignConfirmation(false);
+                      setSimulationError(null);
+                    }}
+                    className="theme-border theme-text-secondary flex-1 rounded-lg border py-2 text-xs font-medium hover:theme-text-primary transition-colors"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="confirm-sign-button"
+                    disabled={Boolean(isSimulationStale || simulationError || isLoadingFee)}
+                    onClick={() => void handleAction()}
+                    className="theme-primary-button flex-1 rounded-lg py-2 text-xs font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    Confirm & Sign
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {isDepositFlow && (
+              <div className="theme-surface-muted theme-border mb-4 rounded-xl border px-4 py-3">
+                <div className="flex items-center justify-between mb-3">
+                  <h3 className="theme-text-muted text-[10px] font-bold uppercase tracking-widest">
+                    Bridge Capacity
+                  </h3>
+                  <div
+                    className={`w-2 h-2 rounded-full ${isOverLimit
+                      ? 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.5)]'
+                      : isHighLimitUsage
+                        ? 'bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.5)]'
+                        : 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.5)]'
+                      }`}
+                  />
+                </div>
+
+                {isLimitUnavailable ? (
+                  <EmptyState
+                    icon={WifiOff}
+                    title="Bridge data unavailable"
+                    description={
+                      bridgeLimitError ??
+                      'Could not fetch the current bridge limit. Please retry.'
+                    }
+                    cta={{ label: 'Retry', onClick: () => void refetchStats() }}
+                    className="py-2"
+                  />
+                ) : (
+                  <>
+                    <div className="flex items-center justify-between text-xs mb-2">
+                      <span className="theme-text-secondary">
+                        On-chain per-deposit limit
+                      </span>
+                      <span className="theme-text-primary font-mono">
+                        {isLoadingBridgeLimit
+                          ? 'Loading...'
+                          : bridgeLimit !== null
+                            ? `${stroopsToDisplay(bridgeLimit ?? BigInt(0))} XLM`
+                            : 'Unavailable'}
+                      </span>
+                    </div>
+
+                    <div className="h-1.5 w-full rounded-full bg-[var(--color-surface-elevated)] overflow-hidden mb-2">
+                      <div
+                        className={`h-full rounded-full transition-all duration-500 ${isOverLimit
+                          ? 'bg-red-500'
+                          : isHighLimitUsage
+                            ? 'bg-amber-400'
+                            : 'bg-blue-500'
+                          }`}
+                        style={{ width: `${Math.min(usagePercent, 100)}%` }}
+                      />
+                    </div>
+
+                    <div className="theme-text-muted flex items-center justify-between text-[10px]">
+                      <span>
+                        {hasValidAmount && bridgeLimit !== null
+                          ? `${usagePercent.toFixed(1)}% used`
+                          : 'Limit utilized per transaction'}
+                      </span>
+                      <span>
+                        {hasValidAmount && bridgeLimit !== null
+                          ? `${stroopsToDisplay(remainingLimit ?? BigInt(0))} XLM available`
+                          : ''}
+                      </span>
+                    </div>
+
+                    {isOverLimit &&
+                      bridgeLimit !== null &&
+                      stroopsAmount !== null && (
+                        <div className="theme-soft-danger mt-3 rounded-lg border px-3 py-2 text-[11px] leading-tight">
+                          Error: Amount exceeds the current bridge limit.
+                        </div>
+                      )}
+                  </>
+                )}
+              </div>
+            )}
+
+            {isRiskyAmount && (
+              <div className="theme-soft-warning mb-4 rounded-xl border px-4 py-3">
+                <p className="font-semibold text-sm mb-2">
+                  Large amount confirmation required
+                </p>
+                <p className="text-xs mb-3">
+                  Amounts above {highValueThreshold} XLM require an
+                  additional confirmation phrase before submission.
+                </p>
+                <input
+                  type="text"
+                  value={riskConfirmation}
+                  onChange={(e) => setRiskConfirmation(e.target.value)}
+                  placeholder={STELLAR_FIAT_RISK_CONFIRMATION_PHRASE}
+                  className="theme-input w-full border rounded-lg px-4 py-3 text-sm focus:outline-none focus:border-blue-500"
+                />
+              </div>
+            )}
+
+            {isAdminMode && (
+              <div className="mb-4">
+                <label className="theme-text-secondary block text-sm mb-1">
+                  Recipient address (leave blank for self)
+                </label>
+                <input
+                  type="text"
+                  id="sfm-recipient"
+                  value={recipient}
+                  onChange={(e) => setRecipient(e.target.value)}
+                  placeholder="G..."
+                  disabled={isTransactionBusy}
+                  aria-invalid={accessibleError?.fieldId === 'sfm-recipient' ? true : undefined}
+                  aria-describedby={accessibleError?.fieldId === 'sfm-recipient' ? 'sfm-error-summary' : undefined}
+                  className="w-full bg-gray-800 border border-gray-600 rounded-lg px-4 py-3 text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 disabled:opacity-60 disabled:cursor-not-allowed font-mono text-sm"
+                />
+              </div>
+            )}
+
+            <div
+              data-testid="wallet-info"
+              className="theme-text-muted flex justify-between text-xs mb-6"
+            >
+              <span className="flex items-center gap-1">
+                <span>
+                  Connected: {connection.address.slice(0, 8)}…
+                  {connection.address.slice(-4)}
+                </span>
+                <CopyButton value={connection.address} iconClassName="w-3 h-3" />
+              </span>
+              <span>Network: {connection.network || 'TESTNET'}</span>
+            </div>
+
+            {status === 'error' && (
+              <ErrorSummary
+                id="sfm-error-summary"
+                error={accessibleError}
+                onDismiss={() => { setAccessibleError(null); setStatus('idle'); setErrorMsg(''); }}
+                data-testid="error-message"
+              />
+            )}
+
+            {isAdminMode && (
+              <div className="mb-4">
+                <WithdrawalQueueStatus />
+              </div>
+            )}
+
+            {reconfirmationNotice && (
+              <div
+                data-testid="reconfirmation-notice"
+                className="bg-amber-950/40 border border-amber-500/50 rounded-xl p-3 mb-4 text-xs text-amber-200"
+              >
+                <div className="flex items-center gap-2 font-semibold text-amber-300 mb-1">
+                  <AlertCircle className="w-4 h-4 shrink-0" />
+                  <span>Review Updated Values</span>
+                </div>
+                <p className="mb-2 leading-relaxed">{reconfirmationNotice}</p>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setHasConfirmedUpdatedValues(true);
+                      setReconfirmationNotice(null);
+                      void handleAction(true);
+                    }}
+                    className="theme-primary-button px-3 py-1.5 rounded-lg text-xs font-semibold"
+                  >
+                    Confirm Updated Values
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setReconfirmationNotice(null)}
+                    className="theme-border border px-3 py-1.5 rounded-lg text-xs text-gray-400 hover:text-white"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              </div>
+            )}
+
+            <div className="flex flex-col gap-2">
+              <button
+                onClick={handleAction}
+                disabled={isSubmitDisabled || isTxProcessing}
+                className="theme-primary-button w-full flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed text-white py-3 rounded-lg font-semibold transition-all"
+              >
+                {isStatusLoading || isTxProcessing ? (
+                  <>
+                    <Loader2
+                      data-testid="loading-spinner"
+                      className="w-4 h-4 animate-spin"
+                    />
+                    Signing & submitting…
+                  </>
+                ) : isAdminMode ? (
+                  'Withdraw'
+                ) : requiresPreSignConfirmation ? (
+                  'Awaiting Confirmation'
+                ) : (
+                  'Deposit'
+                )
+                }
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setAmount('100');
+                  setTxHash(
+                    'MOCK' +
+                    Math.random().toString(36).substring(2, 10).toUpperCase(),
+                  );
+                  setStatus('success');
+                }}
+                className="w-full text-[10px] text-gray-500 hover:text-blue-400 transition-colors py-1"
+              >
+                (Demo: Simulate Success)
+              </button>
+            </div>
+
+            {!connection.isConnected && (
+              <p className="theme-text-muted text-center text-xs mt-3">
+                Connect your Freighter wallet to continue.
+              </p>
+            )}
+          </>
+        )}
+      </div>
+
+      {/* Two-Factor Confirmation Modal */}
+      {showTwoFactorModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50">
+          <div className="bg-gray-900 border border-gray-700 rounded-xl p-6 max-w-md w-full mx-4">
+            <h3 className="text-white font-semibold text-lg mb-4">
+              Two-Factor Confirmation
+            </h3>
+            <p className="text-gray-300 text-sm mb-4">
+              For your security, please enter the last 4 digits of your wallet address to confirm this high-value transfer.
+            </p>
+            <p className="text-gray-400 text-xs mb-2">
+              Your wallet: {connection.address.slice(0, 8)}…{connection.address.slice(-4)}
+            </p>
+            <input
+              type="text"
+              value={twoFactorConfirmation}
+              onChange={(e) => setTwoFactorConfirmation(e.target.value)}
+              placeholder="Enter last 4 digits"
+              maxLength={4}
+              className="w-full bg-gray-800 border border-gray-600 rounded-lg px-4 py-3 text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 mb-4"
+            />
+            <div className="flex gap-3">
+              <button
+                onClick={() => {
+                  setShowTwoFactorModal(false);
+                  setTwoFactorConfirmation('');
+                }}
+                className="flex-1 px-4 py-2 bg-gray-700 text-white rounded-lg hover:bg-gray-600 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleAction}
+                className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
+              >
+                Confirm
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

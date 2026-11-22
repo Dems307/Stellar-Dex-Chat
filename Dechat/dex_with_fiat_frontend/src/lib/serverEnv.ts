@@ -12,17 +12,34 @@ export const serverSchema = z.object({
     return normalized === 'true' || normalized === '1';
   }, z.boolean().default(false)),
   ADMIN_SECRET: z.string().optional(),
+  PAYOUT_FX_QUOTE_SECRET: z.string().optional(),
   GEMINI_API_KEY: z.string().optional(),
 });
 
 const processServerEnvVars = () => {
   const serverVars = {
-    PAYSTACK_SECRET_KEY: typeof process !== 'undefined' ? process.env.PAYSTACK_SECRET_KEY : undefined,
-    PAYOUT_PROVIDER: typeof process !== 'undefined' ? process.env.PAYOUT_PROVIDER : undefined,
-    ADMIN_IP_ALLOWLIST: typeof process !== 'undefined' ? process.env.ADMIN_IP_ALLOWLIST : undefined,
-    ADMIN_IP_ALLOWLIST_BYPASS_LOCAL: typeof process !== 'undefined' ? process.env.ADMIN_IP_ALLOWLIST_BYPASS_LOCAL : undefined,
-    ADMIN_SECRET: typeof process !== 'undefined' ? process.env.ADMIN_SECRET : undefined,
-    GEMINI_API_KEY: typeof process !== 'undefined' ? process.env.GEMINI_API_KEY : undefined,
+    PAYSTACK_SECRET_KEY:
+      typeof process !== 'undefined'
+        ? process.env.PAYSTACK_SECRET_KEY
+        : undefined,
+    PAYOUT_PROVIDER:
+      typeof process !== 'undefined' ? process.env.PAYOUT_PROVIDER : undefined,
+    ADMIN_IP_ALLOWLIST:
+      typeof process !== 'undefined'
+        ? process.env.ADMIN_IP_ALLOWLIST
+        : undefined,
+    ADMIN_IP_ALLOWLIST_BYPASS_LOCAL:
+      typeof process !== 'undefined'
+        ? process.env.ADMIN_IP_ALLOWLIST_BYPASS_LOCAL
+        : undefined,
+    ADMIN_SECRET:
+      typeof process !== 'undefined' ? process.env.ADMIN_SECRET : undefined,
+    PAYOUT_FX_QUOTE_SECRET:
+      typeof process !== 'undefined'
+        ? process.env.PAYOUT_FX_QUOTE_SECRET
+        : undefined,
+    GEMINI_API_KEY:
+      typeof process !== 'undefined' ? process.env.GEMINI_API_KEY : undefined,
   };
 
   const parsed = serverSchema.safeParse(serverVars);
