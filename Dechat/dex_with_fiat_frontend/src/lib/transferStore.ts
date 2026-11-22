@@ -4,6 +4,10 @@ import {
   PayoutTransitionRecord,
   validatePayoutTransition,
 } from './payout/payoutLifecycle';
+import type {
+  FxQuoteRecord,
+  FxQuoteTransferValues,
+} from './payout/fxQuoteProvenance';
 
 export {
   type PayoutStatus,
@@ -66,12 +70,20 @@ export interface TransferStatusRecord {
   amount: number;
   amountMinor?: bigint;
   currency?: string;
+  fxQuote?: FxQuoteRecord;
+  finalTransferValues?: FxQuoteTransferValues;
   failureReason?: string;
   updatedAt: string;
   updatedAtMs?: number;
   clientSessionId?: string;
+  credentialVersion?: string;
+  timeoutOutcome?: 'ambiguous' | 'known';
+  reconciled?: boolean;
   reconciliationAttempts?: number;
   lastReconciledAt?: string;
+  providerEventAt?: string;
+  webhookReceivedAt?: string;
+  history?: PayoutTransitionRecord[];
   lastReconciliationResult?:
     | 'transitioned'
     | 'no_change'
@@ -79,6 +91,7 @@ export interface TransferStatusRecord {
     | 'invalid_transition'
     | 'error';
   nextRetryAt?: number;
+  history?: PayoutTransitionRecord[];
 }
 
 // Key is the transfer reference
@@ -97,8 +110,94 @@ export function setTransferStatus(
   return record;
 }
 
+export function transitionPayoutStatus(input: {
+  reference: string;
+  targetStatus: PayoutStatus;
+  actor: PayoutActor | string;
+  providerReference?: string;
+  reason?: string;
+  amount?: number;
+  updatedAt?: string;
+  clientSessionId?: string;
+}): TransferStatusRecord {
+  const current = getTransferStatus(input.reference);
+  const currentStatus = current?.status ?? 'none';
+  validatePayoutTransition(currentStatus, input.targetStatus, input.reference);
+
+  if (currentStatus === input.targetStatus && current) return current;
+
+  const timestamp = input.updatedAt || new Date().toISOString();
+  const transition: PayoutTransitionRecord = {
+    fromStatus: currentStatus,
+    toStatus: input.targetStatus,
+    actor: input.actor,
+    providerReference: input.providerReference,
+    timestamp,
+    reason: input.reason,
+  };
+  return setTransferStatus({
+    reference: input.reference,
+    status: input.targetStatus,
+    amount: input.amount ?? current?.amount ?? 0,
+    amountMinor: current?.amountMinor,
+    currency: current?.currency,
+    failureReason: input.targetStatus === 'failed' ? input.reason : undefined,
+    updatedAt: timestamp,
+    clientSessionId: input.clientSessionId ?? current?.clientSessionId,
+    history: [...(current?.history ?? []), transition],
+  });
+}
+
 export function getAllTransfers(): TransferStatusRecord[] {
   return Array.from(transferStore.values());
+}
+
+export function transitionPayoutStatus(params: {
+  reference: string;
+  targetStatus: PayoutStatus;
+  actor: PayoutActor | string;
+  providerReference?: string;
+  reason?: string;
+  amount?: number;
+  updatedAt?: string;
+  clientSessionId?: string;
+  failureReason?: string;
+}): TransferStatusRecord {
+  const existing = transferStore.get(params.reference);
+  const currentStatus = existing?.status;
+  validatePayoutTransition(
+    currentStatus || 'none',
+    params.targetStatus,
+    params.reference,
+  );
+
+  if (currentStatus === params.targetStatus) {
+    return existing!;
+  }
+
+  const timestamp = params.updatedAt || new Date().toISOString();
+  const record: TransferStatusRecord = {
+    reference: params.reference,
+    status: params.targetStatus,
+    amount: params.amount ?? existing?.amount ?? 0,
+    updatedAt: timestamp,
+    clientSessionId: params.clientSessionId ?? existing?.clientSessionId,
+    failureReason: params.failureReason ?? existing?.failureReason,
+    history: [
+      ...(existing?.history || []),
+      {
+        fromStatus: currentStatus || 'none',
+        toStatus: params.targetStatus,
+        actor: params.actor,
+        providerReference: params.providerReference,
+        timestamp,
+        reason: params.reason,
+      },
+    ],
+  };
+
+  transferStore.set(params.reference, record);
+  return record;
 }
 
 export function clearTransferStore(): void {
