@@ -300,9 +300,25 @@ export async function POST(request: NextRequest) {
       batchSize,
     });
 
+    // Cross-source reconciliation pass. This is classification only: it
+    // never settles ambiguous/unmatched/conflict entries. Callers must
+    // review the queue before any settlement action.
+    const crossSource = reconcileCrossSource({
+      contractEvents: reconciliationStore.getContractEvents?.() ?? [],
+      payoutRecords: reconciliationStore.getPayoutRecords?.() ?? [],
+      providerEvidence: reconciliationStore.getProviderEvidence?.() ?? [],
+    });
+    const confidenceCounts = countByConfidence(crossSource);
+    const reviewQueue = buildReviewQueue(crossSource);
+
     return NextResponse.json({
       success: true,
       data: summary,
+      crossSource: {
+        confidenceCounts,
+        reviewQueue,
+        autoSettled: false,
+      },
     });
   } catch (error) {
     console.error('Error running reconciliation:', error);
@@ -314,6 +330,7 @@ export async function POST(request: NextRequest) {
 }
 
 // Mock data - in production, this would come from a database
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 const mockReconciliationData: ReconciliationRecord[] = [
   {
     id: '1',
@@ -368,3 +385,6 @@ const mockReconciliationData: ReconciliationRecord[] = [
     status: 'error',
   },
 ];
+
+// Re-exported for consumers that need the confidence state list.
+export { CONFIDENCE_STATES };

@@ -44,6 +44,107 @@ export type ReconciliationDecisionType =
   | 'REJECTED_OUT_OF_ORDER'
   | 'UNRECOGNIZED_EVENT';
 
+/**
+ * Confidence classification for cross-source payout reconciliation.
+ *
+ * - `matched`: all present sources agree on identifiers, amount and currency.
+ * - `ambiguous`: a stable identifier maps to more than one record, so the
+ *   correct counterpart cannot be determined automatically.
+ * - `unmatched`: at least one expected source is missing, so the payout cannot
+ *   be confirmed.
+ * - `conflict`: sources disagree on amount or currency.
+ */
+export type ReconciliationConfidence =
+  | 'matched'
+  | 'ambiguous'
+  | 'unmatched'
+  | 'conflict';
+
+export interface ContractPayoutEvent {
+  txHash: string;
+  payoutReference: string;
+  /** Amount in minor units of `currency`. */
+  amountMinor: string | number | bigint;
+  currency: string;
+  eventType?: string;
+}
+
+export interface InternalPayoutRecord {
+  payoutReference: string;
+  /** Amount in minor units of `currency`. */
+  amountMinor: string | number | bigint;
+  currency: string;
+  status?: DomainPayoutStatus;
+}
+
+export interface ProviderPayoutEvidence {
+  providerReference: string;
+  payoutReference: string;
+  /** Amount in minor units of `currency`. */
+  amountMinor: string | number | bigint;
+  currency: string;
+  eventType?: string;
+}
+
+export interface ReconciliationRecord {
+  /** Deterministic key derived from the stable identifiers. */
+  id: string;
+  txHash?: string;
+  payoutReference?: string;
+  providerReference?: string;
+  confidence: ReconciliationConfidence;
+  /** Normalized amount in minor units (string) when determinable. */
+  amountMinor?: string;
+  currency?: string;
+  /** True only when confidence is `matched`; never auto-settle otherwise. */
+  autoSettled: boolean;
+  reasons: string[];
+  contractEvent?: ContractPayoutEvent;
+  internalRecord?: InternalPayoutRecord;
+  providerEvidence?: ProviderPayoutEvidence;
+  createdAt: string;
+}
+
+export interface ReconciliationInput {
+  contractEvents?: ContractPayoutEvent[];
+  internalRecords?: InternalPayoutRecord[];
+  providerEvidence?: ProviderPayoutEvidence[];
+}
+
+export interface ReconciliationResult {
+  records: ReconciliationRecord[];
+  /** Records that require manual review (ambiguous/unmatched/conflict). */
+  reviewQueue: ReconciliationRecord[];
+}
+
+/**
+ * Normalizes an amount to a canonical minor-unit string.
+ * Accepts decimal strings, numbers and bigints. Rejects non-integer or
+ * negative values so that fractional minor units never silently round.
+ */
+export function normalizeAmountMinor(
+  amount: string | number | bigint,
+): string | null {
+  if (typeof amount === 'bigint') {
+    return amount >= 0n ? amount.toString() : null;
+  }
+  if (typeof amount === 'number') {
+    if (!Number.isFinite(amount) || !Number.isInteger(amount) || amount < 0) {
+      return null;
+    }
+    return BigInt(amount).toString();
+  }
+  const trimmed = amount.trim();
+  if (!/^\d+$/.test(trimmed)) {
+    return null;
+  }
+  return BigInt(trimmed).toString();
+}
+
+function normalizeCurrency(currency: string): string {
+  return currency.trim().toUpperCase();
+}
+
 export interface ReconciliationDecision {
   decision: ReconciliationDecisionType;
   currentStatus?: DomainPayoutStatus;

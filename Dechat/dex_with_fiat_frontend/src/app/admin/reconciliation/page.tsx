@@ -83,6 +83,7 @@ export default function ReconciliationDashboard() {
     ReconciliationTotals | undefined
   >();
   const [statusFilter, setStatusFilter] = useState<string>('all');
+  const [reviewOnly, setReviewOnly] = useState<boolean>(false);
   const [startDate, setStartDate] = useState<string>('');
   const [endDate, setEndDate] = useState<string>('');
   const [loading, setLoading] = useState(true);
@@ -147,6 +148,10 @@ export default function ReconciliationDashboard() {
       filtered = filtered.filter((record) => record.status === statusFilter);
     }
 
+    if (reviewOnly) {
+      filtered = filtered.filter((record) => isReviewState(record.status));
+    }
+
     if (startDate) {
       filtered = filtered.filter(
         (record) => new Date(record.depositDate) >= new Date(startDate),
@@ -160,7 +165,7 @@ export default function ReconciliationDashboard() {
     }
 
     setFilteredRecords(filtered);
-  }, [records, statusFilter, startDate, endDate]);
+  }, [records, statusFilter, reviewOnly, startDate, endDate]);
 
   useEffect(() => {
     filterRecords();
@@ -327,10 +332,11 @@ export default function ReconciliationDashboard() {
                 onChange={(e) => setStatusFilter(e.target.value)}
                 className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500 dark:bg-gray-700 dark:text-white"
               >
-                <option value="all">All</option>
-                <option value="matched">Matched</option>
-                <option value="unmatched">Unmatched</option>
-                <option value="error">Error</option>
+                {STATUS_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
               </select>
             </div>
             <div>
@@ -374,6 +380,31 @@ export default function ReconciliationDashboard() {
               </button>
             </div>
           </div>
+          <div className="mt-4 flex items-center gap-2">
+            <input
+              id="reconciliation-review-only"
+              type="checkbox"
+              checked={reviewOnly}
+              onChange={(e) => setReviewOnly(e.target.checked)}
+              className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+            />
+            <label
+              htmlFor="reconciliation-review-only"
+              className="text-sm font-medium text-gray-700 dark:text-gray-300"
+            >
+              Show review queue only (ambiguous &amp; conflict)
+            </label>
+          </div>
+        </div>
+
+        {/* Review queue notice */}
+        <div className="bg-yellow-50 dark:bg-yellow-900/30 border border-yellow-200 dark:border-yellow-700 rounded-lg p-4 mb-8">
+          <p className="text-sm text-yellow-800 dark:text-yellow-200">
+            Records with an <strong>ambiguous</strong> or <strong>conflict</strong>{' '}
+            confidence state are held for manual review and are not
+            auto-settled. Verify the contract event, internal payout record, and
+            provider evidence before taking action.
+          </p>
         </div>
 
         {/* Table */}
@@ -451,9 +482,11 @@ export default function ReconciliationDashboard() {
                         className={`inline-flex px-2 py-1 text-xs font-semibold rounded-full ${
                           record.status === 'matched'
                             ? 'bg-green-100 text-green-800 dark:bg-green-800 dark:text-green-200'
-                            : record.status === 'unmatched'
+                            : record.status === 'ambiguous'
                               ? 'bg-yellow-100 text-yellow-800 dark:bg-yellow-800 dark:text-yellow-200'
-                              : 'bg-red-100 text-red-800 dark:bg-red-800 dark:text-red-200'
+                              : record.status === 'unmatched'
+                                ? 'bg-orange-100 text-orange-800 dark:bg-orange-800 dark:text-orange-200'
+                                : 'bg-red-100 text-red-800 dark:bg-red-800 dark:text-red-200'
                         }`}
                       >
                         {record.status}
@@ -498,6 +531,17 @@ export default function ReconciliationDashboard() {
                       <div className="font-mono break-all">
                         {record.sourceEvidence ?? record.depositTxHash}
                       </div>
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap">
+                      {isReviewState(record.status) ? (
+                        <span className="inline-flex px-2 py-1 text-xs font-semibold rounded-full bg-yellow-100 text-yellow-800 dark:bg-yellow-800 dark:text-yellow-200">
+                          Manual review required
+                        </span>
+                      ) : (
+                        <span className="text-xs text-gray-400 dark:text-gray-500">
+                          —
+                        </span>
+                      )}
                     </td>
                   </tr>
                 ))}
