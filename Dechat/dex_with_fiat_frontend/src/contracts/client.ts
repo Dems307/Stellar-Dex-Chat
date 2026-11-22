@@ -10,14 +10,17 @@ import {
   FIAT_BRIDGE_METHODS,
   FiatBridgeMethod,
   ContractReceipt,
+  ContractReceiptAuditPage,
   ContractWithdrawRequest,
   ClientFeeEstimate,
 } from './types';
 import {
   encodeAddress,
   encodeI128,
+  encodeU32,
   encodeU64,
   decodeReceipt,
+  decodeReceiptAuditPage,
   decodeWithdrawRequest,
   decodeScVal,
 } from './encoding';
@@ -215,6 +218,17 @@ export class FiatBridgeContractClient {
       [encodeU64(index)],
     );
     return decodeReceipt(raw);
+  }
+
+  public async getReceiptAuditViews(
+    cursor: number,
+    limit: number,
+  ): Promise<ContractReceiptAuditPage> {
+    const raw = await this.callView<unknown>(
+      FIAT_BRIDGE_METHODS.GET_RECEIPT_AUDIT_VIEWS,
+      [encodeU64(cursor), encodeU32(limit)],
+    );
+    return decodeReceiptAuditPage(raw);
   }
 
   public async getAccruedFees(tokenAddress: string): Promise<bigint> {

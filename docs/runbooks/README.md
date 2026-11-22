@@ -11,6 +11,7 @@ release and deployment workflow failure in this repository.
 | [Frontend deploy](frontend-deploy.md) | Prettier, TypeScript, ESLint, Next.js build, pnpm lockfile, unit tests, E2E, bundle budget, release validation | `frontend.yml`, `frontend-build.yml` |
 | [Migration and deployment](migration.md) | Pre-deployment readiness gate, signer availability, network config, migrations, canary verification, contract rollback | `deploy-futurenet.yml` |
 | [Artifact attestation and SBOM](artifact-attestation.md) | SBOM generation (Rust + Node), provenance recording, digest manifest, release-validation job | `security-audit.yml`, `frontend-build.yml`, `deploy-futurenet.yml` |
+| [Escrow liability parity](liability-parity.md) | Read-only comparison of on-chain escrow receipts and persisted payout reservations | manual operations |
 
 ## Related operational docs
 

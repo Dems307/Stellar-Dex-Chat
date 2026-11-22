@@ -68,7 +68,84 @@ paths:
               schema:
                 $ref: '#/components/schemas/PayoutResponse'
 
+  /admin/liability-parity:
+    get:
+      summary: Compare live on-chain escrow liabilities with persisted payout reservations
+      operationId: getEscrowLiabilityParity
+      security:
+        - AdminToken: []
+      parameters:
+        - name: asset
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: receiptId
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: pageSize
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 100
+        - name: maxPages
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            default: 100
+      responses:
+        '200':
+          description: Read-only parity report
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LiabilityParityReport'
+        '400':
+          description: Invalid pagination parameters
+        '401':
+          description: Admin authentication required
+        '403':
+          description: Caller IP is not allowlisted
+        '500':
+          description: Contract or reservation source unavailable
+    post:
+      summary: Compare a supplied liability snapshot without mutating state
+      operationId: compareEscrowLiabilitySnapshot
+      security:
+        - AdminToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LiabilityParityInput'
+      responses:
+        '200':
+          description: Read-only parity report
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LiabilityParityReport'
+        '400':
+          description: Invalid snapshot body
+        '401':
+          description: Admin authentication required
+        '403':
+          description: Caller IP is not allowlisted
+
 components:
+  securitySchemes:
+    AdminToken:
+      type: apiKey
+      in: header
+      name: x-admin-token
   schemas:
     InitiatePayoutRequest:
       type: object
@@ -123,3 +200,143 @@ components:
         updatedAt:
           type: string
           format: date-time
+
+    LiabilityParityInput:
+      type: object
+      required:
+        - liabilities
+        - reservations
+      properties:
+        liabilities:
+          type: array
+          items:
+            $ref: '#/components/schemas/EscrowLiabilityInput'
+        reservations:
+          type: array
+          items:
+            $ref: '#/components/schemas/PayoutReservationInput'
+        assetAliases:
+          type: object
+          additionalProperties:
+            type: string
+        filters:
+          type: object
+          properties:
+            asset:
+              type: string
+            receiptId:
+              type: string
+        sourceTruncated:
+          type: boolean
+
+    EscrowLiabilityInput:
+      type: object
+      required:
+        - receiptId
+        - asset
+        - amountMinor
+      properties:
+        receiptId:
+          type: string
+        asset:
+          type: string
+        amountMinor:
+          type: string
+        status:
+          type: string
+          enum: [active, migrated, released]
+
+    PayoutReservationInput:
+      type: object
+      required:
+        - payoutId
+        - receiptId
+        - asset
+        - amountMinor
+      properties:
+        payoutId:
+          type: string
+        receiptId:
+          type: string
+        asset:
+          type: string
+        amountMinor:
+          type: string
+        status:
+          type: string
+          enum: [reserved, under_review, settled, released]
+
+    LiabilityParityReport:
+      type: object
+      required:
+        - schemaVersion
+        - readOnly
+        - correctionsApplied
+        - ok
+        - totals
+        - byAsset
+        - byReceipt
+        - mismatches
+      properties:
+        schemaVersion:
+          type: integer
+          enum: [1]
+        readOnly:
+          type: boolean
+          enum: [true]
+        correctionsApplied:
+          type: integer
+          enum: [0]
+        ok:
+          type: boolean
+        totals:
+          type: object
+        byAsset:
+          type: array
+          items:
+            type: object
+        byReceipt:
+          type: array
+          items:
+            type: object
+        mismatches:
+          type: array
+          items:
+            $ref: '#/components/schemas/LiabilityParityMismatch'
+
+    LiabilityParityMismatch:
+      type: object
+      required:
+        - key
+        - asset
+        - receiptId
+        - type
+        - reason
+      properties:
+        key:
+          type: string
+        asset:
+          type: string
+        receiptId:
+          type: string
+        payoutIds:
+          type: array
+          items:
+            type: string
+        type:
+          type: string
+          enum:
+            - AMOUNT_MISMATCH
+            - MISSING_RESERVATION
+            - MISSING_LIABILITY
+            - DUPLICATE_RESERVATION
+            - INVALID_RECORD
+            - SOURCE_TRUNCATED
+        onChainMinor:
+          type: string
+        reservedMinor:
+          type: string
+        deltaMinor:
+          type: string
+        reason:
+          type: string

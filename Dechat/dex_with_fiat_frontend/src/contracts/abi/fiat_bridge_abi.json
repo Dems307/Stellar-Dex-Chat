@@ -138,6 +138,14 @@
       "outputs": [{ "type": "bool" }]
     },
     {
+      "name": "get_receipt_audit_views",
+      "inputs": [
+        { "name": "cursor", "type": "u64" },
+        { "name": "limit", "type": "u32" }
+      ],
+      "outputs": [{ "type": "Result<ReceiptAuditPage, Error>" }]
+    },
+    {
       "name": "is_denied",
       "inputs": [
         { "name": "address", "type": "Address" }
@@ -163,6 +171,23 @@
         { "name": "amount", "type": "i128" },
         { "name": "destination", "type": "Address" },
         { "name": "queued_at_ledger", "type": "u32" }
+      ]
+    },
+    "ReceiptAuditPage": {
+      "type": "struct",
+      "fields": [
+        { "name": "records", "type": "Vec<ReceiptAuditView>" },
+        { "name": "next_cursor", "type": "Option<u64>" }
+      ]
+    },
+    "ReceiptAuditView": {
+      "type": "struct",
+      "fields": [
+        { "name": "version", "type": "u32" },
+        { "name": "receipt_id", "type": "BytesN<32>" },
+        { "name": "token", "type": "Address" },
+        { "name": "amount", "type": "i128" },
+        { "name": "status", "type": "ReceiptAuditStatus" }
       ]
     }
   },

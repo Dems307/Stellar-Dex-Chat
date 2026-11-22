@@ -104,6 +104,24 @@ The effective status follows the documented [payout evidence precedence model](.
 An evidence conflict is persisted for review; it does not silently replace the
 highest-precedence status.
 
+### Escrow liability parity
+
+`GET /api/admin/liability-parity` is a read-only check that compares outstanding
+on-chain escrow receipts with active persisted payout reservations. Results are
+grouped by asset and receipt and include `AMOUNT_MISMATCH`,
+`MISSING_RESERVATION`, `MISSING_LIABILITY`, `DUPLICATE_RESERVATION`,
+`INVALID_RECORD`, and `SOURCE_TRUNCATED` mismatch types. The response includes
+`readOnly: true` and `correctionsApplied: 0` and never changes payout or contract
+state.
+
+`POST /api/admin/liability-parity` accepts a JSON snapshot with `liabilities`,
+`reservations`, optional `assetAliases`, and optional `filters`. It runs the same
+comparison without reading the live contract or reservation ledger, which makes
+it suitable for fixtures and incident replay. Both routes require admin
+authentication and the admin IP allowlist. See the
+[liability parity runbook](../runbooks/liability-parity.md) for response fields
+and investigation steps.
+
 ## Error Model
 Standard RFC 7807 Problem Details are returned for non-2xx responses:
 ```json

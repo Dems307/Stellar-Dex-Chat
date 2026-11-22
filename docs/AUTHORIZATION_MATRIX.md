@@ -26,6 +26,7 @@ This document specifies the access control policies, identity requirements, and 
 | `/api/admin-audit` | `GET` | Admin (`x-admin-token` / secret) | System Administrator | Paginated audit logs | `401 Unauthorized` | Read-only from audit log service |
 | `/api/admin/audit-log` | `GET` | Admin | System Administrator | Paginated audit logs | `401 Unauthorized` | Read-only |
 | `/api/admin/reconciliation` | `GET` | Admin | System Administrator | Read reconciliation data | `401 Unauthorized` | Isolated from user sessions |
+| `/api/admin/liability-parity` | `GET`, `POST` | Admin (`x-admin-token` / IP allowlist) | System Administrator | Read-only liability parity report | `401 Unauthorized` / `403 Forbidden` | No payout or contract mutation |
 | `/api/admin/auth/nonce` | `GET`, `POST`| Public / Admin | Admin Auth | Challenge generation & verification | `401 Unauthorized` | Cryptographic nonce verification |
 | `/api/banks` | `GET` | Public | Public | Read supported banks | Public | Cached public list |
 | `/api/webhook` | `POST` | Webhook Provider | System Provider | Settlement event dispatch | `401 Invalid Signature` | Verified against HMAC SHA-512 secret keyring |
