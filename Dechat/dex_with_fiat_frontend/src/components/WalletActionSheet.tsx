@@ -3,6 +3,7 @@
 import React, { useMemo } from 'react';
 import BottomSheet from '@/components/ui/BottomSheet';
 import { useMediaQuery } from '@/hooks/useMediaQuery';
+import { useRtlDirection } from '@/hooks/useRtlDirection';
 import { getFeatureFlag } from '@/lib/featureFlags';
 
 export interface WalletActionHapticControls {
@@ -60,6 +61,7 @@ export default function WalletActionSheet({
 }: WalletActionSheetProps) {
   const isMobile = useMediaQuery('(max-width: 639px)');
   const enableHaptics = getFeatureFlag('enableHaptics');
+  const { dir } = useRtlDirection();
 
   const haptics = useMemo<WalletActionHapticControls>(
     () => ({
@@ -88,7 +90,7 @@ export default function WalletActionSheet({
       title={title}
       ariaLabel={ariaLabel}
     >
-      <div className="wallet-action-sheet-content">
+      <div className="wallet-action-sheet-content" dir={dir}>
         {children}
       </div>
     </BottomSheet>
@@ -100,6 +102,7 @@ export default function WalletActionSheet({
         aria-modal="true"
         aria-label={ariaLabel || title}
         tabIndex={-1}
+        dir={dir}
         className="theme-surface theme-border relative w-full max-w-md mx-4 border rounded-2xl shadow-2xl p-6"
         data-testid="wallet-action-modal"
       >
