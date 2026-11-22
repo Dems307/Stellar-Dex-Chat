@@ -57,7 +57,15 @@ permissions:
 
 env:
   MAX_WASM_BYTES: "98500"
+  # Pinned toolchain versions. These MUST match the canonical manifest at
+  # Dechat/stellar-contracts/toolchain-versions.env and rust-toolchain.toml.
+  # The verify-toolchain job fails with a clear mismatch message if they drift.
+  RUST_TOOLCHAIN: "1.84.0"
+  RUST_TARGET: "wasm32v1-none"
   STELLAR_CLI_VERSION: "28.0.0"
+  SOROBAN_SDK_VERSION: "22.0.0"
+  RUSTFMT_VERSION: "1.84.0"
+  CLIPPY_VERSION: "1.84.0"
   BINDINGS_DIR: "Dechat/dex_with_fiat_frontend/src/lib/contracts"
   # Shared Rust toolchain string used as part of the cache key so a toolchain
   # pin change automatically busts every cached entry.
@@ -68,9 +76,49 @@ env:
   EXPECTED_RPC_URL: ${{ vars.EXPECTED_RPC_URL || 'https://soroban-testnet.stellar.org' }}
 
 jobs:
+  verify-toolchain:
+    name: Verify pinned toolchain
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Verify pinned versions match canonical manifest
+        run: |
+          set -euo pipefail
+          MANIFEST=Dechat/stellar-contracts/toolchain-versions.env
+          if [ ! -f "$MANIFEST" ]; then
+            echo "::error::Canonical toolchain manifest $MANIFEST is missing"
+            exit 1
+          fi
+          # shellcheck disable=SC1090
+          source "$MANIFEST"
+          fail=0
+          check() {
+            local name="$1" expected="$2" actual="$3"
+            if [ "$expected" != "$actual" ]; then
+              echo "::error::Toolchain mismatch for $name: workflow pins '$actual' but manifest pins '$expected'"
+              fail=1
+            else
+              echo "OK: $name = $expected"
+            fi
+          }
+          check RUST_TOOLCHAIN "$RUST_TOOLCHAIN" "${{ env.RUST_TOOLCHAIN }}"
+          check RUST_TARGET "$RUST_TARGET" "${{ env.RUST_TARGET }}"
+          check STELLAR_CLI_VERSION "$STELLAR_CLI_VERSION" "${{ env.STELLAR_CLI_VERSION }}"
+          check SOROBAN_SDK_VERSION "$SOROBAN_SDK_VERSION" "${{ env.SOROBAN_SDK_VERSION }}"
+          check RUSTFMT_VERSION "$RUSTFMT_VERSION" "${{ env.RUSTFMT_VERSION }}"
+          check CLIPPY_VERSION "$CLIPPY_VERSION" "${{ env.CLIPPY_VERSION }}"
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::Workflow toolchain pins drifted from $MANIFEST. Update both to the same versions."
+            exit 1
+          fi
+
   fmt:
     name: Check formatting
     runs-on: ubuntu-latest
+    needs: [verify-toolchain]
     permissions:
       contents: read
     defaults:
@@ -110,6 +158,7 @@ jobs:
   clippy:
     name: Run clippy
     runs-on: ubuntu-latest
+    needs: [verify-toolchain]
     permissions:
       contents: read
     defaults:
@@ -146,6 +195,7 @@ jobs:
   test:
     name: Run tests
     runs-on: ubuntu-latest
+    needs: [verify-toolchain]
     permissions:
       contents: read
     defaults:
@@ -195,6 +245,7 @@ jobs:
   build-wasm:
     name: Build WASM
     runs-on: ubuntu-latest
+    needs: [verify-toolchain]
     permissions:
       contents: read
     defaults:
@@ -277,7 +328,7 @@ jobs:
   readiness-gate:
     name: Production Readiness Gate
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, test, build-wasm]
+    needs: [verify-toolchain, fmt, clippy, test, build-wasm]
     permissions:
       contents: read
     steps:
