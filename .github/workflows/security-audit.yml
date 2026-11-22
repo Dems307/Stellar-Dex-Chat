@@ -12,6 +12,18 @@ name: Security Audit
 # the source revision, workflow identity and artifact digests, and attaches
 # them to the release. The `release-validation` job independently re-derives
 # the digests and verifies the SBOM describes the exact published artifacts.
+#
+# Signed attestations (issue #282): the `attest-verification` job runs on
+# every published release and independently verifies both attestation bundles
+# (contract WASM and frontend build) that signed-attestations.yml attached to
+# the release.  Verification checks:
+#   1. Bundles are present and non-empty on the release assets.
+#   2. Each bundle decodes to a valid in-toto statement.
+#   3. The predicateType is a recognised SLSA Provenance URI.
+#   4. The source revision in the bundle matches the release tag's commit.
+#   5. The repository claim contains this repository's name.
+# Failure opens a tracking issue via open-tracking-issue (same as audit
+# failures) so it surfaces in the same alert channel.
 
 on:
   pull_request:
@@ -69,6 +81,50 @@ jobs:
 
       - name: Audit production dependencies
         run: pnpm audit --prod --audit-level high
+
+  secret-inventory:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    needs: [release-sbom]
+    if: >-
+      always() &&
+      (github.event_name != 'release' || needs.release-sbom.result == 'success')
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Scan committed tree and environment examples
+        run: |
+          set -euo pipefail
+          python3 tools/secret_scanner.py --path . --check-env --json | tee secret-scan-tree.json
+
+      - name: Scan pull request commits
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          python3 tools/secret_scanner.py --commits "${BASE_SHA}..HEAD" --json | tee secret-scan-commits.json
+
+      - name: Download release assets
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-artifacts
+          gh release download "$RELEASE_TAG" --dir release-artifacts --pattern '*' || echo "No release assets found"
+
+      - name: Scan release artifacts
+        if: github.event_name == 'release'
+        run: |
+          set -euo pipefail
+          python3 tools/secret_scanner.py --artifacts release-artifacts --json | tee secret-scan-artifacts.json
 
   release-sbom:
     name: Generate Release SBOM
@@ -172,10 +228,20 @@ jobs:
           ls ./*.cdx.json >/dev/null
           echo "SBOM and provenance verified for ${GITHUB_SHA}"
 
+      - name: Write failure runbook link
+        if: failure()
+        run: |
+          REPO="${{ github.repository }}"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "---" >> "$GITHUB_STEP_SUMMARY"
+          echo "### ❌ Release SBOM / provenance verification failed" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Runbook:** [docs/runbooks/artifact-attestation.md](https://github.com/${REPO}/blob/main/docs/runbooks/artifact-attestation.md)" >> "$GITHUB_STEP_SUMMARY"
+
   open-tracking-issue:
     name: Open Tracking Issue
     runs-on: ubuntu-latest
-    needs: [contracts-audit, frontend-audit, secret-inventory]
+    needs: [contracts-audit, frontend-audit, attest-verification]
     if: failure()
 
     steps:
@@ -204,15 +270,23 @@ jobs:
             const issue = await github.rest.issues.create({
               owner, repo, title, labels: [label],
               body: [
-                'The `security-audit.yml` workflow (`cargo deny check advisories`',
-                'and/or the pnpm severity policy) failed.',
+                'The `security-audit.yml` workflow failed. Possible causes:',
+                '',
+                '- `cargo deny check advisories` found a new RUSTSEC advisory.',
+                '- `pnpm audit` found a high-severity npm advisory.',
+                '- The `attest-verification` job detected a malformed or mismatched',
+                '  attestation bundle on a published release.',
                 '',
                 `Failed run: ${runUrl}`,
                 '',
-                'Close this issue once the advisory has been triaged (ignored with a',
-                'documented reason in `Dechat/stellar-contracts/deny.toml`, or fixed by',
-                'a dependency bump). Security bumps are not auto-merged; they go through',
-                'the normal review and test gates.',
+                '**Advisory failures:** ignore with a documented reason in',
+                '`Dechat/stellar-contracts/deny.toml`, or fix by a dependency bump.',
+                'Security bumps are not auto-merged; they go through the normal review',
+                'and test gates.',
+                '',
+                '**Attestation failures:** check that `signed-attestations.yml` ran',
+                'successfully for this release and that bundles were attached to the',
+                'release assets. See `docs/operations/release-attestations.md`.',
               ].join('\n'),
             });
             core.notice(`Opened tracking issue #${issue.data.number}`);

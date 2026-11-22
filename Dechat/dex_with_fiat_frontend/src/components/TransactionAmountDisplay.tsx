@@ -130,7 +130,7 @@ export function TransactionAmountDisplay(props: TransactionAmountProps) {
       data-optimistic={isOptimistic ? 'true' : 'false'}
     >
       <motion.span
-        className={`font-medium theme-text-primary ${isOptimistic ? 'opacity-80' : ''}`}
+        className={`font-medium theme-text-primary amount-ltr ${isOptimistic ? 'opacity-80' : ''}`}
         key={renderedText}
         initial={{ scale: 0.95, opacity: 0.7 }}
         animate={{ scale: 1, opacity: 1 }}
@@ -141,7 +141,7 @@ export function TransactionAmountDisplay(props: TransactionAmountProps) {
       </motion.span>
       {storedFiatAmount && storedFiatCurrency && (
         <motion.span
-          className="text-xs theme-text-muted"
+          className="text-xs theme-text-muted amount-ltr"
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           transition={{ duration: 0.2, delay: 0.1 }}

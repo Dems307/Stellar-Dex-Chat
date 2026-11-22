@@ -5,6 +5,7 @@ import {
   validateRedirectDestination,
   type DestinationValidationResult,
 } from '@/lib/security/validateDestination';
+import { generateCsrfToken } from '@/lib/payout/security';
 
 const TIMESTAMP_TOLERANCE_MS = 5 * 60 * 1000; // 5 minutes
 
@@ -94,6 +95,7 @@ export async function POST(request: NextRequest) {
     }
 
     const session = createWalletSessionToken(address);
+    const csrfToken = generateCsrfToken();
 
     const response = NextResponse.json({
       success: true,
@@ -101,6 +103,7 @@ export async function POST(request: NextRequest) {
         sessionToken: session.sessionToken,
         expiresAt: session.expiresAt,
         address: session.address,
+        csrfToken,
         ...(Object.keys(validatedDestinations).length > 0
           ? { destinations: validatedDestinations }
           : {}),

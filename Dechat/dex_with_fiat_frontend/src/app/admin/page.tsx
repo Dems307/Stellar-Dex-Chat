@@ -7,7 +7,10 @@ import {
   ReconciliationRecord,
 } from '@/types';
 import { aggregateDailyVolume, DailyMetric } from '@/lib/analytics';
-import { aggregatePayoutMetrics } from '@/lib/adminMetrics';
+import {
+  aggregatePayoutMetrics,
+  aggregateReconciliationSlo,
+} from '@/lib/adminMetrics';
 import { useFeatureFlag } from '@/hooks/useFeatureFlag';
 import AuditTable from '@/components/AuditTable';
 import useBridgeStats from '@/hooks/useBridgeStats';
@@ -131,6 +134,8 @@ export default function AdminDashboard() {
   const [reconciliationRecords, setReconciliationRecords] = useState<
     ReconciliationRecord[]
   >([]);
+  const [reconciliationMismatch, setReconciliationMismatch] =
+    useState<boolean>(false);
   const [metrics, setMetrics] = useState<DailyMetric[]>([]);
   const [loadingMetrics, setLoadingMetrics] = useState(true);
   const [auditEntries, setAuditEntries] = useState<AdminAuditLogEntry[]>([]);
@@ -154,6 +159,10 @@ export default function AdminDashboard() {
 
   const payoutMetrics = useMemo(() => {
     return aggregatePayoutMetrics(reconciliationRecords);
+  }, [reconciliationRecords]);
+
+  const reconciliationSlo = useMemo(() => {
+    return aggregateReconciliationSlo(reconciliationRecords);
   }, [reconciliationRecords]);
 
   useEffect(() => {
@@ -240,8 +249,16 @@ export default function AdminDashboard() {
       }
 
       if (response.ok) {
-        const records: ReconciliationRecord[] = await response.json();
+        const payload = await response.json();
+        // The reconciliation API may return either a bare array of records or
+        // an object carrying a `mismatch` flag alongside the records.
+        const records: ReconciliationRecord[] = Array.isArray(payload)
+          ? payload
+          : (payload?.records ?? []);
         setReconciliationRecords(records);
+        setReconciliationMismatch(
+          !Array.isArray(payload) && Boolean(payload?.mismatch),
+        );
         const dailyMetrics = aggregateDailyVolume(records, 30);
         setMetrics(dailyMetrics);
       }
@@ -255,11 +272,13 @@ export default function AdminDashboard() {
   const exportAuditToCSV = async () => {
     try {
       setExportingCsv(true);
-      // Optimistic UI: show success state immediately
       setOptimisticExportSuccess(true);
       const allEntries: AdminAuditLogEntry[] = [];
+      const maxExportPages = 50; // bounded request count
+      const maxExportRows = 1000; // 50 pages * 20 rows
+      const pagesToFetch = Math.min(auditTotalPages, maxExportPages);
 
-      for (let page = 1; page <= auditTotalPages; page += 1) {
+      for (let page = 1; page <= pagesToFetch && allEntries.length < maxExportRows; page += 1) {
         const params = new URLSearchParams({
           page: String(page),
           action: actionFilter,
@@ -279,7 +298,9 @@ export default function AdminDashboard() {
         }
 
         const payload: AuditLogResponse = await response.json();
-        allEntries.push(...payload.entries);
+        const remaining = maxExportRows - allEntries.length;
+        allEntries.push(...payload.entries.slice(0, remaining));
+        if (payload.entries.length === 0) break;
       }
 
       const headers = [
@@ -313,7 +334,6 @@ export default function AdminDashboard() {
       document.body.removeChild(link);
       URL.revokeObjectURL(url);
     } catch (error) {
-      // Rollback optimistic state on error
       setOptimisticExportSuccess(false);
       setAuditError(
         error instanceof Error
@@ -322,7 +342,6 @@ export default function AdminDashboard() {
       );
     } finally {
       setExportingCsv(false);
-      // Clear optimistic state after a short delay to show success
       if (optimisticExportSuccess) {
         setTimeout(() => setOptimisticExportSuccess(false), 2000);
       }
@@ -454,6 +473,107 @@ export default function AdminDashboard() {
                 </h2>
                 <div className="text-2xl font-bold theme-text-primary">
                   {payoutMetrics.failedPayouts}
+                </div>
+              </div>
+            </div>
+
+            <div
+              className="theme-surface rounded-lg shadow p-6 mb-8 border-t-4"
+              style={{
+                borderTopColor: reconciliationMismatch
+                  ? 'var(--color-danger)'
+                  : 'var(--color-warning)',
+              }}
+              aria-label="Reconciliation SLO summary"
+            >
+              <div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-4">
+                <div>
+                  <h2 className="text-xl font-semibold theme-text-primary">
+                    Reconciliation SLOs
+                  </h2>
+                  <p className="text-sm theme-text-secondary mt-1">
+                    Unresolved payouts tracked against age and amount-at-risk
+                    targets.
+                  </p>
+                </div>
+                <Link
+                  href="/admin/reconciliation"
+                  className="theme-primary-button px-4 py-2 rounded-md whitespace-nowrap"
+                >
+                  Open Reconciliation Tools
+                </Link>
+              </div>
+
+              {reconciliationMismatch && (
+                <div
+                  className="mt-4 rounded-md px-4 py-3 text-sm"
+                  role="alert"
+                  style={{
+                    backgroundColor: 'var(--color-danger-soft)',
+                    color: 'var(--color-danger)',
+                  }}
+                >
+                  Ledger mismatch detected between on-chain balance and
+                  recorded payouts. Follow the{' '}
+                  <a
+                    href="/docs/runbooks/reconciliation-mismatch.md"
+                    className="underline font-medium"
+                  >
+                    reconciliation mismatch runbook
+                  </a>{' '}
+                  before approving further payouts.
+                </div>
+              )}
+
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mt-6">
+                <div>
+                  <h3 className="text-sm font-medium theme-text-secondary mb-2 uppercase tracking-wider">
+                    Amount at Risk
+                  </h3>
+                  <div className="text-2xl font-bold theme-text-primary">
+                    {reconciliationSlo.amountAtRisk.toLocaleString(undefined, {
+                      maximumFractionDigits: 2,
+                    })}{' '}
+                    XLM
+                  </div>
+                  <p className="text-xs theme-text-muted mt-1">
+                    {reconciliationSlo.unresolvedCount} unresolved payout
+                    {reconciliationSlo.unresolvedCount === 1 ? '' : 's'}
+                  </p>
+                </div>
+
+                <div>
+                  <h3 className="text-sm font-medium theme-text-secondary mb-2 uppercase tracking-wider">
+                    Oldest Unresolved Age
+                  </h3>
+                  <div className="text-2xl font-bold theme-text-primary">
+                    {reconciliationSlo.oldestAgeHours === null
+                      ? '---'
+                      : `${reconciliationSlo.oldestAgeHours.toLocaleString(
+                          undefined,
+                          { maximumFractionDigits: 1 },
+                        )} h`}
+                  </div>
+                  <p className="text-xs theme-text-muted mt-1">
+                    {reconciliationSlo.breached
+                      ? 'SLO breached — escalate now'
+                      : 'Within SLO target'}
+                  </p>
+                </div>
+
+                <div>
+                  <h3 className="text-sm font-medium theme-text-secondary mb-2 uppercase tracking-wider">
+                    Next Action
+                  </h3>
+                  <p className="text-sm theme-text-primary">
+                    {reconciliationSlo.nextAction}
+                  </p>
+                  <a
+                    href="/docs/runbooks/reconciliation.md"
+                    className="text-sm underline theme-text-primary mt-2 inline-block"
+                  >
+                    Reconciliation runbook
+                  </a>
                 </div>
               </div>
             </div>

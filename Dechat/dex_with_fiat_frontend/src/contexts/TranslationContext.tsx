@@ -4,6 +4,8 @@ import React, { createContext, useContext, useState, useCallback, useMemo, useEf
 import en from '../locales/en.json';
 import fr from '../locales/fr.json';
 import es from '../locales/es.json';
+import ar from '../locales/ar.json';
+import ar from '../locales/ar.json';
 
 type TranslationKeys = typeof en;
 type NestedKeyOf<T> = T extends object
@@ -13,17 +15,34 @@ type NestedKeyOf<T> = T extends object
 export type TKey = NestedKeyOf<TranslationKeys>;
 
 /** Supported locale codes. */
-export type SupportedLocale = 'en' | 'fr' | 'es';
+export type SupportedLocale = 'en' | 'fr' | 'es' | 'ar';
 
-export const SUPPORTED_LOCALES: SupportedLocale[] = ['en', 'fr', 'es'];
+export const SUPPORTED_LOCALES: SupportedLocale[] = ['en', 'fr', 'es', 'ar'];
+
+/** Locales that use a right-to-left script. */
+export const RTL_LOCALES: SupportedLocale[] = ['ar'];
+
+/** Returns the CSS writing-direction for a given locale. */
+export function getLocaleDir(locale: SupportedLocale): 'ltr' | 'rtl' {
+  return RTL_LOCALES.includes(locale) ? 'rtl' : 'ltr';
+}
 
 interface TranslationContextType {
   t: (key: string, params?: Record<string, string | number>) => string;
   locale: SupportedLocale;
   setLocale: (locale: SupportedLocale) => void;
+  /** True when the active locale uses right-to-left text direction. */
+  isRtl: boolean;
+  /** The CSS writing direction for the active locale ('ltr' | 'rtl'). */
+  dir: 'ltr' | 'rtl';
 }
 
-const translations: Record<SupportedLocale, TranslationKeys> = { en, fr: fr as TranslationKeys, es: es as TranslationKeys };
+const translations: Record<SupportedLocale, TranslationKeys> = {
+  en,
+  fr: fr as TranslationKeys,
+  es: es as TranslationKeys,
+  ar: ar as TranslationKeys,
+};
 
 const TranslationContext = createContext<TranslationContextType | undefined>(undefined);
 
@@ -72,10 +91,13 @@ export function TranslationProvider({ children }: { children: React.ReactNode })
     }
   }, []);
 
-  // Update document.documentElement.lang when locale changes
+  // Update document.documentElement.lang and dir when locale changes.
+  // Setting dir at the root element applies writing direction to the whole
+  // document, so descendant components inherit it via CSS logical properties.
   useEffect(() => {
     if (typeof document !== 'undefined') {
       document.documentElement.lang = locale;
+      document.documentElement.dir = getLocaleDir(locale);
     }
   }, [locale]);
 
@@ -110,7 +132,13 @@ export function TranslationProvider({ children }: { children: React.ReactNode })
     return value;
   }, [locale]);
 
-  const value = useMemo(() => ({ t, locale, setLocale: handleSetLocale }), [t, locale, handleSetLocale]);
+  const isRtl = RTL_LOCALES.includes(locale);
+  const dir = getLocaleDir(locale);
+
+  const value = useMemo(
+    () => ({ t, locale, setLocale: handleSetLocale, isRtl, dir }),
+    [t, locale, handleSetLocale, isRtl, dir],
+  );
 
   return (
     <TranslationContext.Provider value={value}>

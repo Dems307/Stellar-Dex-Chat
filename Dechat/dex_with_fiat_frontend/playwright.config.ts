@@ -47,6 +47,9 @@ const E2E_RUN_ID = process.env.E2E_RUN_ID ?? `run-${Date.now()}`;
 const e2eEnv: Record<string, string> = {
   NEXT_PUBLIC_E2E: 'true',
   E2E_RUN_ID,
+  // Issue #279: wallet/transaction UX smoke specs select browser-isolated
+  // wallet mocks via this flag; never inherit a real wallet provider.
+  E2E_WALLET_MOCK: 'true',
   // Force local, disposable endpoints; never inherit production values.
   SOROBAN_RPC_URL: process.env.E2E_SOROBAN_RPC_URL ?? 'http://127.0.0.1:8000/soroban/rpc',
   NEXT_PUBLIC_SOROBAN_RPC_URL:
@@ -57,6 +60,10 @@ const e2eEnv: Record<string, string> = {
   NEXT_PUBLIC_PAYOUT_PROVIDER_URL:
     process.env.E2E_PAYOUT_PROVIDER_URL ?? 'http://127.0.0.1:8787',
 };
+
+// Issue #211: visual regression baselines are committed per viewport. Keep the
+// snapshot path stable and deterministic so CI diffs are reviewable.
+const VISUAL_SNAPSHOT_PATH = process.env.VISUAL_SNAPSHOT_PATH ?? './tests/visual/__screenshots__';
 
 export default defineConfig({
   testDir: './tests/e2e',
@@ -73,6 +80,15 @@ export default defineConfig({
     trace: 'on-first-retry',
     screenshot: 'only-on-failure',
   },
+  expect: {
+    toHaveScreenshot: {
+      // Allow tiny anti-aliasing drift while still catching real regressions.
+      maxDiffPixelRatio: 0.01,
+      animations: 'disabled',
+      caret: 'hide',
+    },
+  },
+  snapshotPathTemplate: `${VISUAL_SNAPSHOT_PATH}/{testFilePath}/{arg}-{projectName}{ext}`,
   projects: [
     {
       name: 'chromium',
@@ -86,6 +102,39 @@ export default defineConfig({
       name: 'webkit',
       use: { ...devices['Desktop Safari'] },
     },
+    // Issue #279: focused cross-browser wallet + transaction UX smoke suite.
+    // Each project pins its own browser so wallet mocks stay isolated per
+    // engine (no shared storage/extension state between browsers).
+    {
+      name: 'wallet-ux-chromium',
+      testDir: './tests/e2e/wallet-ux',
+      testMatch: /.*\.(spec|test)\.ts$/,
+      use: {
+        ...devices['Desktop Chrome'],
+        browserName: 'chromium',
+        walletMock: { browser: 'chromium', storage: 'isolated' },
+      },
+    },
+    {
+      name: 'wallet-ux-firefox',
+      testDir: './tests/e2e/wallet-ux',
+      testMatch: /.*\.(spec|test)\.ts$/,
+      use: {
+        ...devices['Desktop Firefox'],
+        browserName: 'firefox',
+        walletMock: { browser: 'firefox', storage: 'isolated' },
+      },
+    },
+    {
+      name: 'wallet-ux-webkit',
+      testDir: './tests/e2e/wallet-ux',
+      testMatch: /.*\.(spec|test)\.ts$/,
+      use: {
+        ...devices['Desktop Safari'],
+        browserName: 'webkit',
+        walletMock: { browser: 'webkit', storage: 'isolated' },
+      },
+    },
     {
       name: 'amount-property',
       testDir: './tests/property',
@@ -97,6 +146,18 @@ export default defineConfig({
       testDir: './tests/a11y',
       testMatch: /.*\.(spec|test)\.ts$/,
       use: { ...devices['Desktop Chrome'] },
+    },
+    {
+      name: 'visual-desktop',
+      testDir: './tests/visual',
+      testMatch: /.*\.visual\.ts$/,
+      use: { ...devices['Desktop Chrome'], viewport: { width: 1280, height: 800 } },
+    },
+    {
+      name: 'visual-mobile',
+      testDir: './tests/visual',
+      testMatch: /.*\.visual\.ts$/,
+      use: { ...devices['Pixel 7'] },
     },
   ],
   webServer: {
