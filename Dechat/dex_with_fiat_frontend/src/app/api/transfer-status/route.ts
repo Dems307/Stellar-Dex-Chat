@@ -56,6 +56,9 @@ export async function POST(request: NextRequest) {
   const limited = applyRateLimit(ip, '/api/transfer-status', RATE_LIMIT);
   if (limited) return limited;
 
+  const correlationId =
+    request.headers.get('x-correlation-id') || crypto.randomUUID();
+
   try {
     let body: unknown;
     try {
@@ -154,7 +157,10 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json(errorDetails.body, {
       status: errorDetails.status,
-      headers: errorDetails.headers,
+      headers: {
+        ...errorDetails.headers,
+        'X-Correlation-Id': correlationId,
+      },
     });
   }
 }

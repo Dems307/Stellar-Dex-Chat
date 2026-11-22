@@ -1072,13 +1072,22 @@ export default function StellarFiatModal({
   };
 
   return (
-    <div className="theme-overlay fixed inset-0 z-50 flex items-center justify-center backdrop-blur-sm">
+    <div
+      className="theme-overlay fixed inset-0 z-50 flex items-center justify-center backdrop-blur-sm"
+      data-testid="stellar-fiat-modal-overlay"
+      data-tx-status={status}
+    >
       <div
         ref={modalRef}
         role="dialog"
         aria-modal="true"
         aria-label={isAdminMode ? 'Withdraw from Bridge' : 'Deposit to Bridge'}
         tabIndex={-1}
+        data-testid="stellar-fiat-modal"
+        data-flow={isAdminMode ? 'withdraw' : 'deposit'}
+        data-wallet-connected={connection.isConnected ? 'true' : 'false'}
+        data-wallet-address={connection.address || ''}
+        data-wallet-network={txNetwork}
         className="theme-surface theme-border relative w-full max-w-md mx-4 border rounded-2xl shadow-2xl p-6"
       >
         <div className="flex items-center justify-between mb-6">
@@ -1091,6 +1100,7 @@ export default function StellarFiatModal({
           <button
             onClick={handleClose}
             aria-label="Close"
+            data-testid="close-modal-button"
             className="theme-text-muted hover:theme-text-primary transition-colors"
           >
             <X className="w-5 h-5" />
@@ -1124,6 +1134,7 @@ export default function StellarFiatModal({
                 }
                 target="_blank"
                 rel="noreferrer"
+                data-testid="tx-hash-link"
                 className="text-blue-400 hover:underline text-xs break-all"
               >
                 {txHash}
