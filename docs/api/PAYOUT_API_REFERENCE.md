@@ -94,6 +94,16 @@ Health metrics are available in `GET /api/health` under `providerCircuits`.
 Provider outage responses remain `503` with `Retry-After` and `PROVIDER_OUTAGE`;
 the same provider operation may enter `HALF_OPEN` independently after cooldown.
 
+### Evidence reconciliation
+`POST /api/admin/reconciliation` polls stale pending payouts. Its response includes
+`conflicts` and per-payout outcomes. `GET /api/admin/reconciliation?format=report`
+returns reconciliation records and includes persisted evidence conflicts for
+authorized operators.
+
+The effective status follows the documented [payout evidence precedence model](../payout/EVIDENCE_PRECEDENCE.md).
+An evidence conflict is persisted for review; it does not silently replace the
+highest-precedence status.
+
 ## Error Model
 Standard RFC 7807 Problem Details are returned for non-2xx responses:
 ```json
