@@ -1,6 +1,7 @@
 # Payout API Security Policy
 
 ## Overview
+
 This document specifies the threat model, enforcement strategy, and cross-origin security guarantees for all fiat payout API routes in the Stellar-Dex-Chat application.
 
 ---
@@ -8,6 +9,7 @@ This document specifies the threat model, enforcement strategy, and cross-origin
 ## 1. State-Changing Browser Routes
 
 ### Scope
+
 - `POST /api/create-recipient`
 - `POST /api/initiate-transfer`
 - `POST /api/verify-account`
@@ -39,6 +41,7 @@ This document specifies the threat model, enforcement strategy, and cross-origin
 ## 2. Wallet-Based and Programmatic Clients
 
 ### Policy
+
 - Wallet clients (e.g., Freighter, mobile wallets, automated integration scripts, or server-to-server API callers) do not execute in an ambient browser cookie context and do not transmit browser-specific `Origin` or `Sec-Fetch-*` headers.
 - **Safe Allowance**: Requests lacking `Origin`, `Referer`, and `Sec-Fetch-*` headers are classified as wallet/programmatic clients and are allowed to proceed to route handlers without blocking.
 - State-changing actions are authenticated via cryptographic signatures (e.g., Stellar account signature or Bearer tokens) and idempotency keys rather than browser CSRF cookies.
@@ -48,10 +51,12 @@ This document specifies the threat model, enforcement strategy, and cross-origin
 ## 3. Signed Provider Webhooks (`/api/webhook`)
 
 ### Separation from Browser Security
+
 - Inbound webhooks from payout providers (e.g., Paystack) originate from external provider servers (server-to-server callbacks) and do not have browser sessions, same-origin headers, or CSRF tokens.
 - Webhook routes are explicitly **exempt** from browser Origin, Fetch Metadata, and CSRF token requirements.
 
 ### Webhook Authentication Policy
+
 1. **Cryptographic HMAC Signature Verification**:
    - Inbound webhook payloads must carry a valid `x-paystack-signature` header.
    - The server verifies the signature using `crypto.createHmac('sha512', PAYSTACK_SECRET_KEY)`.
