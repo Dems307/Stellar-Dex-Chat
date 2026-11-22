@@ -80,6 +80,20 @@ deployments or shared between application instances. A reconnect to an
 instance that cannot satisfy the cursor receives `resync`; the existing status
 polling path remains the recovery mechanism for the active payout.
 
+### Provider circuit isolation
+Circuit health is isolated by provider and operation:
+
+- `account_verification`
+- `recipient_creation`
+- `transfer_initiation`
+- `status_query`
+- `transfer_cancellation`
+
+An outage in one operation does not open circuits for another operation.
+Health metrics are available in `GET /api/health` under `providerCircuits`.
+Provider outage responses remain `503` with `Retry-After` and `PROVIDER_OUTAGE`;
+the same provider operation may enter `HALF_OPEN` independently after cooldown.
+
 ## Error Model
 Standard RFC 7807 Problem Details are returned for non-2xx responses:
 ```json

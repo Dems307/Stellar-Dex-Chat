@@ -156,7 +156,10 @@ export async function POST(request: NextRequest) {
     });
 
     const provider = getPayoutProvider();
-    const breaker = getProviderCircuitBreaker(provider.name);
+    const breaker = getProviderCircuitBreaker(
+      provider.name,
+      'recipient_creation',
+    );
 
     // Race-safe beneficiary resolution with circuit breaker protection
     const beneficiaryResult = await getOrCreateBeneficiary(

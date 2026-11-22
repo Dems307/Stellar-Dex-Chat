@@ -215,13 +215,19 @@ export class PayoutRetryQueue {
       this.persistToFile();
 
       try {
-        await provider.initiateTransfer({
-          source: job.payload.source,
-          amount: job.payload.amount,
-          recipient: job.payload.recipient,
-          reason: job.payload.reason,
-          reference: job.idempotencyKey, // Reuses original idempotency key!
-        });
+        const breaker = getProviderCircuitBreaker(
+          provider.name,
+          'transfer_initiation',
+        );
+        await breaker.execute(() =>
+          provider.initiateTransfer({
+            source: job.payload.source,
+            amount: job.payload.amount,
+            recipient: job.payload.recipient,
+            reason: job.payload.reason,
+            reference: job.idempotencyKey,
+          }),
+        );
 
         job.status = 'completed';
         job.updatedAt = new Date().toISOString();

@@ -117,7 +117,10 @@ export async function POST(request: NextRequest) {
     });
 
     const provider = getPayoutProvider();
-    const breaker = getProviderCircuitBreaker(provider.name);
+    const breaker = getProviderCircuitBreaker(
+      provider.name,
+      'account_verification',
+    );
 
     const data = await breaker.execute(() =>
       provider.verifyAccount({ accountNumber, bankCode }),

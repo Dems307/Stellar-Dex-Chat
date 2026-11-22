@@ -120,7 +120,10 @@ export async function POST(request: NextRequest) {
     }
 
     const provider = getPayoutProvider();
-    const breaker = getProviderCircuitBreaker(provider.name);
+    const breaker = getProviderCircuitBreaker(
+      provider.name,
+      'status_query',
+    );
 
     const data = await breaker.execute(() =>
       provider.checkTransferStatus({ reference }),
