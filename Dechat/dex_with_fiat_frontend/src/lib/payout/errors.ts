@@ -2,19 +2,23 @@ import { NextResponse } from 'next/server';
 import { randomUUID } from 'crypto';
 
 export const API_VERSION = 'v1' as const;
+export const API_VERSION_HEADER = 'X-API-Version';
+export const SUPPORTED_API_VERSIONS = ['v1'] as const;
+export const PAYOUT_API_DEPRECATION_WINDOW_MONTHS = 6;
 
 export type PayoutErrorCategory =
-  | 'validation'
-  | 'authorization'
-  | 'provider'
-  | 'rate_limit'
-  | 'internal';
+  'validation' | 'authorization' | 'provider' | 'rate_limit' | 'internal';
 
 export type PayoutErrorCode =
   // Validation errors (400)
   | 'VALIDATION_ERROR'
   | 'MALFORMED_REQUEST'
   | 'INVALID_INPUT'
+  | 'FX_QUOTE_REQUIRED'
+  | 'FX_QUOTE_EXPIRED'
+  | 'FX_QUOTE_MISMATCH'
+  | 'FX_QUOTE_UNAVAILABLE'
+  | 'IDEMPOTENCY_CONFLICT'
   // Authorization errors (401, 403)
   | 'UNAUTHORIZED'
   | 'FORBIDDEN'
@@ -140,7 +144,10 @@ export function logStructuredError(
   error: unknown,
   metadata?: Record<string, unknown>,
 ): void {
-  const sanitizedMeta = redactSecrets(metadata || {}) as Record<string, unknown>;
+  const sanitizedMeta = redactSecrets(metadata || {}) as Record<
+    string,
+    unknown
+  >;
   const errMessage = error instanceof Error ? error.message : String(error);
   const errStack = error instanceof Error ? error.stack : undefined;
 
@@ -214,11 +221,19 @@ export function createPayoutErrorResponse(options: {
 export function validationError(options: {
   message?: string;
   correlationId?: string;
-  issues?: Array<{ path?: (string | number)[]; message: string; code?: string }>;
+  issues?: Array<{
+    path?: (string | number)[];
+    message: string;
+    code?: string;
+  }>;
   code?: PayoutErrorCode;
 }): NextResponse {
   const details: PayoutErrorDetail[] = (options.issues || []).map((issue) => ({
-    field: issue.path ? issue.path.join('.') : undefined,
+    field: issue.path
+      ? issue.path
+          .filter((part): part is string | number => typeof part !== 'symbol')
+          .join('.')
+      : undefined,
     message: issue.message,
     code: issue.code,
   }));
@@ -231,7 +246,12 @@ export function validationError(options: {
     retryable: false,
     correlationId: options.correlationId,
     details,
-    rawErrors: options.issues,
+    rawErrors: options.issues?.map((issue) => ({
+      path: issue.path
+        ?.filter((part): part is string | number => typeof part !== 'symbol'),
+      message: issue.message,
+      code: issue.code,
+    })),
   });
 }
 
@@ -307,7 +327,8 @@ export function providerError(options: {
   let code: PayoutErrorCode = 'PROVIDER_ERROR';
   let retryable = true;
   let userMessage =
-    options.safeMessage || 'Payment provider encountered an error. Please try again.';
+    options.safeMessage ||
+    'Payment provider encountered an error. Please try again.';
 
   if (providerStatus === 422) {
     status = 400;
@@ -323,7 +344,8 @@ export function providerError(options: {
     status = 503;
     code = 'PROVIDER_UNAVAILABLE';
     retryable = true;
-    userMessage = 'Payment provider is currently unavailable. Please try again later.';
+    userMessage =
+      'Payment provider is currently unavailable. Please try again later.';
   }
 
   return createPayoutErrorResponse({
