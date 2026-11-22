@@ -452,6 +452,8 @@ Repo Avatar
 - **integration:** Catch integration failures across intent, signing, and payout
 - **contract:** Event schemas, resource budgets, upgrade compatibility, and adversarial fixtures
 - **api:** Harden payout lifecycle with reconciliation, minor units, ownership auth, and provider adapters
+- **i18n:** Add localization QA fixtures for financial edge cases
+- Add rollback-safe frontend and API release health gates
 - **security:** Add release-time secret scanning with exception policy
 - **ci:** Add migration and contract-upgrade checks to PR template
 - **ci:** Improve caching without weakening reproducibility
@@ -464,6 +466,7 @@ Repo Avatar
 - **perf:** Enforce audit and chat performance budgets
 - **payout:** Audited, idempotent dead-letter replay operator action
 - **fixtures:** Deterministic full-stack fixture with seeded ledger history
+- Add staged contract deployment with preflight and post-deploy verification
 
 ### Fixed
 
@@ -1343,6 +1346,7 @@ Repo Avatar
 - **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
 - **fault-injection:** Add fault-injection tests for DB, RPC, and provider outages
+- **changelog:** Update changelog [skip ci]
 
 ### Deprecated
 
