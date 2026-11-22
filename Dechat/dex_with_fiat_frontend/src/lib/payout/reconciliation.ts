@@ -1,13 +1,16 @@
 import fs from 'fs';
 import path from 'path';
 import { payoutAuditLedger, PayoutAuditLedger } from './auditLedger';
+import {
+  PayoutEvidence,
+  PayoutEvidenceResolution,
+  payoutEvidenceConflictResolver,
+} from './evidenceConflictResolver';
+import { getAllTransfers, setTransferStatus } from '../transferStore';
+import { getPayoutProvider } from './providers/registry';
 
 export type DomainPayoutStatus =
-  | 'pending'
-  | 'success'
-  | 'failed'
-  | 'reversed'
-  | 'cancelled';
+  'pending' | 'success' | 'failed' | 'reversed' | 'cancelled';
 
 export interface RejectedEventRecord {
   id: string;
@@ -19,6 +22,20 @@ export interface RejectedEventRecord {
   reason: string;
   payload: Record<string, unknown>;
   timestamp: string;
+  providerEventAt: string;
+  receivedAt: string;
+}
+
+export interface PayoutWebhookEventRecord {
+  eventId: string;
+  payoutReference: string;
+  eventType: string;
+  targetStatus?: DomainPayoutStatus;
+  decision: ReconciliationDecisionType;
+  initialStatus: DomainPayoutStatus;
+  effectiveStatus: DomainPayoutStatus;
+  providerEventAt: string;
+  receivedAt: string;
 }
 
 export type ReconciliationDecisionType =
@@ -127,7 +144,9 @@ export interface ReconciliationTotalsVerification {
 
 export class PayoutReconciliationService {
   private rejectedEvents: RejectedEventRecord[] = [];
+  private webhookEvents: PayoutWebhookEventRecord[] = [];
   private storageFilePath: string | null = null;
+  private webhookEventsFilePath: string | null = null;
   private auditLedger: PayoutAuditLedger;
 
   constructor(storageDir?: string, auditLedgerInstance?: PayoutAuditLedger) {
@@ -147,9 +166,50 @@ export class PayoutReconciliationService {
         storageDir,
         'payout_rejected_events.jsonl',
       );
+      this.webhookEventsFilePath = path.join(
+        storageDir,
+        'payout_webhook_events.jsonl',
+      );
       this.loadFromFile();
+      this.loadWebhookEvents();
     } catch (err) {
       console.warn('Failed to initialize reconciliation storage:', err);
+    }
+  }
+
+  private loadWebhookEvents(): void {
+    if (
+      !this.webhookEventsFilePath ||
+      !fs.existsSync(this.webhookEventsFilePath)
+    ) {
+      return;
+    }
+
+    try {
+      const data = fs.readFileSync(this.webhookEventsFilePath, 'utf8');
+      this.webhookEvents = data
+        .split('\n')
+        .filter((line) => line.trim().length > 0)
+        .map((line) => JSON.parse(line) as PayoutWebhookEventRecord);
+    } catch (err) {
+      console.warn('Failed to load webhook event ordering data:', err);
+    }
+  }
+
+  private appendWebhookEvent(record: PayoutWebhookEventRecord): void {
+    this.webhookEvents.push(record);
+    if (!this.webhookEventsFilePath) return;
+
+    try {
+      fs.appendFileSync(
+        this.webhookEventsFilePath,
+        `${JSON.stringify(record)}\n`,
+        'utf8',
+      );
+    } catch (err) {
+      console.error('Failed to persist webhook event ordering data:', err);
+      this.webhookEvents.pop();
+      throw err;
     }
   }
 
@@ -265,6 +325,8 @@ export class PayoutReconciliationService {
     currentStatus?: DomainPayoutStatus;
     payload?: Record<string, unknown>;
     correlationId?: string;
+    providerEventAt?: string;
+    receivedAt?: string;
   }): ReconciliationDecision {
     const {
       eventId,
@@ -273,10 +335,37 @@ export class PayoutReconciliationService {
       currentStatus,
       payload,
       correlationId,
+      providerEventAt,
+      receivedAt,
     } = params;
     const targetStatus = this.mapEventToStatus(eventType);
+    const received = receivedAt ? new Date(receivedAt) : new Date();
+    const providerTime = providerEventAt ? new Date(providerEventAt) : received;
+    if (
+      !Number.isFinite(received.getTime()) ||
+      !Number.isFinite(providerTime.getTime())
+    ) {
+      throw new Error('Webhook event and receipt times must be valid dates');
+    }
+    const eventTimestamp = providerTime.toISOString();
+    const receiptTimestamp = received.toISOString();
+    const payoutEvents = this.webhookEvents.filter(
+      (event) => event.payoutReference === payoutReference,
+    );
+    const initialStatus =
+      payoutEvents[0]?.initialStatus ?? currentStatus ?? 'pending';
 
     if (!targetStatus) {
+      this.appendWebhookEvent({
+        eventId,
+        payoutReference,
+        eventType,
+        decision: 'UNRECOGNIZED_EVENT',
+        initialStatus,
+        effectiveStatus: currentStatus ?? initialStatus,
+        providerEventAt: eventTimestamp,
+        receivedAt: receiptTimestamp,
+      });
       return {
         decision: 'UNRECOGNIZED_EVENT',
         currentStatus,
@@ -285,66 +374,111 @@ export class PayoutReconciliationService {
       };
     }
 
-    if (currentStatus === targetStatus) {
-      return {
-        decision: 'IDEMPOTENT_NOOP',
-        currentStatus,
-        targetStatus,
-        effectiveStatus: currentStatus,
-        reason: 'Current state already matches event status',
-      };
+    const latestEvent = payoutEvents.reduce<
+      PayoutWebhookEventRecord | undefined
+    >(
+      (latest, event) =>
+        !latest || this.compareEventOrder(event, latest) > 0 ? event : latest,
+      undefined,
+    );
+    const candidate: PayoutWebhookEventRecord = {
+      eventId,
+      payoutReference,
+      eventType,
+      targetStatus,
+      decision: 'APPLIED',
+      initialStatus,
+      effectiveStatus: initialStatus,
+      providerEventAt: eventTimestamp,
+      receivedAt: receiptTimestamp,
+    };
+    const orderedEvents = [...payoutEvents, candidate]
+      .filter((event) => event.targetStatus)
+      .sort((left, right) => this.compareEventOrder(left, right));
+    let effectiveStatus = initialStatus;
+    let candidateAllowed = false;
+    let candidateRejectionReason: string | undefined;
+    for (const event of orderedEvents) {
+      const eventTarget = event.targetStatus!;
+      const transition = this.evaluateTransition(effectiveStatus, eventTarget);
+      const allowed =
+        transition.allowed ||
+        (effectiveStatus === 'failed' && eventTarget === 'success');
+      if (allowed) {
+        effectiveStatus = eventTarget;
+        if (event === candidate) candidateAllowed = true;
+      } else if (event === candidate) {
+        candidateRejectionReason = transition.reason;
+      }
     }
 
-    const { allowed, reason } = this.evaluateTransition(
-      currentStatus,
-      targetStatus,
-    );
-
-    if (!allowed) {
-      const rejectedRecord: RejectedEventRecord = {
+    candidate.effectiveStatus = effectiveStatus;
+    const isDuplicate = payoutEvents.some((event) => event.eventId === eventId);
+    const isOlderThanLatest =
+      latestEvent && this.compareEventOrder(candidate, latestEvent) <= 0;
+    const reject = (reason: string): ReconciliationDecision => {
+      candidate.decision = 'REJECTED_OUT_OF_ORDER';
+      this.appendWebhookEvent(candidate);
+      this.appendRejectedRecord({
         id: `rej_${Date.now()}_${eventId}`,
         eventId,
         payoutReference,
         eventType,
         currentStatus,
         targetStatus,
-        reason: reason || 'Out-of-order transition rejected',
+        reason,
         payload: payload || {},
-        timestamp: new Date().toISOString(),
-      };
-
-      this.appendRejectedRecord(rejectedRecord);
-
-      // Record in immutable audit ledger for finance/audit traceability
+        timestamp: receiptTimestamp,
+        providerEventAt: eventTimestamp,
+        receivedAt: receiptTimestamp,
+      });
       this.auditLedger.recordEvent({
         payoutId: payoutReference,
         action: 'payout_event_rejected',
         actor: 'system:reconciliation',
         requestCorrelationId: correlationId || eventId,
         providerReference: eventId,
-        metadata: {
-          eventId,
-          eventType,
-          currentStatus,
-          targetStatus,
-          reason,
-        },
+        metadata: { eventId, eventType, currentStatus, targetStatus, reason },
       });
-
       return {
         decision: 'REJECTED_OUT_OF_ORDER',
         currentStatus,
         targetStatus,
-        effectiveStatus: currentStatus || 'pending',
+        effectiveStatus,
         reason,
+      };
+    };
+
+    if (isDuplicate) {
+      return reject('Webhook event identifier has already been processed');
+    }
+    if (!candidateAllowed) {
+      return reject(
+        candidateRejectionReason || 'Out-of-order transition rejected',
+      );
+    }
+    if (isOlderThanLatest && effectiveStatus === (currentStatus ?? 'pending')) {
+      return reject(
+        'Webhook event is older than or duplicates the latest provider event',
+      );
+    }
+
+    if (effectiveStatus === (currentStatus ?? 'pending')) {
+      candidate.decision = 'IDEMPOTENT_NOOP';
+      this.appendWebhookEvent(candidate);
+      return {
+        decision: 'IDEMPOTENT_NOOP',
+        currentStatus,
+        targetStatus,
+        effectiveStatus,
+        reason: 'Current state already matches event status',
       };
     }
 
     // Transition is allowed: audit record is created for domain action
     let auditAction: 'payout_succeeded' | 'payout_failed' | 'payout_reversed' =
-      'payout_succeeded';
-    if (targetStatus === 'failed') auditAction = 'payout_failed';
-    if (targetStatus === 'reversed') auditAction = 'payout_reversed';
+      effectiveStatus === 'success' ? 'payout_succeeded' : 'payout_failed';
+    if (effectiveStatus === 'reversed') auditAction = 'payout_reversed';
 
     this.auditLedger.recordEvent({
       payoutId: payoutReference,
@@ -356,16 +490,50 @@ export class PayoutReconciliationService {
         eventId,
         eventType,
         previousStatus: currentStatus,
-        newStatus: targetStatus,
+        newStatus: effectiveStatus,
       },
     });
+    this.appendWebhookEvent(candidate);
 
     return {
       decision: 'APPLIED',
       currentStatus,
       targetStatus,
-      effectiveStatus: targetStatus,
+      effectiveStatus,
     };
+  }
+
+  private compareEventOrder(
+    left: PayoutWebhookEventRecord,
+    right: PayoutWebhookEventRecord,
+  ): number {
+    const timeDifference =
+      new Date(left.providerEventAt).getTime() -
+      new Date(right.providerEventAt).getTime();
+    if (timeDifference !== 0) return timeDifference;
+
+    const priority: Record<DomainPayoutStatus, number> = {
+      pending: 0,
+      failed: 1,
+      cancelled: 1,
+      success: 2,
+      reversed: 3,
+    };
+    const priorityDifference =
+      priority[left.targetStatus ?? 'pending'] -
+      priority[right.targetStatus ?? 'pending'];
+    if (priorityDifference !== 0) return priorityDifference;
+    return left.eventId.localeCompare(right.eventId);
+  }
+
+  public getWebhookEvents(
+    payoutReference?: string,
+  ): PayoutWebhookEventRecord[] {
+    return payoutReference
+      ? this.webhookEvents.filter(
+          (event) => event.payoutReference === payoutReference,
+        )
+      : [...this.webhookEvents];
   }
 
   /**
@@ -388,172 +556,43 @@ export class PayoutReconciliationService {
   }
 
   /**
-   * Computes reconciliation SLO data (age, amount at risk, next action,
-   * source evidence) for a set of unresolved payout records.
+   * Resolves signed webhook, provider polling, and imported statement evidence.
+   * Conflicting evidence is persisted for review and never silently overwrites
+   * the effective status.
    */
-  public computeSloEntries(
-    records: UnresolvedPayoutRecord[],
-    options?: {
-      now?: Date;
-      thresholds?: Partial<ReconciliationSloThresholds>;
-    },
-  ): ReconciliationSloEntry[] {
-    const now = options?.now ?? new Date();
-    const thresholds: ReconciliationSloThresholds = {
-      ...DEFAULT_RECONCILIATION_SLO_THRESHOLDS,
-      ...(options?.thresholds || {}),
-    };
-
-    return records.map((record) => {
-      const createdAtMs = Date.parse(record.createdAt);
-      const ageSeconds = Number.isFinite(createdAtMs)
-        ? Math.max(0, Math.floor((now.getTime() - createdAtMs) / 1000))
-        : 0;
-      const ageHours = Math.round((ageSeconds / 3600) * 100) / 100;
-
-      let alertState: ReconciliationAlertState = 'OK';
-      let nextAction = 'No action required; payout is settled.';
-
-      if (record.status === 'pending') {
-        if (ageSeconds >= thresholds.pendingAgingSeconds) {
-          alertState = 'PENDING_AGING';
-          nextAction =
-            'Investigate stalled pending payout: confirm provider transfer status and re-drive or cancel.';
-        } else {
-          nextAction = 'Monitor pending payout until provider confirmation.';
-        }
-      } else if (record.status === 'failed') {
-        if (ageSeconds >= thresholds.failedUnresolvedSeconds) {
-          alertState = 'FAILED_UNRESOLVED';
-          nextAction =
-            'Resolve failed payout: verify funds returned, notify user, and mark reconciled.';
-        } else {
-          nextAction = 'Confirm failed payout refund and notify user.';
-        }
-      } else if (record.status === 'reversed') {
-        if (ageSeconds >= thresholds.reversedUnresolvedSeconds) {
-          alertState = 'REVERSED_UNRESOLVED';
-          nextAction =
-            'Reconcile reversed payout: confirm clawback settled and update ledger.';
-        } else {
-          nextAction = 'Confirm reversed payout clawback completion.';
-        }
-      } else if (record.status === 'cancelled') {
-        nextAction = 'No action required; payout was cancelled before settlement.';
-      }
-
-      const amountAtRiskMinor =
-        record.status === 'success' || record.status === 'cancelled'
-          ? 0
-          : Math.max(0, Math.trunc(record.amountMinor));
-
-      const evidence: ReconciliationSourceEvidence = {
-        providerReferences: record.providerReference
-          ? [record.providerReference]
-          : [],
-        transactionHashes: record.transactionHash
-          ? [record.transactionHash]
-          : [],
-        auditEntryIds: record.auditEntryIds ? [...record.auditEntryIds] : [],
-      };
-
-      return {
-        payoutReference: record.payoutReference,
-        status: record.status,
-        ageSeconds,
-        ageHours,
-        amountAtRiskMinor,
-        currency: record.currency,
-        nextAction,
-        alertState,
-        runbookUrl: getRunbookUrlForAlertState(alertState),
-        evidence,
-      };
-    });
+  public reconcileEvidence(params: {
+    payoutReference: string;
+    evidence: PayoutEvidence[];
+  }): PayoutEvidenceResolution {
+    const resolution = payoutEvidenceConflictResolver.resolve(params);
+    if (resolution.conflict) {
+      this.auditLedger.recordEvent({
+        payoutId: params.payoutReference,
+        action: 'payout_event_rejected',
+        actor: 'system:evidence-resolution',
+        requestCorrelationId: resolution.conflictId,
+        providerReference: resolution.effectiveStatus,
+        metadata: {
+          conflictId: resolution.conflictId,
+          effectiveStatus: resolution.effectiveStatus,
+          precedenceSource: resolution.precedenceSource,
+          evidenceSources: params.evidence.map((item) => item.source),
+          reason: resolution.reason,
+        },
+      });
+    }
+    return resolution;
   }
 
-  /**
-   * Aggregates reconciliation totals from unresolved payout records.
-   */
-  public computeTotals(records: UnresolvedPayoutRecord[]): ReconciliationTotals {
-    const totals: ReconciliationTotals = {
-      pendingCount: 0,
-      pendingAmountMinor: 0,
-      failedCount: 0,
-      failedAmountMinor: 0,
-      atRiskCount: 0,
-      atRiskAmountMinor: 0,
-    };
-
-    for (const record of records) {
-      const amount = Math.max(0, Math.trunc(record.amountMinor));
-      if (record.status === 'pending') {
-        totals.pendingCount += 1;
-        totals.pendingAmountMinor += amount;
-      }
-      if (record.status === 'failed') {
-        totals.failedCount += 1;
-        totals.failedAmountMinor += amount;
-      }
-      if (
-        record.status === 'pending' ||
-        record.status === 'failed' ||
-        record.status === 'reversed'
-      ) {
-        totals.atRiskCount += 1;
-        totals.atRiskAmountMinor += amount;
-      }
-    }
-
-    return totals;
-  }
-
-  /**
-   * Verifies displayed totals against authoritative database counts.
-   * Returns a mismatch report with a runbook link when discrepancies exist.
-   */
-  public verifyTotals(
-    records: UnresolvedPayoutRecord[],
-    dbCounts: ReconciliationTotals,
-  ): ReconciliationTotalsVerification {
-    const computed = this.computeTotals(records);
-    const fields: (keyof ReconciliationTotals)[] = [
-      'pendingCount',
-      'pendingAmountMinor',
-      'failedCount',
-      'failedAmountMinor',
-      'atRiskCount',
-      'atRiskAmountMinor',
-    ];
-
-    const mismatches: ReconciliationTotalsMismatch[] = [];
-    for (const field of fields) {
-      const expected = dbCounts[field] ?? 0;
-      const actual = computed[field] ?? 0;
-      if (expected !== actual) {
-        mismatches.push({
-          field,
-          expected,
-          actual,
-          delta: actual - expected,
-        });
-      }
-    }
-
-    return {
-      ok: mismatches.length === 0,
-      computed,
-      db: dbCounts,
-      mismatches,
-      runbookUrl: getRunbookUrlForAlertState(
-        mismatches.length === 0 ? 'OK' : 'TOTALS_MISMATCH',
-      ),
-    };
+  public getEvidenceConflicts(payoutReference?: string) {
+    return payoutEvidenceConflictResolver.getConflicts(payoutReference);
   }
 
   public _resetForTest(newDir?: string): void {
     this.rejectedEvents = [];
+    this.webhookEvents = [];
     this.storageFilePath = null;
+    this.webhookEventsFilePath = null;
     if (newDir) {
       this.initStorage(newDir);
     }
@@ -561,3 +600,137 @@ export class PayoutReconciliationService {
 }
 
 export const payoutReconciliationService = new PayoutReconciliationService();
+
+export function reconcileEvidence(params: {
+  payoutReference: string;
+  evidence: PayoutEvidence[];
+}): PayoutEvidenceResolution {
+  return payoutReconciliationService.reconcileEvidence(params);
+}
+
+export async function reconcileStalePayouts(params?: {
+  staleAgeMs?: number;
+  batchSize?: number;
+}): Promise<{
+  processed: number;
+  transitioned: number;
+  noChange: number;
+  providerUnavailable: number;
+  conflicts: number;
+  errors: number;
+  results: Array<{
+    payoutReference: string;
+    outcome:
+      | 'transitioned'
+      | 'no_change'
+      | 'provider_unavailable'
+      | 'conflict'
+      | 'error';
+  }>;
+  timestamp: number;
+}> {
+  const staleAgeMs = params?.staleAgeMs ?? 5 * 60 * 1000;
+  const batchSize = params?.batchSize ?? 25;
+  const now = Date.now();
+  const candidates = getAllTransfers()
+    .filter(
+      (record) =>
+        record.status !== 'success' &&
+        record.status !== 'failed' &&
+        record.status !== 'reversed' &&
+        record.status !== 'cancelled' &&
+        now - Date.parse(record.updatedAt) >= staleAgeMs,
+    )
+    .slice(0, batchSize);
+
+  const summary = {
+    processed: candidates.length,
+    transitioned: 0,
+    noChange: 0,
+    providerUnavailable: 0,
+    conflicts: 0,
+    errors: 0,
+    results: [] as Array<{
+      payoutReference: string;
+      outcome:
+        | 'transitioned'
+        | 'no_change'
+        | 'provider_unavailable'
+        | 'conflict'
+        | 'error';
+    }>,
+    timestamp: now,
+  };
+
+  for (const record of candidates) {
+    try {
+      const provider = getPayoutProvider();
+      const providerStatus = await provider.checkTransferStatus({
+        reference: record.reference,
+      });
+      const resolution = payoutReconciliationService.reconcileEvidence({
+        payoutReference: record.reference,
+        evidence: [
+          {
+            source: 'provider_poll',
+            status: providerStatus.status,
+            observedAt: new Date().toISOString(),
+            reference: record.reference,
+            evidenceId: providerStatus.providerReference || record.reference,
+            amountMinor: providerStatus.amountMinor?.toString(),
+            currency: providerStatus.currency,
+          },
+        ],
+      });
+
+      if (resolution.conflict) {
+        summary.conflicts++;
+        summary.results.push({
+          payoutReference: record.reference,
+          outcome: 'conflict',
+        });
+        continue;
+      }
+
+      if (resolution.effectiveStatus === record.status) {
+        summary.noChange++;
+        summary.results.push({
+          payoutReference: record.reference,
+          outcome: 'no_change',
+        });
+        continue;
+      }
+
+      setTransferStatus({
+        ...record,
+        status: resolution.effectiveStatus,
+        updatedAt: new Date().toISOString(),
+      });
+      summary.transitioned++;
+      summary.results.push({
+        payoutReference: record.reference,
+        outcome: 'transitioned',
+      });
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        (error.message.toLowerCase().includes('unavailable') ||
+          error.message.toLowerCase().includes('timeout'))
+      ) {
+        summary.providerUnavailable++;
+        summary.results.push({
+          payoutReference: record.reference,
+          outcome: 'provider_unavailable',
+        });
+      } else {
+        summary.errors++;
+        summary.results.push({
+          payoutReference: record.reference,
+          outcome: 'error',
+        });
+      }
+    }
+  }
+
+  return summary;
+}

@@ -87,6 +87,7 @@ export default function ReconciliationDashboard() {
   const [endDate, setEndDate] = useState<string>('');
   const [loading, setLoading] = useState(true);
   const [showReauthPrompt, setShowReauthPrompt] = useState(false);
+  const [conflictCount, setConflictCount] = useState(0);
 
   useEffect(() => {
     fetchReconciliationData();
@@ -118,6 +119,19 @@ export default function ReconciliationDashboard() {
         }
       } else {
         console.error('Failed to fetch data');
+      }
+
+      const conflictResponse = await fetch(
+        '/api/admin/reconciliation?format=conflicts',
+        { credentials: 'include' },
+      );
+      if (conflictResponse.ok) {
+        const conflictData = await conflictResponse.json();
+        setConflictCount(
+          Array.isArray(conflictData.conflicts)
+            ? conflictData.conflicts.length
+            : 0,
+        );
       }
     } catch (error) {
       console.error('Error fetching data:', error);
@@ -232,6 +246,16 @@ export default function ReconciliationDashboard() {
         <h1 className="text-3xl font-bold text-gray-900 dark:text-white mb-8">
           Admin Reconciliation Dashboard
         </h1>
+        {conflictCount > 0 && (
+          <div
+            role="status"
+            className="mb-6 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100"
+          >
+            {conflictCount} payout evidence conflict
+            {conflictCount === 1 ? '' : 's'} require operator review. Conflicting
+            evidence is preserved and was not silently overwritten.
+          </div>
+        )}
 
         {totalsMismatch(totals, verifiedTotals) && (
           <div

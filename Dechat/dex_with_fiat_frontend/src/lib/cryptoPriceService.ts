@@ -13,12 +13,14 @@ export interface CryptoPriceResult {
   prices: CryptoPrice;
   stale: boolean;
   source: PriceSource;
+  providerResponseId: string | null;
 }
 
 export interface TokenPriceQuote {
   price: number;
   stale: boolean;
   source: PriceSource;
+  providerResponseId: string | null;
 }
 
 export interface TokenPriceData {
@@ -27,6 +29,7 @@ export interface TokenPriceData {
     [currency: string]: number;
   };
   lastUpdated: number;
+  providerResponseId: string | null;
 }
 
 export interface TokenPriceWithChange {
@@ -68,7 +71,7 @@ const CACHE_DURATION = 2 * 60 * 1000; // 2 minutes
 async function fetchCoinGeckoPrices(
   tokenSymbols: string[],
   vsCurrencies: string[],
-): Promise<CryptoPrice> {
+): Promise<{ prices: CryptoPrice; providerResponseId: string | null }> {
   const tokenIds = tokenSymbols
     .map((symbol) => TOKEN_IDS[symbol.toUpperCase()])
     .filter(Boolean);
@@ -103,7 +106,10 @@ async function fetchCoinGeckoPrices(
     if (tokenSymbol) prices[tokenSymbol] = coinPrices;
   });
 
-  return prices;
+  return {
+    prices,
+    providerResponseId: response.headers?.get('x-cg-request-id') ?? null,
+  };
 }
 
 /** Fetch live prices, or return the last good cache and flagged fallbacks. */
@@ -112,7 +118,10 @@ export async function fetchCryptoPrices(
   vsCurrencies: string[] = ['usd', 'eur', 'gbp', 'ngn'],
 ): Promise<CryptoPriceResult> {
   try {
-    const prices = await fetchCoinGeckoPrices(tokenSymbols, vsCurrencies);
+    const { prices, providerResponseId } = await fetchCoinGeckoPrices(
+      tokenSymbols,
+      vsCurrencies,
+    );
     const lastUpdated = Date.now();
     Object.entries(prices).forEach(([symbol, currencies]) => {
       Object.entries(currencies).forEach(([currency, price]) => {
@@ -121,28 +130,32 @@ export async function fetchCryptoPrices(
             tokenSymbol: symbol,
             prices: { [currency]: price },
             lastUpdated,
+            providerResponseId,
           });
         }
       });
     });
-    return { prices, stale: false, source: 'live' };
+    return { prices, stale: false, source: 'live', providerResponseId };
   } catch (error) {
     console.error('Error fetching crypto prices:', error);
     const fallbackPrices = getFallbackPrices(tokenSymbols, vsCurrencies);
     const prices: CryptoPrice = {};
     let usedFallback = false;
     let usedCache = false;
+    let providerResponseId: string | null = null;
 
     tokenSymbols.forEach((symbol) => {
       const tokenSymbol = symbol.toUpperCase();
       vsCurrencies.forEach((currency) => {
         const currencyLower = currency.toLowerCase();
-        const cachedPrice = priceCache.get(
-          `${tokenSymbol}_${currencyLower}`,
-        )?.prices[currencyLower];
+        const cached = priceCache.get(`${tokenSymbol}_${currencyLower}`);
+        const cachedPrice = cached?.prices[currencyLower];
         const fallbackPrice = fallbackPrices[tokenSymbol]?.[currencyLower];
         const price = cachedPrice ?? fallbackPrice;
-        if (cachedPrice !== undefined) usedCache = true;
+        if (cachedPrice !== undefined) {
+          usedCache = true;
+          providerResponseId ??= cached.providerResponseId;
+        }
         if (price !== undefined) {
           prices[tokenSymbol] ??= {};
           prices[tokenSymbol][currencyLower] = price;
@@ -157,6 +170,7 @@ export async function fetchCryptoPrices(
       prices,
       stale: true,
       source: usedFallback || !usedCache ? 'fallback' : 'cache',
+      providerResponseId,
     };
   }
 }
@@ -260,6 +274,7 @@ export async function getTokenPriceWithStatus(
       price: cached.prices[vsCurrency.toLowerCase()] ?? 0,
       stale: false,
       source: 'cache',
+      providerResponseId: cached.providerResponseId,
     };
   }
 
@@ -276,6 +291,7 @@ export async function getTokenPriceWithStatus(
         0,
       stale: result.stale,
       source: result.source,
+      providerResponseId: result.providerResponseId,
     }),
   );
   inflightRequests.set(cacheKey, promise);
@@ -356,7 +372,9 @@ export async function fetchTickerData(
       throw new Error(`Unsupported currency: ${vsCurrency}`);
     }
 
-    const prices = await fetchCoinGeckoPrices(tokenSymbols, [currencyLower]);
+    const { prices } = await fetchCoinGeckoPrices(tokenSymbols, [
+      currencyLower,
+    ]);
     const tickerData: TickerData = {};
     Object.entries(prices).forEach(([tokenSymbol, priceRecord]) => {
       if (tokenSymbol && priceRecord[currencyLower] !== undefined) {
@@ -382,11 +400,51 @@ export async function fetchTickerData(
 export const QUOTE_LOCK_DURATION_MS = 120 * 1000; // 120 seconds
 
 export interface LockedQuote {
+  quoteId: string;
+  quoteToken: string;
+  tokenSymbol: string;
+  tokenAmountDecimal: string;
+  currency: string;
+  exchangeRateDecimal: string;
+  fiatAmountMinorUnits: string;
+  roundingPolicy: string;
+  provider: string;
+  providerRequestId: string;
+  providerResponseId: string | null;
   ngnAmount: number;
   lockedAt: number;
   expiresAt: number;
-  stale?: boolean;
-  source?: PriceSource;
+  stale: boolean;
+  source: PriceSource;
+}
+
+function isLockedQuote(value: unknown): value is LockedQuote {
+  if (!value || typeof value !== 'object') return false;
+  const quote = value as Record<string, unknown>;
+  return (
+    typeof quote.quoteId === 'string' &&
+    typeof quote.quoteToken === 'string' &&
+    typeof quote.tokenSymbol === 'string' &&
+    typeof quote.tokenAmountDecimal === 'string' &&
+    typeof quote.currency === 'string' &&
+    typeof quote.exchangeRateDecimal === 'string' &&
+    typeof quote.fiatAmountMinorUnits === 'string' &&
+    typeof quote.roundingPolicy === 'string' &&
+    typeof quote.provider === 'string' &&
+    typeof quote.providerRequestId === 'string' &&
+    (typeof quote.providerResponseId === 'string' ||
+      quote.providerResponseId === null) &&
+    typeof quote.ngnAmount === 'number' &&
+    Number.isFinite(quote.ngnAmount) &&
+    typeof quote.lockedAt === 'number' &&
+    Number.isFinite(quote.lockedAt) &&
+    typeof quote.expiresAt === 'number' &&
+    Number.isFinite(quote.expiresAt) &&
+    typeof quote.stale === 'boolean' &&
+    (quote.source === 'live' ||
+      quote.source === 'cache' ||
+      quote.source === 'fallback')
+  );
 }
 
 /**
@@ -399,19 +457,35 @@ export async function fetchLockedQuote(
   amount: number,
   fiatCurrency: string = 'ngn',
 ): Promise<LockedQuote> {
-  const quote = await getTokenPriceWithStatus(tokenSymbol, fiatCurrency);
-  if (quote.price <= 0 || !Number.isFinite(quote.price)) {
-    throw new Error(`No price data available for ${tokenSymbol}`);
+  const response = await fetch('/api/fx-quote', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      tokenSymbol,
+      tokenAmount: amount,
+      currency: fiatCurrency,
+    }),
+  });
+  const result: unknown = await response.json();
+  if (
+    !response.ok ||
+    !result ||
+    typeof result !== 'object' ||
+    !('success' in result) ||
+    result.success !== true ||
+    !('data' in result) ||
+    !isLockedQuote(result.data)
+  ) {
+    const message =
+      result &&
+      typeof result === 'object' &&
+      'message' in result &&
+      typeof result.message === 'string'
+        ? result.message
+        : `Failed to obtain an FX quote for ${tokenSymbol}`;
+    throw new Error(message);
   }
-  const ngnAmount = amount * quote.price;
-  const lockedAt = Date.now();
-  return {
-    ngnAmount,
-    lockedAt,
-    expiresAt: lockedAt + QUOTE_LOCK_DURATION_MS,
-    stale: quote.stale,
-    source: quote.source,
-  };
+  return result.data;
 }
 
 /**
