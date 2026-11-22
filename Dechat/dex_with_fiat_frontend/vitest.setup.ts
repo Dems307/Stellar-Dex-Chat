@@ -1,11 +1,20 @@
 import '@testing-library/jest-dom';
 import { afterEach, beforeAll, beforeEach, vi } from 'vitest';
 import { resetNetworkQueueForTests } from '@/lib/networkQueue';
+import {
+  installTestKeyFixtures,
+  resetTestKeyFixtures,
+} from '@/test-utils/keyRotationFixtures';
 import { resetRateLimitersForTests } from '@/lib/rateLimit';
 import { resetTransferStoreForTests } from '@/lib/transferStore';
 import { resetProviderMocksForTests } from '@/lib/providers';
 
 vi.mock('server-only', () => ({}));
+
+// TEST-ONLY: install deterministic, non-production key fixtures so
+// key-rotation tests can configure active/previous data keys. These fixtures
+// contain no real key material and are never loaded in production builds.
+installTestKeyFixtures();
 
 Object.defineProperty(window, 'matchMedia', {
   writable: true,
@@ -98,6 +107,7 @@ beforeEach(() => {
 
 afterEach(() => {
   resetNetworkQueueForTests();
+  resetTestKeyFixtures();
   resetProviderMocksForTests();
   resetTransferStoreForTests();
   resetRateLimitersForTests();

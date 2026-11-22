@@ -8,6 +8,10 @@ import {
   handlePayoutApiError,
 } from '@/lib/payout/circuitBreaker';
 import {
+  enforceRouteCors,
+  corsPreflightResponse,
+} from '@/lib/payout/cors';
+import {
   extractOrGenerateCorrelationId,
   validationError,
   logStructuredError,
@@ -84,13 +88,21 @@ function buildFreshnessMetadata(
 =======
 
 export async function OPTIONS(request: NextRequest) {
+  // Reject untrusted origins before answering preflight.
+  const corsBlocked = enforceRouteCors(request, '/api/transfer-status');
+  if (corsBlocked) return corsBlocked;
+
   return (
     enforcePayoutRouteSecurity(request) ||
-    new NextResponse(null, { status: 204 })
+    corsPreflightResponse(request, '/api/transfer-status')
   );
 }
 
 export async function POST(request: NextRequest) {
+  // Enforce restrictive cross-origin policy before any expensive work.
+  const corsBlocked = enforceRouteCors(request, '/api/transfer-status');
+  if (corsBlocked) return corsBlocked;
+
   // Enforce payout API security
   const securityBlocked = enforcePayoutRouteSecurity(request);
   if (securityBlocked) return securityBlocked;
@@ -102,9 +114,6 @@ export async function POST(request: NextRequest) {
 
   const limited = applyRateLimit(ip, '/api/transfer-status', RATE_LIMIT);
   if (limited) return limited;
-
-  const correlationId =
-    request.headers.get('x-correlation-id') || crypto.randomUUID();
 
   try {
     let body: unknown;

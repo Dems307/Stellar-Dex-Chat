@@ -6,11 +6,14 @@ import {
   uniformNotFoundResponse,
 } from '@/lib/auth/authorizationMatrix';
 import {
-  buildFreshnessEnvelope,
-  DEFAULT_FRESHNESS_THRESHOLD_MS,
-} from '@/lib/readModelFreshness';
+  applyCorsHeaders,
+  enforceCorsPolicy,
+} from '@/lib/security/corsPolicy';
 
 const RATE_LIMIT = { maxRequests: 5, windowMs: 60_000 };
+
+// Browser-facing route: restrict cross-origin access to trusted origins only.
+const CORS_ROUTE = '/api/transfer-status';
 
 // Temporary memory store to mark cancellation requests.
 const cancelledTransfers = new Set<string>();
@@ -19,6 +22,12 @@ export async function POST(
   request: NextRequest,
   { params }: { params: Promise<{ reference: string }> },
 ) {
+  // Reject untrusted origins and preflight requests before any expensive work.
+  const corsRejection = enforceCorsPolicy(request, CORS_ROUTE, {
+    allowCredentials: true,
+  });
+  if (corsRejection) return corsRejection;
+
   const correlationId = extractOrGenerateCorrelationId(request.headers);
   const ip = getClientIp(request);
   const limited = applyRateLimit(ip, '/api/transfer-status', RATE_LIMIT, {
@@ -111,6 +120,9 @@ export async function POST(
     );
 
     response.headers.set('X-Correlation-Id', correlationId);
+    applyCorsHeaders(request, response, CORS_ROUTE, {
+      allowCredentials: true,
+    });
     return response;
   } catch (error: unknown) {
     console.error('Cancel transfer error:', error);
@@ -126,6 +138,12 @@ export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ reference: string }> },
 ) {
+  // Reject untrusted origins and preflight requests before any expensive work.
+  const corsRejection = enforceCorsPolicy(request, CORS_ROUTE, {
+    allowCredentials: true,
+  });
+  if (corsRejection) return corsRejection;
+
   const correlationId = extractOrGenerateCorrelationId(request.headers);
 
   try {
@@ -163,7 +181,7 @@ export async function GET(
     });
 
     if (cancelledTransfers.has(reference)) {
-      const response = NextResponse.json({
+      const cancelledResponse = NextResponse.json({
         success: true,
         data: {
           reference,
@@ -173,8 +191,11 @@ export async function GET(
         },
         freshness,
       });
-      response.headers.set('X-Correlation-Id', correlationId);
-      return response;
+      cancelledResponse.headers.set('X-Correlation-Id', correlationId);
+      applyCorsHeaders(request, cancelledResponse, CORS_ROUTE, {
+        allowCredentials: true,
+      });
+      return cancelledResponse;
     }
 
     const response = NextResponse.json({
@@ -183,6 +204,9 @@ export async function GET(
       freshness,
     });
     response.headers.set('X-Correlation-Id', correlationId);
+    applyCorsHeaders(request, response, CORS_ROUTE, {
+      allowCredentials: true,
+    });
     return response;
   } catch (error: unknown) {
     console.error('Get transfer status error:', error);

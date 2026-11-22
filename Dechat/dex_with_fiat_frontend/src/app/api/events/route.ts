@@ -4,6 +4,7 @@ import path from 'path';
 import { ContractEvent } from '../../../types/events';
 import { applyRateLimit, getClientIp } from '@/lib/rateLimit';
 import { eventsQuerySchema } from '@/lib/apiSchemas';
+import { enforceCorsPolicy } from '@/lib/cors';
 
 const DATA_DIR = path.join(process.cwd(), 'data');
 const EVENTS_FILE = path.join(DATA_DIR, 'contract-events.json');
@@ -57,6 +58,9 @@ function readFreshnessMetadata(): FreshnessMetadata {
 }
 
 export async function GET(request: NextRequest) {
+  const corsResponse = enforceCorsPolicy(request, '/api/events');
+  if (corsResponse) return corsResponse;
+
   const ip = getClientIp(request);
   const limited = applyRateLimit(ip, '/api/events', RATE_LIMIT);
   if (limited) return limited;

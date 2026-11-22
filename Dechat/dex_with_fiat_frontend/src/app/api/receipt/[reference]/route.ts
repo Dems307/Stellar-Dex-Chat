@@ -3,6 +3,7 @@ import {
   authorizeTransferAccess,
   uniformReceiptNotFoundResponse,
 } from '@/lib/auth/authorizationMatrix';
+import { enforceRouteCors } from '@/lib/security/corsPolicy';
 
 /**
  * Read-model freshness metadata.
@@ -78,6 +79,13 @@ export async function GET(
   { params }: { params: Promise<{ reference: string }> },
 ) {
   try {
+    // Enforce restrictive cross-origin policy for this financial route.
+    // Rejects untrusted origins and preflight requests before any work.
+    const cors = enforceRouteCors(request, 'receipt');
+    if (!cors.allowed) {
+      return cors.response;
+    }
+
     const p = await params;
     const { reference } = p;
 
@@ -108,13 +116,13 @@ export async function GET(
       currency: 'NGN',
     };
 
-    return NextResponse.json({
-      success: true,
-      data: receiptData,
-      freshness,
-      // Lineage is optional: only present when the projection persisted it.
-      ...(lineage ? { lineage } : {}),
-    });
+    return NextResponse.json(
+      {
+        success: true,
+        data: receiptData,
+      },
+      { headers: cors.headers },
+    );
   } catch (error: unknown) {
     console.error('Get receipt error:', error);
     return NextResponse.json(

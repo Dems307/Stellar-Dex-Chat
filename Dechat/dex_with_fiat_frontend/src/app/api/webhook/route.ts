@@ -2,7 +2,13 @@ import { NextRequest, NextResponse } from 'next/server';
 import crypto from 'crypto';
 import { serverEnv } from '@/lib/serverEnv';
 import { telemetry } from '@/lib/telemetry';
-import { getTransferStatus, setTransferStatus } from '@/lib/transferStore';
+import { redactForLog } from '@/lib/logging/redaction';
+import {
+  isReplayEvent,
+  getTransferStatus,
+  transitionPayoutStatus,
+  InvalidPayoutTransitionError,
+} from '@/lib/transferStore';
 import { publishPaymentStatus } from '@/lib/paymentStatusEvents';
 import { credentialManager } from '@/lib/payout/credentialManager';
 import {
@@ -10,6 +16,7 @@ import {
   type DomainPayoutStatus,
 } from '@/lib/payout/reconciliation';
 import { webhookDeduplicationService } from '@/lib/payout/webhookDeduplication';
+import { validateCallbackDestination } from '@/lib/security/urlAllowlist';
 import { payoutReservationLedger } from '@/lib/payout/reservationLedger';
 import {
   applyRateLimit,
@@ -82,6 +89,42 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    telemetry.addLog(span.spanId, 'info', 'Starting webhook processing', {
+      endpoint: '/api/webhook',
+    });
+
+    // Validate the callback destination before processing provider callbacks.
+    // Rejects malformed URLs, external hosts, and scheme/host confusion
+    // (including percent-encoded bypasses) against the centralized allowlist.
+    const callbackDestination =
+      request.headers.get('x-callback-url') ??
+      request.headers.get('x-paystack-callback-url') ??
+      request.nextUrl.searchParams.get('callback_url');
+
+    if (callbackDestination !== null) {
+      const destinationCheck = validateCallbackDestination(callbackDestination);
+      if (!destinationCheck.ok) {
+        telemetry.addLog(
+          span.spanId,
+          'warn',
+          'Webhook rejected: invalid callback destination',
+          {
+            endpoint: '/api/webhook',
+            reason: destinationCheck.reason,
+          },
+        );
+        telemetry.finishSpan(span.spanId, {
+          success: false,
+          error: 'Invalid callback destination',
+          errorType: 'invalid_destination',
+        });
+        return NextResponse.json(
+          { message: 'Invalid callback destination' },
+          { status: 400 },
+        );
+      }
+    }
+
     const payload = await request.text();
     const signature = request.headers.get('x-paystack-signature');
     if (!signature) {
@@ -114,7 +157,14 @@ export async function POST(request: NextRequest) {
     const matchedCredential = candidateKeys.find((credential) =>
       isValidSignature(payload, signature, credential.secretKey),
     );
+
     if (!matchedCredential) {
+      telemetry.addLog(
+        span.spanId,
+        'error',
+        'Invalid webhook signature',
+        redactForLog({ receivedSignature: signature }) as Record<string, unknown>,
+      );
       telemetry.finishSpan(span.spanId, {
         success: false,
         error: 'Invalid signature',
@@ -162,6 +212,22 @@ export async function POST(request: NextRequest) {
       .createHash('sha256')
       .update(payload)
       .digest('hex');
+
+    telemetry.addLog(
+      span.spanId,
+      'info',
+      'Webhook signature verified',
+      redactForLog({
+        eventType: event.event,
+        reference: event.data?.reference,
+        eventId,
+        credentialVersion: matchedCredential.version,
+      }) as Record<string, unknown>,
+    );
+
+    console.log('Received Paystack webhook:', event.event);
+
+    // Durable deduplication and replay protection (Issue #35)
     const { acquired, isDuplicate } =
       await webhookDeduplicationService.acquireOrCheck(
         eventId,
@@ -216,7 +282,7 @@ export async function POST(request: NextRequest) {
 
       const status = reconciliation.effectiveStatus;
       const updatedAt = receivedAt;
-      const nextRecord = setTransferStatus({
+      const nextRecord = transitionPayoutStatus({
         reference: payoutReference,
         status,
         amount: Number(data.amount ?? existingRecord?.amount ?? 0),
@@ -231,6 +297,7 @@ export async function POST(request: NextRequest) {
         payoutReservationLedger.getReservationByProviderReference(
           payoutReference,
         );
+
       if (reservation) {
         if (status === 'success') {
           payoutReservationLedger.settle(reservation.payoutId, receivedAt);
@@ -268,9 +335,14 @@ export async function POST(request: NextRequest) {
       throw error;
     }
   } catch (error) {
-    telemetry.addLog(span.spanId, 'error', 'Webhook processing error', {
-      error: error instanceof Error ? error.message : 'Unknown error',
-    });
+    telemetry.addLog(
+      span.spanId,
+      'error',
+      'Webhook processing error',
+      redactForLog({
+        error: error instanceof Error ? error.message : 'Unknown error',
+      }) as Record<string, unknown>,
+    );
     telemetry.finishSpan(span.spanId, {
       success: false,
       error: 'Webhook processing failed',

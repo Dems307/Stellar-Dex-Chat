@@ -4,7 +4,8 @@ import { getPayoutProvider } from '@/lib/payout/providers/registry';
 import { sanitizeProviderError } from '@/lib/payout/timeoutBudget';
 import { telemetry } from '@/lib/telemetry';
 import { applyRateLimit, getClientIp } from '@/lib/rateLimit';
-import { setTransferStatus } from '@/lib/transferStore';
+import { enforcePayoutRouteSecurity } from '@/lib/payout/routeSecurity';
+import { setTransferStatus, getTransferStatus } from '@/lib/transferStore';
 import { initiateTransferSchema } from '@/lib/apiSchemas';
 import { payoutAuditLedger } from '@/lib/payout/auditLedger';
 import {
@@ -13,6 +14,10 @@ import {
 } from '@/lib/payout/reservationLedger';
 import { ProviderIdempotencyReconciliationRequiredError } from '@/lib/payout/providerIdempotency';
 import { payoutRetryQueue } from '@/lib/payout/retryQueue';
+import {
+  validateRedirectDestination,
+  type RedirectDestinationKind,
+} from '@/lib/urlAllowlist';
 import { enforcePayoutRouteSecurity } from '@/lib/payout/security';
 import {
   createPayoutErrorResponse,
@@ -55,13 +60,18 @@ function hashPayoutRequest(payload: {
 }
 
 export async function OPTIONS(request: NextRequest) {
-  return (
-    enforcePayoutRouteSecurity(request) ||
-    new NextResponse(null, { status: 204 })
-  );
+  // Reject untrusted preflight requests before any expensive work
+  const securityBlocked = enforcePayoutRouteSecurity(request);
+  if (securityBlocked) return securityBlocked;
+
+  return new NextResponse(null, {
+    status: 204,
+    headers: buildCorsHeaders(request),
+  });
 }
 
 export async function POST(request: NextRequest) {
+  // Enforce payout API security (CORS origin + credentials) before any work
   const securityBlocked = enforcePayoutRouteSecurity(request);
   if (securityBlocked) return securityBlocked;
   const apiVersionBlocked = enforcePayoutApiVersion(request);
@@ -149,6 +159,56 @@ export async function POST(request: NextRequest) {
       quoteToken,
       clientSessionId: bodyClientSessionId,
     } = validationResult.data;
+    const bodyRecord = body as Record<string, unknown>;
+
+    // Validate any redirect/callback/deep-link destinations against the
+    // centralized allowlist before initiating a transfer (Issue #264).
+    const destinationFields: Array<{
+      field: string;
+      kind: RedirectDestinationKind;
+    }> = [
+      { field: 'redirectUrl', kind: 'redirect' },
+      { field: 'callbackUrl', kind: 'callback' },
+      { field: 'returnUrl', kind: 'redirect' },
+      { field: 'deepLink', kind: 'deepLink' },
+    ];
+
+    for (const { field, kind } of destinationFields) {
+      const rawValue = bodyRecord[field];
+      if (rawValue === undefined || rawValue === null) continue;
+
+      const destinationResult = validateRedirectDestination(rawValue, kind);
+      if (!destinationResult.ok) {
+        telemetry.addLog(
+          span.spanId,
+          'warn',
+          'Rejected invalid redirect destination',
+          {
+            field,
+            kind,
+            reason: destinationResult.reason,
+            correlationId,
+          },
+        );
+        telemetry.finishSpan(span.spanId, {
+          success: false,
+          error: 'Invalid redirect destination',
+        });
+
+        return validationError({
+          message: 'Invalid redirect destination.',
+          correlationId,
+          code: 'INVALID_REDIRECT_DESTINATION',
+          issues: [
+            {
+              path: [field],
+              code: 'custom',
+              message: `The ${field} must be a safe, allowlisted ${kind} destination.`,
+            },
+          ],
+        });
+      }
+    }
     const clientSessionId =
       request.headers.get('x-client-session-id') || bodyClientSessionId;
 
@@ -447,7 +507,20 @@ export async function POST(request: NextRequest) {
     });
     return NextResponse.json(errorDetails.body, {
       status: errorDetails.status,
-      headers: errorDetails.headers,
+      headers: { ...errorDetails.headers, ...buildCorsHeaders(request) },
     });
   }
+}
+
+function buildCorsHeaders(request: NextRequest): Record<string, string> {
+  const origin = request.headers.get('origin');
+  if (!origin) return {};
+  return {
+    'Access-Control-Allow-Origin': origin,
+    'Access-Control-Allow-Credentials': 'true',
+    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+    'Access-Control-Allow-Headers':
+      'Content-Type, X-Idempotency-Key, X-Client-Session-Id',
+    Vary: 'Origin',
+  };
 }
