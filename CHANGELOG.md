@@ -1348,6 +1348,7 @@ Repo Avatar
 - **fault-injection:** Add fault-injection tests for DB, RPC, and provider outages
 - **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
+- **changelog:** Update changelog [skip ci]
 
 ### Deprecated
 
