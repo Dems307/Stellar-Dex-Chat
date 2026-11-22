@@ -1,10 +1,5 @@
-import { NextRequest, NextResponse } from 'next/server';
-import {
-  ReleaseHealthGate,
-  DEFAULT_THRESHOLDS,
-  type HealthGateThresholds,
-  type ReleaseHealthDecision,
-} from '@/lib/releaseHealthGate';
+import { NextResponse } from 'next/server';
+import { getProviderCircuitBreakerHealth } from '@/lib/payout/circuitBreaker';
 
 export const runtime = 'edge';
 
@@ -79,21 +74,9 @@ export async function GET(request: NextRequest) {
 
     return NextResponse.json(
       {
-        status: metrics.decision === 'HEALTHY' ? 'ok' : metrics.decision.toLowerCase(),
-        timestamp: metrics.evaluatedAt,
-        releaseHealth: {
-          decision: metrics.decision,
-          payoutProcessingPermitted: metrics.payoutProcessingPermitted,
-          reason: metrics.reason || null,
-          metrics: {
-            totalRequests: metrics.totalRequests,
-            erroredRequests: metrics.erroredRequests,
-            errorRate: metrics.errorRate,
-            payoutFailures: metrics.payoutFailures,
-          },
-          thresholds: metrics.thresholds,
-          windowMs: metrics.thresholds.windowMs,
-        },
+        status: 'ok',
+        timestamp: new Date().toISOString(),
+        providerCircuits: getProviderCircuitBreakerHealth(),
       },
       { status: httpStatus },
     );
