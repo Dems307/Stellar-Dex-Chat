@@ -23,85 +23,139 @@ export interface IndexerCursor {
   updatedAt: number;
 }
 
-export type ProjectionStatus = 'active' | 'building' | 'validated' | 'failed';
-
-export interface ProjectionVersion {
-  version: number;
-  status: ProjectionStatus;
-  checksum: string;
-  eventCount: number;
-  createdAt: number;
+/**
+ * Durable checkpoint persisted alongside the events it covers.
+ * `ledgerHash` is the authoritative hash of `lastLedger` used for reorg detection.
+ */
+export interface IndexerCheckpoint extends IndexerCursor {
+  ledgerHash?: string;
 }
 
-interface ProjectionState {
-  events: Map<string, SorobanEventRecord>;
-  cursor: IndexerCursor;
-  meta: ProjectionVersion;
+export interface CommitBatchResult {
+  ingested: number;
+  duplicatesSkipped: number;
+  /** True when the conditional write refused to overwrite newer canonical events. */
+  rejectedAsStale: boolean;
+}
+
+/**
+ * Persistence adapter. Implementations MUST commit events and the cursor
+ * atomically (single transaction) so a crash can never leave the cursor
+ * ahead of the stored events (or vice versa).
+ */
+export interface IndexerPersistenceAdapter {
+  loadCheckpoint(): Promise<IndexerCheckpoint | null>;
+  loadEvents(fromLedger: number, toLedger: number): Promise<SorobanEventRecord[]>;
+  /**
+   * Atomically persist `events` and `checkpoint`. Must refuse (return false)
+   * when the stored checkpoint is newer than `checkpoint` (conditional write).
+   */
+  commitBatch(events: SorobanEventRecord[], checkpoint: IndexerCheckpoint): Promise<boolean>;
+  /** Delete events strictly after `checkpoint` and reset the cursor atomically. */
+  rollbackTo(checkpoint: IndexerCheckpoint): Promise<void>;
+  /** Acquire the backfill lock; returns false when another job holds it. */
+  acquireBackfillLock(owner: string, ttlMs: number): Promise<boolean>;
+  releaseBackfillLock(owner: string): Promise<void>;
+}
+
+export interface BackfillCancellationToken {
+  readonly cancelled: boolean;
 }
 
 export class SorobanEventIndexer {
-  private projections: Map<number, ProjectionState> = new Map();
-  private activeVersion: number = 1;
-  private nextVersion: number = 2;
-  private shadowVersion: number | null = null;
+  private events: Map<string, SorobanEventRecord> = new Map();
+  private cursor: IndexerCheckpoint = { lastLedger: 0, lastEventIndex: 0, updatedAt: 0 };
   private supportedSchemas: Set<number> = new Set([1]);
+  private adapter?: IndexerPersistenceAdapter;
+  private backfillOwner?: string;
 
-  constructor(initialCursor?: IndexerCursor) {
-    const cursor: IndexerCursor = initialCursor
-      ? { ...initialCursor }
-      : { lastLedger: 0, lastEventIndex: 0, updatedAt: 0 };
-    this.projections.set(1, {
-      events: new Map(),
-      cursor,
-      meta: {
-        version: 1,
-        status: 'active',
-        checksum: computeChecksum([]),
-        eventCount: 0,
-        createdAt: Date.now(),
-      },
-    });
-  }
-
-  private getActive(): ProjectionState {
-    const state = this.projections.get(this.activeVersion);
-    if (!state) {
-      throw new Error(`Active projection version ${this.activeVersion} is missing`);
+  constructor(initialCursor?: IndexerCheckpoint, adapter?: IndexerPersistenceAdapter) {
+    if (initialCursor) {
+      this.cursor = { ...initialCursor };
     }
-    return state;
+    this.adapter = adapter;
   }
 
-  public getActiveVersion(): ProjectionVersion {
-    return { ...this.getActive().meta };
+  /**
+   * Resume from the last committed checkpoint. Must be awaited before ingesting.
+   */
+  public async initialize(): Promise<IndexerCheckpoint> {
+    if (!this.adapter) return this.getCursor();
+    const checkpoint = await this.adapter.loadCheckpoint();
+    if (checkpoint) {
+      this.cursor = { ...checkpoint };
+    }
+    return this.getCursor();
   }
 
-  public getProjectionVersion(version: number): ProjectionVersion | null {
-    const state = this.projections.get(version);
-    return state ? { ...state.meta } : null;
+  public getCursor(): IndexerCheckpoint {
+    return { ...this.cursor };
   }
 
-  public getCursor(): IndexerCursor {
-    return { ...this.getActive().cursor };
+  public getCheckpoint(): IndexerCheckpoint {
+    return this.getCursor();
+  }
+
+  /**
+   * Roll back to a trusted checkpoint (reorg repair). Removes all cached and
+   * persisted events after the checkpoint so they can be re-ingested.
+   */
+  public async rollbackToCheckpoint(checkpoint: IndexerCheckpoint): Promise<void> {
+    if (this.adapter) {
+      await this.adapter.rollbackTo(checkpoint);
+    }
+    for (const [key, record] of this.events) {
+      if (
+        record.ledger > checkpoint.lastLedger ||
+        (record.ledger === checkpoint.lastLedger && record.eventIndex > checkpoint.lastEventIndex)
+      ) {
+        this.events.delete(key);
+      }
+    }
+    this.cursor = { ...checkpoint };
+  }
+
+  public async acquireBackfillLock(owner: string, ttlMs: number = 60_000): Promise<boolean> {
+    if (!this.adapter) return true;
+    const acquired = await this.adapter.acquireBackfillLock(owner, ttlMs);
+    if (acquired) this.backfillOwner = owner;
+    return acquired;
+  }
+
+  public async releaseBackfillLock(): Promise<void> {
+    if (this.adapter && this.backfillOwner) {
+      await this.adapter.releaseBackfillLock(this.backfillOwner);
+    }
+    this.backfillOwner = undefined;
   }
 
   /**
    * Ingest a batch of events idempotently without duplicates or gaps.
+   * When an adapter is configured, events and the cursor are committed atomically.
+   * Pass a cancellation token for backfill batches to abort between records.
    */
-  public ingestEvents(batch: SorobanEventRecord[]): { ingested: number; duplicatesSkipped: number } {
-    let ingested = 0;
+  public async ingestEvents(
+    batch: SorobanEventRecord[],
+    cancellation?: BackfillCancellationToken,
+  ): Promise<CommitBatchResult> {
     let duplicatesSkipped = 0;
+    const pending: SorobanEventRecord[] = [];
+    const pendingKeys = new Set<string>();
 
-    // Stable sort by ledger then eventIndex
+    // Stable sort by ledger then eventIndex (canonical ordering)
     const sorted = [...batch].sort((a, b) => {
       if (a.ledger !== b.ledger) return a.ledger - b.ledger;
-      return a.eventIndex - b.eventIndex;
+      if (a.eventIndex !== b.eventIndex) return a.eventIndex - b.eventIndex;
+      return a.txHash < b.txHash ? -1 : a.txHash > b.txHash ? 1 : 0;
     });
 
     const active = this.getActive();
 
     for (const record of sorted) {
+      if (cancellation?.cancelled) break;
+
       const recordKey = `${record.ledger}_${record.txHash}_${record.eventIndex}`;
-      if (active.events.has(recordKey)) {
+      if (this.events.has(recordKey) || pendingKeys.has(recordKey)) {
         duplicatesSkipped++;
         continue;
       }
@@ -111,12 +165,22 @@ export class SorobanEventIndexer {
         console.warn(`Encountered unsupported event schema version: ${record.schemaVersion}`);
       }
 
-      active.events.set(recordKey, { ...record, id: recordKey });
-      ingested++;
+      pending.push({ ...record, id: recordKey });
+      pendingKeys.add(recordKey);
+    }
 
-      if (record.ledger > active.cursor.lastLedger || 
-         (record.ledger === active.cursor.lastLedger && record.eventIndex > active.cursor.lastEventIndex)) {
-        active.cursor = {
+    if (pending.length === 0) {
+      return { ingested: 0, duplicatesSkipped, rejectedAsStale: false };
+    }
+
+    // Compute the new cursor from the highest pending record.
+    let nextCursor: IndexerCheckpoint = { ...this.cursor };
+    for (const record of pending) {
+      if (
+        record.ledger > nextCursor.lastLedger ||
+        (record.ledger === nextCursor.lastLedger && record.eventIndex > nextCursor.lastEventIndex)
+      ) {
+        nextCursor = {
           lastLedger: record.ledger,
           lastEventIndex: record.eventIndex,
           updatedAt: Date.now(),
@@ -124,10 +188,20 @@ export class SorobanEventIndexer {
       }
     }
 
-    active.meta.eventCount = active.events.size;
-    active.meta.checksum = computeChecksum(active.events.values());
+    if (this.adapter) {
+      const committed = await this.adapter.commitBatch(pending, nextCursor);
+      if (!committed) {
+        // Conditional write refused: stored data is newer than this batch.
+        return { ingested: 0, duplicatesSkipped, rejectedAsStale: true };
+      }
+    }
 
-    return { ingested, duplicatesSkipped };
+    for (const record of pending) {
+      this.events.set(record.id, record);
+    }
+    this.cursor = nextCursor;
+
+    return { ingested: pending.length, duplicatesSkipped, rejectedAsStale: false };
   }
 
   /**

@@ -44,7 +44,11 @@ export async function GET(request: NextRequest) {
       payoutAuditArchive.getManifest();
 
     if (format === 'csv') {
-      const csvData = payoutAuditLedger.exportCsv(filter, { partition });
+      const maxRows = Math.min(
+        Math.max(Number(searchParams.get('maxRows') || 10000), 1),
+        10000,
+      );
+      const csvData = payoutAuditLedger.exportCsv(filter, maxRows);
       return new NextResponse(csvData, {
         status: 200,
         headers: {

@@ -75,7 +75,18 @@ function makeFetch(transferStatusResponse: {
       return { ok: true, json: async () => ({ success: true, data: [{ id: 1, name: 'Test Bank', code: '001', active: true }] }) };
     }
     if (url.includes('/api/verify-account')) {
-      return { ok: true, json: async () => ({ success: true, data: { account_name: 'Test Account' } }) };
+      return {
+        ok: true,
+        json: async () => ({
+          success: true,
+          data: {
+            account_name: 'Test Account',
+            accountNumberMasked: '******7890',
+            verificationToken: 'test-verification-token',
+            verificationExpiresAt: new Date(Date.now() + 300_000).toISOString(),
+          },
+        }),
+      };
     }
     if (url.includes('/api/create-recipient')) {
       return { ok: true, json: async () => ({ success: true, data: { recipient_code: 'RCP_test123' } }) };
