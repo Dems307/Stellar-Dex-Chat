@@ -235,7 +235,12 @@ describe('Wallet Session Expiry and Secure Reconnect UX', () => {
       ok: true,
       json: async () => ({
         success: true,
-        data: { account_name: 'JANE DOE' },
+        data: {
+          account_name: 'JANE DOE',
+          accountNumberMasked: '******7890',
+          verificationToken: 'test-verification-token',
+          verificationExpiresAt: new Date(Date.now() + 300_000).toISOString(),
+        },
       }),
     });
     const accInput = await screen.findByPlaceholderText('0000000000');

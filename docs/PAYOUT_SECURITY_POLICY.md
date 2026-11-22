@@ -59,5 +59,24 @@ This document specifies the threat model, enforcement strategy, and cross-origin
    - Requests with missing or invalid signatures are rejected immediately with `401 Unauthorized`.
    - If `PAYSTACK_SECRET_KEY` is not configured, the endpoint fails closed with a `400 Bad Request`.
 
-2. **Replay Protection**:
-   - Webhook events are checked against a bounded replay cache with a 15-minute TTL to prevent duplicate processing of replayed callback payloads.
+2. **Replay Protection and Event Ordering**:
+   - Webhook deliveries are deduplicated by provider event ID; committed duplicates receive a successful acknowledgement without applying another payout transition.
+   - The durable deduplication and event-order records use `PAYOUT_DATA_DIR` when configured. Deduplication records are retained for seven days by default, and abandoned in-flight processing locks expire after 30 seconds.
+   - Provider event time and server receipt time are stored for each event. Events are ordered by provider time with stable status and event-ID tie-breakers, and the payout state is reconciled against that ordered history so delivery order does not determine the final state.
+   - Terminal transitions are monotonic: delayed or contradictory events cannot downgrade a terminal payout state. Rejected events remain available for investigation.
+
+## 4. Payout Traceability and Settlement Estimates
+
+1. **Provider Idempotency**:
+   - Each external transfer attempt stores its provider key, request fingerprint, expiration, and response reference in the durable provider idempotency registry.
+   - `PAYSTACK_IDEMPOTENCY_WINDOW_MS` configures the Paystack key window (24 hours by default). A retry after expiration first reconciles the provider status; a new provider key is issued only after the provider confirms that no transfer exists.
+   - Reusing an idempotency key with a different request is rejected.
+
+2. **Reservation Ledger**:
+   - When `contractReceiptId` is supplied to `POST /api/initiate-transfer`, the ledger links that receipt and reserved minor-unit amount to the payout, provider transfer reference, and its final settlement/release/review action.
+   - Ledger entries are append-only and hash-linked. Duplicate settlement/release actions are idempotent, while conflicting receipt, amount, or provider-transfer links are rejected.
+   - The ledger uses `PAYOUT_DATA_DIR` when configured. Configure this directory on persistent storage in deployments that require payout records to survive restarts.
+
+3. **Settlement Estimate**:
+   - Provider calendars define supported currencies, time zones, business days, non-processing dates, cutoff times, and settlement windows.
+   - For configured currencies, `POST /api/initiate-transfer` includes a `settlementEstimate` with earliest/latest timestamps, timezone, and configuration source. Estimates are indicative windows, not a guarantee of settlement time.

@@ -71,8 +71,8 @@ describe('beneficiaryStore', () => {
   describe('race-safe beneficiary resolution and provider reuse', () => {
     it('creates recipient on first request and reuses reference on second request', async () => {
       const mockProvider = vi.fn().mockResolvedValue({
-        recipient_code: 'RCP_test_123',
-        name: 'Ada Synthetic',
+        recipientCode: 'RCP_test_123',
+        name: 'John Doe',
       });
 
       const input = {

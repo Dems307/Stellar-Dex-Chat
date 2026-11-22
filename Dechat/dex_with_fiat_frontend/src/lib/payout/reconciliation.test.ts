@@ -88,8 +88,12 @@ describe('PayoutReconciliationService', () => {
 
     const replaySequence = (events: FixtureEvent[]): DomainPayoutStatus => {
       let state: DomainPayoutStatus = 'pending';
+      const replayService = new PayoutReconciliationService(
+        undefined,
+        auditLedger,
+      );
       for (const ev of events) {
-        const dec = service.reconcileEvent({
+        const dec = replayService.reconcileEvent({
           eventId: ev.id,
           payoutReference: 'ref_fixture',
           eventType: ev.type,
@@ -133,5 +137,155 @@ describe('PayoutReconciliationService', () => {
     expect(rejected).toHaveLength(1);
     expect(rejected[0].eventId).toBe('evt_delayed');
     expect(rejected[0].payload).toEqual({ note: 'delayed webhook callback' });
+  });
+
+  it('uses provider time rather than receipt order to reject delayed events', () => {
+    const receivedLate = '2026-11-21T12:00:00.000Z';
+    const providerFailureAt = '2026-11-21T10:00:00.000Z';
+    const providerSuccessAt = '2026-11-21T11:00:00.000Z';
+
+    const successFirst = new PayoutReconciliationService(
+      undefined,
+      auditLedger,
+    );
+    const appliedSuccess = successFirst.reconcileEvent({
+      eventId: 'evt-success',
+      payoutReference: 'ref-order-a',
+      eventType: 'transfer.success',
+      currentStatus: 'pending',
+      providerEventAt: providerSuccessAt,
+      receivedAt: receivedLate,
+    });
+    expect(appliedSuccess.decision).toBe('APPLIED');
+    const delayedFailure = successFirst.reconcileEvent({
+      eventId: 'evt-failure',
+      payoutReference: 'ref-order-a',
+      eventType: 'transfer.failed',
+      currentStatus: 'success',
+      providerEventAt: providerFailureAt,
+      receivedAt: '2026-11-21T12:01:00.000Z',
+    });
+
+    const failureFirst = new PayoutReconciliationService(
+      undefined,
+      auditLedger,
+    );
+    const appliedFailure = failureFirst.reconcileEvent({
+      eventId: 'evt-failure',
+      payoutReference: 'ref-order-b',
+      eventType: 'transfer.failed',
+      currentStatus: 'pending',
+      providerEventAt: providerFailureAt,
+      receivedAt: '2026-11-21T10:01:00.000Z',
+    });
+    const laterSuccess = failureFirst.reconcileEvent({
+      eventId: 'evt-success',
+      payoutReference: 'ref-order-b',
+      eventType: 'transfer.success',
+      currentStatus: appliedFailure.effectiveStatus,
+      providerEventAt: providerSuccessAt,
+      receivedAt: receivedLate,
+    });
+
+    expect(delayedFailure.decision).toBe('REJECTED_OUT_OF_ORDER');
+    expect(laterSuccess.effectiveStatus).toBe('success');
+    expect(successFirst.getWebhookEvents('ref-order-a')[1]).toMatchObject({
+      providerEventAt: providerFailureAt,
+      receivedAt: '2026-11-21T12:01:00.000Z',
+    });
+  });
+
+  it('uses a stable status priority for contradictory events with the same provider time', () => {
+    const service = new PayoutReconciliationService(undefined, auditLedger);
+    const receivedAt = '2026-11-21T12:00:00.000Z';
+    const providerEventAt = '2026-11-21T11:00:00.000Z';
+
+    const failed = service.reconcileEvent({
+      eventId: 'evt-failed',
+      payoutReference: 'ref-same-time',
+      eventType: 'transfer.failed',
+      currentStatus: 'pending',
+      providerEventAt,
+      receivedAt,
+    });
+    const succeeded = service.reconcileEvent({
+      eventId: 'evt-success',
+      payoutReference: 'ref-same-time',
+      eventType: 'transfer.success',
+      currentStatus: failed.effectiveStatus,
+      providerEventAt,
+      receivedAt,
+    });
+
+    expect(succeeded.effectiveStatus).toBe('success');
+    expect(service.getWebhookEvents('ref-same-time')).toHaveLength(2);
+  });
+
+  it('converges on provider-time order when contradictory events arrive in either order', () => {
+    const successAt = '2026-11-21T10:00:00.000Z';
+    const failureAt = '2026-11-21T11:00:00.000Z';
+    const receivedAt = '2026-11-21T12:00:00.000Z';
+
+    const replay = (
+      events: Array<{
+        eventId: string;
+        eventType: string;
+        providerEventAt: string;
+      }>,
+      payoutReference: string,
+    ): DomainPayoutStatus => {
+      const orderedService = new PayoutReconciliationService(
+        undefined,
+        auditLedger,
+      );
+      let currentStatus: DomainPayoutStatus = 'pending';
+      for (const event of events) {
+        const result = orderedService.reconcileEvent({
+          ...event,
+          payoutReference,
+          currentStatus,
+          receivedAt,
+        });
+        currentStatus = result.effectiveStatus;
+      }
+      return currentStatus;
+    };
+
+    const success = {
+      eventId: 'evt-success-first',
+      eventType: 'transfer.success',
+      providerEventAt: successAt,
+    };
+    const failure = {
+      eventId: 'evt-failure-last',
+      eventType: 'transfer.failed',
+      providerEventAt: failureAt,
+    };
+
+    expect(replay([success, failure], 'ref-order-forward')).toBe('success');
+    expect(replay([failure, success], 'ref-order-reversed')).toBe('success');
+  });
+
+  it('persists provider and receipt timestamps for accepted webhook events', () => {
+    service.reconcileEvent({
+      eventId: 'evt-persisted',
+      payoutReference: 'ref-event-times',
+      eventType: 'transfer.success',
+      currentStatus: 'pending',
+      providerEventAt: '2026-11-21T10:00:00.000Z',
+      receivedAt: '2026-11-21T10:01:00.000Z',
+    });
+
+    const restartedService = new PayoutReconciliationService(
+      tempDir,
+      auditLedger,
+    );
+    expect(restartedService.getWebhookEvents('ref-event-times')).toMatchObject([
+      {
+        eventId: 'evt-persisted',
+        providerEventAt: '2026-11-21T10:00:00.000Z',
+        receivedAt: '2026-11-21T10:01:00.000Z',
+      },
+    ]);
   });
 });
