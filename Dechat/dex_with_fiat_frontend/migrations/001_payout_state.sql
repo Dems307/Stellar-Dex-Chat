@@ -22,126 +22,233 @@ CREATE TABLE IF NOT EXISTS payout_state_transitions (
   transitioned_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
--- Dual control for high-risk manual payout actions (Issue #229).
--- Each row records a requested retry/release/override action that requires an
--- independent reviewer approval before it is applied to the payout intent.
-CREATE TABLE IF NOT EXISTS payout_dual_control_actions (
-  id VARCHAR(64) PRIMARY KEY,
+-- Transactional outbox for payout side effects (Issue #222).
+-- Rows are written in the same DB transaction as the payout state mutation so
+-- the state change and the outbound provider command commit or roll back
+-- together. A dispatcher delivers pending rows asynchronously (at-least-once)
+-- using the stable idempotency_key so provider retries and replays are safe.
+CREATE TABLE IF NOT EXISTS payout_outbox (
+  id BIGSERIAL PRIMARY KEY,
   payout_id VARCHAR(64) NOT NULL REFERENCES payout_intents(id) ON DELETE CASCADE,
-  action_type VARCHAR(32) NOT NULL,
+  command_type VARCHAR(64) NOT NULL,
+  idempotency_key VARCHAR(128) UNIQUE NOT NULL,
+  payload JSONB NOT NULL,
   status VARCHAR(32) NOT NULL DEFAULT 'pending',
-  requester_id VARCHAR(128) NOT NULL,
-  approver_id VARCHAR(128),
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  delivered_at TIMESTAMP WITH TIME ZONE
+);
+
+-- Provider capability contract for reversals and recalls (Issue #223).
+-- Each provider adapter declares which cancellation, recall, and status
+-- semantics it supports. Actions a provider does not support are routed to an
+-- explicit manual-review outcome instead of reporting a false success.
+CREATE TABLE IF NOT EXISTS provider_capabilities (
+  provider_id VARCHAR(64) PRIMARY KEY,
+  supports_cancel BOOLEAN NOT NULL DEFAULT FALSE,
+  supports_recall BOOLEAN NOT NULL DEFAULT FALSE,
+  supports_status BOOLEAN NOT NULL DEFAULT FALSE,
+  cancel_semantics VARCHAR(32) NOT NULL DEFAULT 'unsupported',
+  recall_semantics VARCHAR(32) NOT NULL DEFAULT 'unsupported',
+  status_semantics VARCHAR(32) NOT NULL DEFAULT 'unsupported',
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT provider_capabilities_cancel_semantics_check
+    CHECK (cancel_semantics IN ('unsupported', 'synchronous', 'asynchronous')),
+  CONSTRAINT provider_capabilities_recall_semantics_check
+    CHECK (recall_semantics IN ('unsupported', 'synchronous', 'asynchronous')),
+  CONSTRAINT provider_capabilities_status_semantics_check
+    CHECK (status_semantics IN ('unsupported', 'polling', 'webhook'))
+);
+
+-- Manual-review queue for actions a provider cannot perform. Rows are created
+-- instead of emitting a success transition so operators can resolve them.
+CREATE TABLE IF NOT EXISTS payout_manual_reviews (
+  id BIGSERIAL PRIMARY KEY,
+  payout_id VARCHAR(64) NOT NULL REFERENCES payout_intents(id) ON DELETE CASCADE,
+  action VARCHAR(32) NOT NULL,
+  provider_id VARCHAR(64) NOT NULL,
   reason TEXT NOT NULL,
-  before_state JSONB NOT NULL,
-  after_state JSONB NOT NULL,
-  requested_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-  decided_at TIMESTAMP WITH TIME ZONE,
-  CONSTRAINT payout_dual_control_action_type_check
-    CHECK (action_type IN ('retry', 'release', 'override')),
-  CONSTRAINT payout_dual_control_status_check
-    CHECK (status IN ('pending', 'approved', 'rejected', 'cancelled')),
-  CONSTRAINT payout_dual_control_no_self_approval
-    CHECK (approver_id IS NULL OR approver_id <> requester_id),
-  CONSTRAINT payout_dual_control_decision_consistency
-    CHECK (
-      (status = 'pending' AND approver_id IS NULL AND decided_at IS NULL)
-      OR (status IN ('approved', 'rejected') AND approver_id IS NOT NULL AND decided_at IS NOT NULL)
-      OR (status = 'cancelled' AND decided_at IS NOT NULL)
-    )
+  status VARCHAR(32) NOT NULL DEFAULT 'open',
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  resolved_at TIMESTAMP WITH TIME ZONE,
+  CONSTRAINT payout_manual_reviews_action_check
+    CHECK (action IN ('cancel', 'recall', 'status')),
+  CONSTRAINT payout_manual_reviews_status_check
+    CHECK (status IN ('open', 'resolved', 'dismissed'))
 );
 
--- Provider reconciliation imports (Issue #230).
--- Each import batch is checksummed so re-imports are detectable, and each
--- imported row retains its provider source identifier for row-level provenance.
--- Reconciliation is read-only with respect to payout_intents: it never mutates
--- payouts implicitly; any payout change must go through an explicit action.
-CREATE TABLE IF NOT EXISTS provider_reconciliation_imports (
-  id VARCHAR(64) PRIMARY KEY,
-  provider VARCHAR(64) NOT NULL,
-  statement_reference VARCHAR(128) NOT NULL,
-  import_checksum VARCHAR(128) NOT NULL,
-  record_count INTEGER NOT NULL,
-  imported_by VARCHAR(128) NOT NULL,
-  imported_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-  CONSTRAINT provider_reconciliation_imports_checksum_unique
-    UNIQUE (provider, import_checksum)
-);
-
-CREATE TABLE IF NOT EXISTS provider_reconciliation_records (
-  id VARCHAR(64) PRIMARY KEY,
-  import_id VARCHAR(64) NOT NULL REFERENCES provider_reconciliation_imports(id) ON DELETE CASCADE,
-  source_record_id VARCHAR(128) NOT NULL,
-  source_checksum VARCHAR(128) NOT NULL,
+-- Append-only reversal and dispute lifecycle (Issue #224).
+-- Provider reversals and disputed transfers are recorded as immutable events
+-- linked to the original payout. Each event captures the settlement evidence
+-- (provider reference, amount, currency, evidence payload) so the original
+-- settlement record is preserved even after the payout is reversed. Rows are
+-- never updated or deleted; the current lifecycle state is derived from the
+-- latest event per payout.
+CREATE TABLE IF NOT EXISTS payout_reversals (
+  id BIGSERIAL PRIMARY KEY,
+  payout_id VARCHAR(64) NOT NULL REFERENCES payout_intents(id) ON DELETE CASCADE,
+  event_type VARCHAR(32) NOT NULL,
   provider_reference VARCHAR(128),
   amount_minor_units BIGINT NOT NULL,
   currency VARCHAR(8) NOT NULL,
-  status VARCHAR(32) NOT NULL,
-  matched_payout_id VARCHAR(64) REFERENCES payout_intents(id) ON DELETE SET NULL,
-  conflict_reason TEXT,
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-  CONSTRAINT provider_reconciliation_records_status_check
-    CHECK (status IN ('matched', 'unmatched', 'conflicting')),
-  CONSTRAINT provider_reconciliation_records_source_unique
-    UNIQUE (import_id, source_record_id),
-  CONSTRAINT provider_reconciliation_records_conflict_consistency
-    CHECK (
-      (status = 'conflicting' AND conflict_reason IS NOT NULL)
-      OR (status <> 'conflicting' AND conflict_reason IS NULL)
-    )
+  reason TEXT,
+  evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
+  recorded_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT payout_reversals_event_type_check
+    CHECK (event_type IN ('reversal_requested', 'reversal_settled', 'dispute_opened', 'dispute_resolved')),
+  CONSTRAINT payout_reversals_amount_check CHECK (amount_minor_units > 0)
 );
 
--- Adaptive, bounded payout status polling (Issue #231).
--- Tracks per-payout polling lifecycle so consumers can apply lifecycle-aware
--- backoff, enforce per-provider concurrency limits, and stop polling once a
--- terminal state is reached. last_checked_at and next_retry_at are exposed to
--- the UI; poll_attempts drives the backoff schedule.
-CREATE TABLE IF NOT EXISTS payout_status_polls (
-  payout_id VARCHAR(64) PRIMARY KEY REFERENCES payout_intents(id) ON DELETE CASCADE,
-  provider VARCHAR(64) NOT NULL,
-  poll_attempts INTEGER NOT NULL DEFAULT 0,
-  last_checked_at TIMESTAMP WITH TIME ZONE,
-  next_retry_at TIMESTAMP WITH TIME ZONE,
-  last_observed_status VARCHAR(32),
-  terminal BOOLEAN NOT NULL DEFAULT FALSE,
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-  CONSTRAINT payout_status_polls_attempts_non_negative
-    CHECK (poll_attempts >= 0),
-  CONSTRAINT payout_status_polls_terminal_consistency
-    CHECK (
-      (terminal = FALSE AND next_retry_at IS NOT NULL)
-      OR (terminal = TRUE AND next_retry_at IS NULL)
-    )
-);
+-- A payout may only be reversed once; disputes may be opened and resolved
+-- repeatedly but a reversal event is terminal for the successful state.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_payout_reversals_single_reversal
+  ON payout_reversals(payout_id)
+  WHERE event_type IN ('reversal_requested', 'reversal_settled');
 
--- Supported currency minor-unit (precision) metadata (Issue #232).
--- Single source of truth for currency precision used by payout validation.
--- Currencies absent from this table have unknown precision and MUST be
--- rejected by validation rather than defaulted or guessed.
-CREATE TABLE IF NOT EXISTS payout_currency_precision (
-  currency VARCHAR(8) PRIMARY KEY,
-  minor_units SMALLINT NOT NULL,
-  provider VARCHAR(64),
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-  CONSTRAINT payout_currency_precision_minor_units_range
-    CHECK (minor_units >= 0 AND minor_units <= 8)
-);
+-- Prevent a reversed transfer from remaining successful: once any reversal
+-- event exists for a payout, the payout status must not be 'succeeded'.
+CREATE OR REPLACE FUNCTION enforce_payout_reversal_status()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF NEW.status = 'succeeded' AND EXISTS (
+    SELECT 1 FROM payout_reversals
+    WHERE payout_id = NEW.id
+      AND event_type IN ('reversal_requested', 'reversal_settled')
+  ) THEN
+    RAISE EXCEPTION 'payout % cannot remain succeeded after a reversal', NEW.id;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_payout_intents_reversal_status ON payout_intents;
+CREATE TRIGGER trg_payout_intents_reversal_status
+  BEFORE UPDATE ON payout_intents
+  FOR EACH ROW
+  EXECUTE FUNCTION enforce_payout_reversal_status();
 
 CREATE INDEX IF NOT EXISTS idx_payout_intents_status ON payout_intents(status);
 CREATE INDEX IF NOT EXISTS idx_payout_intents_created_at ON payout_intents(created_at);
-CREATE INDEX IF NOT EXISTS idx_payout_dual_control_payout_id ON payout_dual_control_actions(payout_id);
-CREATE INDEX IF NOT EXISTS idx_payout_dual_control_status ON payout_dual_control_actions(status);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_payout_dual_control_pending_unique
-  ON payout_dual_control_actions(payout_id, action_type)
-  WHERE status = 'pending';
-CREATE INDEX IF NOT EXISTS idx_provider_reconciliation_records_import_id
-  ON provider_reconciliation_records(import_id);
-CREATE INDEX IF NOT EXISTS idx_provider_reconciliation_records_status
-  ON provider_reconciliation_records(status);
-CREATE INDEX IF NOT EXISTS idx_provider_reconciliation_records_matched_payout
-  ON provider_reconciliation_records(matched_payout_id);
--- Supports per-provider concurrency limits and due-retry lookups for polling.
-CREATE INDEX IF NOT EXISTS idx_payout_status_polls_provider_due
-  ON payout_status_polls(provider, next_retry_at)
-  WHERE terminal = FALSE;
+
+-- Issue #217: Tenant-aware AI budget accounting with atomic reservations.
+-- Reservations are taken before model dispatch against both a per-user and a
+-- global spend ceiling; actual usage is reconciled afterward. The reserved
+-- amount is held in `reserved_minor_units` until the request settles, at which
+-- point it is released and `spent_minor_units` is incremented by the actual
+-- cost. Concurrent requests are serialized per tenant/user via row locks so
+-- that the sum of reserved + spent can never exceed the configured ceiling.
+
+CREATE TABLE IF NOT EXISTS ai_budget_accounts (
+  tenant_id VARCHAR(64) NOT NULL,
+  user_id VARCHAR(64) NOT NULL,
+  currency VARCHAR(8) NOT NULL DEFAULT 'USD',
+  -- Configured ceilings (NULL means unlimited for that scope).
+  user_ceiling_minor_units BIGINT,
+  global_ceiling_minor_units BIGINT,
+  -- Running totals for this tenant/user scope.
+  reserved_minor_units BIGINT NOT NULL DEFAULT 0,
+  spent_minor_units BIGINT NOT NULL DEFAULT 0,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (tenant_id, user_id),
+  CONSTRAINT ai_budget_accounts_non_negative
+    CHECK (reserved_minor_units >= 0 AND spent_minor_units >= 0)
+);
+
+-- One row per tenant to enforce the global ceiling atomically across users.
+CREATE TABLE IF NOT EXISTS ai_budget_tenant_totals (
+  tenant_id VARCHAR(64) PRIMARY KEY,
+  currency VARCHAR(8) NOT NULL DEFAULT 'USD',
+  global_ceiling_minor_units BIGINT,
+  reserved_minor_units BIGINT NOT NULL DEFAULT 0,
+  spent_minor_units BIGINT NOT NULL DEFAULT 0,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT ai_budget_tenant_totals_non_negative
+    CHECK (reserved_minor_units >= 0 AND spent_minor_units >= 0)
+);
+
+-- Individual reservations. A reservation is created before dispatch and
+-- settled (reconciled) or released (rolled back) afterward. The status column
+-- makes the lifecycle explicit so partial/error responses can be reconciled.
+CREATE TABLE IF NOT EXISTS ai_budget_reservations (
+  id VARCHAR(64) PRIMARY KEY,
+  tenant_id VARCHAR(64) NOT NULL,
+  user_id VARCHAR(64) NOT NULL,
+  request_id VARCHAR(128),
+  status VARCHAR(32) NOT NULL DEFAULT 'reserved',
+  reserved_minor_units BIGINT NOT NULL,
+  actual_minor_units BIGINT,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  settled_at TIMESTAMP WITH TIME ZONE,
+  CONSTRAINT ai_budget_reservations_status_check
+    CHECK (status IN ('reserved', 'settled', 'released')),
+  CONSTRAINT ai_budget_reservations_amounts_check
+    CHECK (reserved_minor_units >= 0 AND (actual_minor_units IS NULL OR actual_minor_units >= 0))
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_budget_reservations_scope
+  ON ai_budget_reservations(tenant_id, user_id, status);
+CREATE INDEX IF NOT EXISTS idx_ai_budget_reservations_request
+  ON ai_budget_reservations(request_id);
+
+-- Issue #219: Privacy-safe retention controls for model traces and
+-- evaluation fixtures. Stored traces hold only redacted prompts/completions
+-- (secrets and payout identifiers are stripped at the trace-write boundary),
+-- and every row carries an explicit expiry so retention is enforced by
+-- deletion rather than by trusting callers. Traces are scoped to a tenant and
+-- a user/session so they can be deleted on request (right-to-erasure) and
+-- swept by the retention job once `expires_at` has passed.
+
+CREATE TABLE IF NOT EXISTS ai_model_traces (
+  id VARCHAR(64) PRIMARY KEY,
+  tenant_id VARCHAR(64) NOT NULL,
+  user_id VARCHAR(64) NOT NULL,
+  session_id VARCHAR(128),
+  request_id VARCHAR(128),
+  -- Redacted prompt/completion payloads. Never store raw secrets or payout
+  -- identifiers here; the write boundary sanitizes before insert.
+  prompt_redacted TEXT,
+  completion_redacted TEXT,
+  -- True when redaction removed at least one sensitive span, so operators can
+  -- audit that sanitization actually ran without seeing the removed data.
+  redaction_applied BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  -- Hard retention deadline. Rows past this are eligible for deletion.
+  expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+  CONSTRAINT ai_model_traces_retention_check
+    CHECK (expires_at > created_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_model_traces_user
+  ON ai_model_traces(tenant_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_ai_model_traces_session
+  ON ai_model_traces(tenant_id, session_id);
+CREATE INDEX IF NOT EXISTS idx_ai_model_traces_expiry
+  ON ai_model_traces(expires_at);
+
+-- Evaluation fixtures follow the same retention contract: synthetic-only
+-- inputs, redacted payloads, and an explicit expiry so fixtures cannot linger
+-- indefinitely. `deleted_at` supports soft-deletion for audit while the
+-- retention sweep hard-deletes expired rows.
+CREATE TABLE IF NOT EXISTS ai_evaluation_fixtures (
+  id VARCHAR(64) PRIMARY KEY,
+  tenant_id VARCHAR(64) NOT NULL,
+  name VARCHAR(128) NOT NULL,
+  input_redacted TEXT,
+  expected_redacted TEXT,
+  redaction_applied BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+  deleted_at TIMESTAMP WITH TIME ZONE,
+  CONSTRAINT ai_evaluation_fixtures_retention_check
+    CHECK (expires_at > created_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_evaluation_fixtures_tenant
+  ON ai_evaluation_fixtures(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_ai_evaluation_fixtures_expiry
+  ON ai_evaluation_fixtures(expires_at);
