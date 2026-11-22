@@ -1347,6 +1347,7 @@ Repo Avatar
 - **changelog:** Update changelog [skip ci]
 - **fault-injection:** Add fault-injection tests for DB, RPC, and provider outages
 - **changelog:** Update changelog [skip ci]
+- **changelog:** Update changelog [skip ci]
 
 ### Deprecated
 
