@@ -468,6 +468,7 @@ Repo Avatar
 - **payout:** Audited, idempotent dead-letter replay operator action
 - **fixtures:** Deterministic full-stack fixture with seeded ledger history
 - Add staged contract deployment with preflight and post-deploy verification
+- **reconciliation:** Add read-only escrow liability parity checks
 
 ### Fixed
 
@@ -1347,6 +1348,7 @@ Repo Avatar
 - **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
 - **fault-injection:** Add fault-injection tests for DB, RPC, and provider outages
+- **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
