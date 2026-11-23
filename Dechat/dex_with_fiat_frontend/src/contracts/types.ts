@@ -22,6 +22,7 @@ export const FIAT_BRIDGE_METHODS = {
   GET_WQ_OLDEST_AGE_LEDGERS: 'get_wq_oldest_age_ledgers',
   GET_WITHDRAWAL_REQUEST: 'get_withdrawal_request',
   GET_RECEIPT_BY_INDEX: 'get_receipt_by_index',
+  GET_RECEIPT_AUDIT_VIEWS: 'get_receipt_audit_views',
   GET_ACCRUED_FEES: 'get_accrued_fees',
   GET_EVENT_VERSION: 'get_event_version',
   IS_CIRCUIT_BREAKER_TRIPPED: 'is_circuit_breaker_tripped',
@@ -35,6 +36,21 @@ export interface ContractReceipt {
   depositor: string;
   amount: bigint;
   ledger: number;
+}
+
+export type ContractReceiptAuditStatus = 'active' | 'migrated';
+
+export interface ContractReceiptAuditView {
+  version: number;
+  receiptId: string;
+  token: string;
+  amount: bigint;
+  status: ContractReceiptAuditStatus;
+}
+
+export interface ContractReceiptAuditPage {
+  records: ContractReceiptAuditView[];
+  nextCursor: number | null;
 }
 
 export interface ContractWithdrawRequest {
