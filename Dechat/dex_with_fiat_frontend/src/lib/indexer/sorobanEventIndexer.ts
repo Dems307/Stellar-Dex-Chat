@@ -24,6 +24,29 @@ export interface IndexerCursor {
 }
 
 /**
+ * Alert thresholds for indexer health diagnostics.
+ * Exported so operational tooling and alerting can reuse the same bounds.
+ */
+export const MAX_LEDGER_LAG = 100;
+export const MAX_RETRY_COUNT = 5;
+export const MAX_OLDEST_EVENT_AGE_SECONDS = 300;
+
+/** Upper bound applied to any numeric health field to keep labels bounded. */
+const MAX_BOUNDED_VALUE = 1_000_000_000;
+
+export interface IndexerHealthSnapshot {
+  cursor: { lastLedger: number; lastEventIndex: number };
+  ledgerLag: number;
+  retryCount: number;
+  oldestUnprocessedEvent: { ledger: number; ageSeconds: number } | null;
+}
+
+function clampNonNegative(value: number): number {
+  if (!Number.isFinite(value) || value < 0) return 0;
+  return Math.min(Math.floor(value), MAX_BOUNDED_VALUE);
+}
+
+/**
  * Durable checkpoint persisted alongside the events it covers.
  * `ledgerHash` is the authoritative hash of `lastLedger` used for reorg detection.
  */
@@ -66,6 +89,9 @@ export class SorobanEventIndexer {
   private events: Map<string, SorobanEventRecord> = new Map();
   private cursor: IndexerCheckpoint = { lastLedger: 0, lastEventIndex: 0, updatedAt: 0 };
   private supportedSchemas: Set<number> = new Set([1]);
+  private retryCount = 0;
+  private oldestUnprocessedLedger: number | null = null;
+  private oldestUnprocessedAt: number | null = null;
   private adapter?: IndexerPersistenceAdapter;
   private backfillOwner?: string;
 
@@ -179,6 +205,12 @@ export class SorobanEventIndexer {
         continue;
       }
 
+      // Track the oldest event that has not yet been processed into the cursor.
+      if (this.oldestUnprocessedLedger === null || record.ledger < this.oldestUnprocessedLedger) {
+        this.oldestUnprocessedLedger = record.ledger;
+        this.oldestUnprocessedAt = Date.now();
+      }
+
       // Schema compatibility verification
       if (!this.supportedSchemas.has(record.schemaVersion)) {
         console.warn(`Encountered unsupported event schema version: ${record.schemaVersion}`);
@@ -205,6 +237,15 @@ export class SorobanEventIndexer {
           updatedAt: Date.now(),
         };
       }
+    }
+
+    // Clear the oldest-unprocessed marker once the cursor has caught up to it.
+    if (
+      this.oldestUnprocessedLedger !== null &&
+      this.oldestUnprocessedLedger <= this.cursor.lastLedger
+    ) {
+      this.oldestUnprocessedLedger = null;
+      this.oldestUnprocessedAt = null;
     }
 
     if (this.adapter) {
@@ -293,7 +334,6 @@ export class SorobanEventIndexer {
 
     shadow.meta.eventCount = shadow.events.size;
     shadow.meta.checksum = computeChecksum(shadow.events.values());
-
     return { ingested, duplicatesSkipped };
   }
 

@@ -7,23 +7,19 @@ import { enforceRouteCors } from '@/lib/corsPolicy';
 
 export const dynamic = 'force-dynamic';
 
-const NONCE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const ADMIN_SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
-// In-memory store for nonces (in production, use Redis or similar)
-const nonces = new Map<string, { expires: number }>();
+export async function GET(request: NextRequest) {
+  const origin = resolveRequestOrigin(request);
+  if (!origin) {
+    return NextResponse.json(
+      { error: 'Unable to determine request origin' },
+      { status: 400 },
+    );
+  }
 
-// Clean up expired nonces periodically
-if (typeof global.nonceCleanupInterval === 'undefined') {
-  global.nonceCleanupInterval = setInterval(() => {
-    const now = Date.now();
-    for (const [nonce, data] of nonces.entries()) {
-      if (data.expires < now) {
-        nonces.delete(nonce);
-      }
-    }
-  }, 60 * 1000);
-}
+  // Optional wallet binding: the nonce can only be consumed by this address.
+  const wallet = request.nextUrl.searchParams.get('wallet')?.trim() || undefined;
 
 export async function GET(request: NextRequest) {
   // Reject untrusted origins and preflight requests before doing any work
@@ -60,21 +56,39 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Check if nonce exists and is not expired
-    const nonceData = nonces.get(nonce);
-    if (!nonceData) {
+    const origin = resolveRequestOrigin(request);
+    if (!origin) {
       return NextResponse.json(
-        { error: 'Invalid or expired nonce' },
+        { error: 'Unable to determine request origin' },
         { status: 400 },
       );
     }
 
-    if (nonceData.expires < Date.now()) {
-      nonces.delete(nonce);
-      return NextResponse.json(
-        { error: 'Nonce expired' },
-        { status: 400 },
-      );
+    // Atomically consume the nonce before doing any expensive verification.
+    // This guarantees a nonce can be used at most once, even under concurrent
+    // replay attempts (compare-and-delete semantics).
+    const consumed = consumeNonce(nonce, { origin, wallet: address });
+    if (!consumed.ok) {
+      switch (consumed.reason) {
+        case 'expired':
+          return NextResponse.json({ error: 'Nonce expired' }, { status: 400 });
+        case 'wallet_mismatch':
+          return NextResponse.json(
+            { error: 'Nonce was issued for a different wallet' },
+            { status: 403 },
+          );
+        case 'origin_mismatch':
+          return NextResponse.json(
+            { error: 'Nonce was issued for a different origin' },
+            { status: 403 },
+          );
+        case 'not_found':
+        default:
+          return NextResponse.json(
+            { error: 'Invalid or expired nonce' },
+            { status: 400 },
+          );
+      }
     }
 
     // Verify the signed transaction
@@ -98,7 +112,7 @@ export async function POST(request: NextRequest) {
     // Create session cookie
     const cookieStore = await cookies();
     const sessionToken = crypto.randomUUID();
-    
+
     // Store session data using shared session store
     setAdminSession(sessionToken, address, ADMIN_SESSION_TTL_MS);
 
@@ -110,9 +124,6 @@ export async function POST(request: NextRequest) {
       maxAge: ADMIN_SESSION_TTL_MS / 1000,
       path: '/',
     });
-
-    // Clean up the used nonce
-    nonces.delete(nonce);
 
     return NextResponse.json({ success: true });
   } catch (error) {

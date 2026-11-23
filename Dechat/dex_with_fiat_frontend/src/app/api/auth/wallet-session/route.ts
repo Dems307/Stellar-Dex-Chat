@@ -26,7 +26,7 @@ export async function POST(request: NextRequest) {
 
   try {
     const body = await request.json().catch(() => ({}));
-    const { address, signature, timestamp, message } = body;
+    const { address, signature, timestamp, nonce } = body;
 
     // Validate all redirect/callback destinations before any session work.
     const destinations = collectDestinations(request, body);
@@ -51,7 +51,7 @@ export async function POST(request: NextRequest) {
         {
           success: false,
           message:
-            'Missing required authentication fields: address, signature, timestamp',
+            'Missing required authentication fields: address, signature, timestamp, nonce',
         },
         { status: 400 },
       );
@@ -71,7 +71,26 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const payload = message || `authenticate:${address}:${ts}`;
+    // Atomically consume the server-issued nonce. This is a one-time use
+    // operation: concurrent replays, expired nonces, wallet mismatches and
+    // origin mismatches are all rejected here before signature verification.
+    const nonceResult = consumeWalletNonce({
+      nonce: String(nonce),
+      address: String(address),
+      origin: getRequestOrigin(request),
+    });
+
+    if (!nonceResult.ok) {
+      return NextResponse.json(
+        {
+          success: false,
+          message: 'Invalid, expired, or already used authentication nonce',
+        },
+        { status: 401 },
+      );
+    }
+
+    const payload = nonceResult.message;
     const isValid = await verifySignature(payload, signature, address);
 
     if (!isValid) {

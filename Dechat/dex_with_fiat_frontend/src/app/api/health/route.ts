@@ -105,6 +105,9 @@ export async function GET(request: NextRequest) {
   }
 
   try {
+    const indexer = await loadIndexerHealth();
+    const { status, critical } = evaluateIndexerHealth(indexer);
+
     const { searchParams } = new URL(request.url);
     const overrides = parseThresholdOverrides(searchParams);
 
@@ -117,12 +120,17 @@ export async function GET(request: NextRequest) {
         : gate;
 
     const metrics = evaluatingGate.evaluate();
-    const httpStatus = decisionToStatus(metrics.decision);
+    const gateStatus = decisionToStatus(metrics.decision);
+
+    // The overall response is critical if either the indexer or the release
+    // health gate reports a critical/rollback condition.
+    const httpStatus = critical ? 503 : gateStatus;
 
     return NextResponse.json(
       {
-        status: 'ok',
+        status,
         timestamp: new Date().toISOString(),
+        indexer,
         providerCircuits: getProviderCircuitBreakerHealth(),
       },
       { status: httpStatus, headers: corsHeaders(origin) },
