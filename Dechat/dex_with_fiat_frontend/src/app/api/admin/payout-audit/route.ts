@@ -2,11 +2,20 @@ import { NextRequest, NextResponse } from 'next/server';
 import { requireAdminAuth } from '../_utils/requireAdminAuth';
 import { payoutAuditLedger, PayoutAuditAction } from '@/lib/payout/auditLedger';
 import {
+  ADMIN_PAYOUT_AUDIT_CORS_POLICY,
+  enforceCorsPolicy,
+} from '@/lib/security/corsPolicy';
+import {
   payoutAuditArchive,
   PayoutAuditArchiveManifest,
 } from '@/lib/payout/auditArchive';
 
 export async function GET(request: NextRequest) {
+  const corsError = enforceCorsPolicy(request, ADMIN_PAYOUT_AUDIT_CORS_POLICY);
+  if (corsError) {
+    return corsError;
+  }
+
   const authError = requireAdminAuth(request);
   if (authError) {
     return authError;
@@ -15,6 +24,7 @@ export async function GET(request: NextRequest) {
   try {
     const searchParams = request.nextUrl.searchParams;
     const format = searchParams.get('format') || 'json';
+    const verify = searchParams.get('verify') === 'true';
     const payoutId = searchParams.get('payoutId') || undefined;
     const action =
       (searchParams.get('action') as PayoutAuditAction) || undefined;
@@ -39,6 +49,16 @@ export async function GET(request: NextRequest) {
       startDate,
       endDate,
     };
+
+    if (verify) {
+      const verification = payoutAuditLedger.verifyChain();
+      return NextResponse.json(verification, {
+        status: 200,
+        headers: {
+          'Cache-Control': 'no-store, no-cache, must-revalidate',
+        },
+      });
+    }
 
     const manifest: PayoutAuditArchiveManifest =
       payoutAuditArchive.getManifest();
@@ -78,13 +98,42 @@ export async function GET(request: NextRequest) {
       partition,
     });
 
+    // Read-model freshness: expose the source ledger cursor and the latest
+    // audit entry timestamp so clients never present stale projections as
+    // confirmed settlement state.
+    const latestEntry = result.entries.reduce<{ timestamp?: string } | null>(
+      (latest, entry) => {
+        const timestamp = (entry as { timestamp?: string }).timestamp;
+        if (!timestamp) return latest;
+        if (!latest?.timestamp) return { timestamp };
+        return new Date(timestamp).getTime() >
+          new Date(latest.timestamp).getTime()
+          ? { timestamp }
+          : latest;
+      },
+      null,
+    );
+
+    const freshness = buildFreshnessMetadata({
+      dbUpdatedAt: latestEntry?.timestamp ?? null,
+    });
+
+    // Data lineage (#252): attach persisted calculation lineage per payout
+    // entry when available so auditors can recompute displayed/paid amounts.
+    const entries = result.entries.map((entry) => {
+      const payoutId = (entry as { payoutId?: string }).payoutId;
+      const lineage = payoutId
+        ? getCalculationLineageForPayout(payoutId)
+        : undefined;
+      return lineage ? { ...entry, lineage } : entry;
+    });
+
     return NextResponse.json(
-      { ...result, archiveManifest: manifest },
+      { ...result, entries, freshness },
       {
         status: 200,
         headers: {
           'Cache-Control': 'no-store, no-cache, must-revalidate',
-          'X-Audit-Archive-Version': manifest.version,
         },
       },
     );
@@ -98,28 +147,48 @@ export async function GET(request: NextRequest) {
 }
 
 // Append-only enforcement: Prevent mutating or deleting audit history
-export async function POST() {
+export async function POST(request: NextRequest) {
+  const corsError = enforceCorsPolicy(request, ADMIN_PAYOUT_AUDIT_CORS_POLICY);
+  if (corsError) {
+    return corsError;
+  }
+
   return NextResponse.json(
     { error: 'Method Not Allowed: The payout audit ledger is append-only' },
     { status: 405, headers: { Allow: 'GET' } },
   );
 }
 
-export async function PUT() {
+export async function PUT(request: NextRequest) {
+  const corsError = enforceCorsPolicy(request, ADMIN_PAYOUT_AUDIT_CORS_POLICY);
+  if (corsError) {
+    return corsError;
+  }
+
   return NextResponse.json(
     { error: 'Method Not Allowed: The payout audit ledger is append-only' },
     { status: 405, headers: { Allow: 'GET' } },
   );
 }
 
-export async function DELETE() {
+export async function DELETE(request: NextRequest) {
+  const corsError = enforceCorsPolicy(request, ADMIN_PAYOUT_AUDIT_CORS_POLICY);
+  if (corsError) {
+    return corsError;
+  }
+
   return NextResponse.json(
     { error: 'Method Not Allowed: The payout audit ledger is append-only' },
     { status: 405, headers: { Allow: 'GET' } },
   );
 }
 
-export async function PATCH() {
+export async function PATCH(request: NextRequest) {
+  const corsError = enforceCorsPolicy(request, ADMIN_PAYOUT_AUDIT_CORS_POLICY);
+  if (corsError) {
+    return corsError;
+  }
+
   return NextResponse.json(
     { error: 'Method Not Allowed: The payout audit ledger is append-only' },
     { status: 405, headers: { Allow: 'GET' } },

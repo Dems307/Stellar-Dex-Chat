@@ -164,179 +164,317 @@ export const RETENTION_PERIODS_MS: Record<PayoutStatus, number> = {
 };
 
 /**
+ * Legal/audit retention exceptions that override user-initiated account deletion.
+ * Each exception documents why a category of user-linked data must survive an
+ * account deletion request and what transformation is permitted instead.
+ */
+export type RetentionExceptionCategory =
+  | 'financial_audit'      // Accounting / tax records of settled payouts
+  | 'financial_logs'       // Operational financial logs required for reconciliation
+  | 'dispute_hold'         // Records under active dispute or chargeback investigation
+  | 'regulatory_mandate';  // Statutory retention imposed by a regulator
+
+export type RetentionAction =
+  | 'retain'               // Keep the record as-is (already non-identifying)
+  | 'deidentify'           // Irreversibly strip identifiers, keep the audit skeleton
+  | 'delete';              // No exception applies; erase the record
+
+export interface RetentionException {
+  id: string;
+  category: RetentionExceptionCategory;
+  description: string;
+  /** Minimum period the exception keeps the record alive, in milliseconds. */
+  retentionMs: number;
+  /** Fields that must be irreversibly de-identified when the exception applies. */
+  deidentifyFields: string[];
+  /** Fields that may be preserved verbatim under the exception. */
+  preservedFields: string[];
+}
+
+/**
+ * Declarative registry of legal/audit retention exceptions.
+ */
+export const RETENTION_EXCEPTIONS: Record<string, RetentionException> = {
+  payout_financial_audit: {
+    id: 'payout_financial_audit',
+    category: 'financial_audit',
+    description:
+      'Settled payout audit summaries are retained for accounting and tax reporting.',
+    retentionMs: 7 * 365 * 24 * 60 * 60 * 1000, // 7 years
+    deidentifyFields: [
+      'account_number',
+      'account_name',
+      'bvn',
+      'phone_number',
+      'email',
+      'recipient_code',
+      'transfer_code',
+    ],
+    preservedFields: [
+      'reference',
+      'amount',
+      'currency',
+      'fee',
+      'status',
+      'createdAt',
+      'settledAt',
+      'bankToken',
+    ],
+  },
+  payout_financial_logs: {
+    id: 'payout_financial_logs',
+    category: 'financial_logs',
+    description:
+      'Financial transaction logs are retained for reconciliation and fraud review.',
+    retentionMs: 2 * 365 * 24 * 60 * 60 * 1000, // 2 years
+    deidentifyFields: [
+      'account_number',
+      'account_name',
+      'bvn',
+      'phone_number',
+      'email',
+      'recipient_code',
+      'transfer_code',
+    ],
+    preservedFields: ['reference', 'amount', 'currency', 'status', 'createdAt'],
+  },
+  payout_dispute_hold: {
+    id: 'payout_dispute_hold',
+    category: 'dispute_hold',
+    description:
+      'Records tied to an open dispute or chargeback are frozen until resolution.',
+    retentionMs: 180 * 24 * 60 * 60 * 1000, // 180 days
+    deidentifyFields: [
+      'account_number',
+      'account_name',
+      'bvn',
+      'phone_number',
+      'email',
+    ],
+    preservedFields: ['reference', 'amount', 'currency', 'status', 'createdAt'],
+  },
+};
+
+export interface RetentionDecision {
+  action: RetentionAction;
+  /** Matched exception id, if any. */
+  exceptionId?: string;
+  /** Fields that must be irreversibly de-identified. */
+  deidentifyFields: string[];
+  /** Fields that may be preserved under the exception. */
+  preservedFields: string[];
+  /** Timestamp (ms) until which the record must be retained, if applicable. */
+  retainUntil?: number;
+  reason: string;
+}
+
+export interface RetentionEvaluationInput {
+  status: PayoutStatus;
+  createdAt: number;
+  settledAt?: number;
+  /** True when the record is linked to an open dispute or chargeback. */
+  hasOpenDispute?: boolean;
+  /** True when the record is a financial log entry rather than a payout record. */
+  isFinancialLog?: boolean;
+  /** Current time in ms (injectable for deterministic tests). */
+  now?: number;
+}
+
+/**
+ * Decides how a user-linked payout record must be handled after an account
+ * deletion request: retained, irreversibly de-identified, or deleted.
+ *
+ * Pending payouts are never deleted or de-identified because they are still
+ * in flight; the caller must wait for a terminal status.
+ */
+export function evaluateRetention(
+  input: RetentionEvaluationInput,
+): RetentionDecision {
+  const now = input.now ?? Date.now();
+
+  if (input.status === 'pending') {
+    return {
+      action: 'retain',
+      deidentifyFields: [],
+      preservedFields: [],
+      reason:
+        'Pending payouts are in flight and cannot be deleted or de-identified until terminal status.',
+    };
+  }
+
+  if (input.hasOpenDispute) {
+    const exception = RETENTION_EXCEPTIONS.payout_dispute_hold;
+    return {
+      action: 'deidentify',
+      exceptionId: exception.id,
+      deidentifyFields: [...exception.deidentifyFields],
+      preservedFields: [...exception.preservedFields],
+      retainUntil: now + exception.retentionMs,
+      reason: exception.description,
+    };
+  }
+
+  if (input.isFinancialLog) {
+    const exception = RETENTION_EXCEPTIONS.payout_financial_logs;
+    return {
+      action: 'deidentify',
+      exceptionId: exception.id,
+      deidentifyFields: [...exception.deidentifyFields],
+      preservedFields: [...exception.preservedFields],
+      retainUntil: now + exception.retentionMs,
+      reason: exception.description,
+    };
+  }
+
+  if (input.status === 'completed') {
+    const exception = RETENTION_EXCEPTIONS.payout_financial_audit;
+    const settledAt = input.settledAt ?? input.createdAt;
+    const retainUntil = settledAt + exception.retentionMs;
+    return {
+      action: retainUntil > now ? 'deidentify' : 'delete',
+      exceptionId: exception.id,
+      deidentifyFields: [...exception.deidentifyFields],
+      preservedFields: [...exception.preservedFields],
+      retainUntil,
+      reason: exception.description,
+    };
+  }
+
+  // Failed, cancelled, and rejected payouts carry no legal retention obligation.
+  return {
+    action: 'delete',
+    deidentifyFields: [],
+    preservedFields: [],
+    reason: 'No legal or audit retention exception applies to this record.',
+  };
+}
+
+/**
  * Retention horizons for high-volume audit and event data.
  * Each horizon defines how long rows remain in the hot (queryable) partition
  * before being moved to archive storage. Audit evidence is never destroyed.
  */
-export type RetentionHorizon = 'HOT' | 'WARM' | 'ARCHIVE';
+export type EvidenceClass = 'audit' | 'webhook' | 'provider_evidence';
 
-export interface RetentionHorizonPolicy {
-  horizon: RetentionHorizon;
-  /** Maximum age (ms) of rows kept in this horizon. */
+/**
+ * Storage tiers for evidence. `hot` is queryable online, `warm` is retained for
+ * operational lookups, and `archive` is retained for compliance/export only.
+ */
+export type RetentionTier = 'hot' | 'warm' | 'archive';
+
+export interface RetentionTierPolicy {
+  tier: RetentionTier;
+  /** Age (ms) at which evidence enters this tier. */
+  minAgeMs: number;
+  /** Age (ms) at which evidence leaves this tier; Infinity for archive. */
   maxAgeMs: number;
-  /** Whether rows in this horizon are still served by default queries. */
-  queryable: boolean;
+  /** Whether the evidence is expected to be exported to cold storage. */
+  exportable: boolean;
   description: string;
 }
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 /**
- * Declarative retention horizon registry for audit/event tables.
- * - HOT: last 30 days, fully queryable.
- * - WARM: 30-180 days, queryable with explicit horizon selection.
- * - ARCHIVE: older than 180 days, retrievable only via archive lookups.
+ * Declarative retention tier boundaries per evidence class.
+ * Boundaries are inclusive of `minAgeMs` and exclusive of `maxAgeMs`.
  */
-export const RETENTION_HORIZONS: Record<RetentionHorizon, RetentionHorizonPolicy> = {
-  HOT: {
-    horizon: 'HOT',
-    maxAgeMs: 30 * DAY_MS,
-    queryable: true,
-    description: 'Recent audit/event rows served by default queries',
-  },
-  WARM: {
-    horizon: 'WARM',
-    maxAgeMs: 180 * DAY_MS,
-    queryable: true,
-    description: 'Aged rows queryable only with explicit horizon selection',
-  },
-  ARCHIVE: {
-    horizon: 'ARCHIVE',
-    maxAgeMs: Number.POSITIVE_INFINITY,
-    queryable: false,
-    description: 'Archived audit evidence retrievable via archive lookups only',
-  },
+export const RETENTION_TIERS: Record<EvidenceClass, RetentionTierPolicy[]> = {
+  audit: [
+    {
+      tier: 'hot',
+      minAgeMs: 0,
+      maxAgeMs: 30 * DAY_MS,
+      exportable: false,
+      description: 'Audit summaries queryable online for 30 days',
+    },
+    {
+      tier: 'warm',
+      minAgeMs: 30 * DAY_MS,
+      maxAgeMs: 365 * DAY_MS,
+      exportable: true,
+      description: 'Audit summaries retained for operational lookups up to 1 year',
+    },
+    {
+      tier: 'archive',
+      minAgeMs: 365 * DAY_MS,
+      maxAgeMs: Number.POSITIVE_INFINITY,
+      exportable: true,
+      description: 'Audit summaries retained indefinitely for compliance',
+    },
+  ],
+  webhook: [
+    {
+      tier: 'hot',
+      minAgeMs: 0,
+      maxAgeMs: 7 * DAY_MS,
+      exportable: false,
+      description: 'Webhook payloads queryable online for 7 days',
+    },
+    {
+      tier: 'warm',
+      minAgeMs: 7 * DAY_MS,
+      maxAgeMs: 90 * DAY_MS,
+      exportable: true,
+      description: 'Webhook payloads retained for replay/debugging up to 90 days',
+    },
+    {
+      tier: 'archive',
+      minAgeMs: 90 * DAY_MS,
+      maxAgeMs: Number.POSITIVE_INFINITY,
+      exportable: true,
+      description: 'Webhook payloads archived for dispute resolution',
+    },
+  ],
+  provider_evidence: [
+    {
+      tier: 'hot',
+      minAgeMs: 0,
+      maxAgeMs: 14 * DAY_MS,
+      exportable: false,
+      description: 'Provider evidence queryable online for 14 days',
+    },
+    {
+      tier: 'warm',
+      minAgeMs: 14 * DAY_MS,
+      maxAgeMs: 180 * DAY_MS,
+      exportable: true,
+      description: 'Provider evidence retained for reconciliation up to 180 days',
+    },
+    {
+      tier: 'archive',
+      minAgeMs: 180 * DAY_MS,
+      maxAgeMs: Number.POSITIVE_INFINITY,
+      exportable: true,
+      description: 'Provider evidence archived for financial audit',
+    },
+  ],
 };
 
 /**
- * Resolves the retention horizon for a row based on its age relative to `now`.
- * Boundary semantics: a row exactly at a horizon boundary belongs to the
- * *older* horizon (age >= maxAgeMs moves it out of the current horizon).
+ * Resolves the retention tier for a piece of evidence of the given class and age.
+ * Throws on unknown evidence classes or invalid (negative/non-finite) ages.
  */
-export function resolveRetentionHorizon(
-  timestamp: number,
-  now: number = Date.now(),
-): RetentionHorizon {
-  const age = now - timestamp;
-  if (age < RETENTION_HORIZONS.HOT.maxAgeMs) {
-    return 'HOT';
+export function getRetentionTier(
+  evidenceClass: EvidenceClass,
+  ageMs: number,
+): RetentionTier {
+  const policies = RETENTION_TIERS[evidenceClass];
+  if (!policies) {
+    throw new Error(`Unknown evidence class: ${String(evidenceClass)}`);
   }
-  if (age < RETENTION_HORIZONS.WARM.maxAgeMs) {
-    return 'WARM';
+  if (typeof ageMs !== 'number' || Number.isNaN(ageMs) || ageMs < 0) {
+    throw new Error(`Invalid evidence age: ${String(ageMs)}`);
   }
-  return 'ARCHIVE';
-}
 
-export interface PartitionBoundary {
-  horizon: RetentionHorizon;
-  /** Inclusive lower bound (epoch ms) of rows in this partition. */
-  fromMs: number;
-  /** Exclusive upper bound (epoch ms) of rows in this partition. */
-  toMs: number;
-}
+  for (const policy of policies) {
+    if (ageMs >= policy.minAgeMs && ageMs < policy.maxAgeMs) {
+      return policy.tier;
+    }
+  }
 
-/**
- * Computes time-based partition boundaries for the given reference time.
- * Partitions are contiguous and non-overlapping: [fromMs, toMs).
- */
-export function computePartitionBoundaries(
-  now: number = Date.now(),
-): PartitionBoundary[] {
-  return [
-    {
-      horizon: 'HOT',
-      fromMs: now - RETENTION_HORIZONS.HOT.maxAgeMs,
-      toMs: now,
-    },
-    {
-      horizon: 'WARM',
-      fromMs: now - RETENTION_HORIZONS.WARM.maxAgeMs,
-      toMs: now - RETENTION_HORIZONS.HOT.maxAgeMs,
-    },
-    {
-      horizon: 'ARCHIVE',
-      fromMs: Number.NEGATIVE_INFINITY,
-      toMs: now - RETENTION_HORIZONS.WARM.maxAgeMs,
-    },
-  ];
-}
-
-/**
- * A single audit/event row subject to retention partitioning.
- */
-export interface AuditEventRow {
-  id: string;
-  reference: string;
-  eventType: string;
-  occurredAt: number;
-  payload: Record<string, unknown>;
-}
-
-export interface ArchivedRow extends AuditEventRow {
-  archivedAt: string;
-  horizon: RetentionHorizon;
-}
-
-export interface ArchiveManifestEntry {
-  id: string;
-  reference: string;
-  occurredAt: number;
-  rowHash: string;
-}
-
-export interface ArchiveManifest {
-  manifestId: string;
-  createdAt: string;
-  cutoffMs: number;
-  rowCount: number;
-  entries: ArchiveManifestEntry[];
-  /** SHA-256 over the canonical manifest content for integrity verification. */
-  integrityHash: string;
-}
-
-/**
- * Computes a deterministic SHA-256 hash of an audit row's canonical content.
- */
-export function hashAuditRow(row: AuditEventRow): string {
-  const canonical = JSON.stringify({
-    id: row.id,
-    reference: row.reference,
-    eventType: row.eventType,
-    occurredAt: row.occurredAt,
-    payload: row.payload,
-  });
-  return crypto.createHash('sha256').update(canonical).digest('hex');
-}
-
-/**
- * Computes the integrity hash of an archive manifest from its entries.
- */
-export function computeManifestIntegrityHash(
-  manifestId: string,
-  createdAt: string,
-  cutoffMs: number,
-  entries: ArchiveManifestEntry[],
-): string {
-  const canonical = JSON.stringify({
-    manifestId,
-    createdAt,
-    cutoffMs,
-    entries,
-  });
-  return crypto.createHash('sha256').update(canonical).digest('hex');
-}
-
-/**
- * Verifies that a manifest's integrity hash matches its entries.
- */
-export function verifyArchiveManifest(manifest: ArchiveManifest): boolean {
-  const expected = computeManifestIntegrityHash(
-    manifest.manifestId,
-    manifest.createdAt,
-    manifest.cutoffMs,
-    manifest.entries,
-  );
-  return expected === manifest.integrityHash;
+  // Only reachable for non-finite ages beyond the final tier.
+  return policies[policies.length - 1].tier;
 }
 
 export interface EncryptedPayload {
@@ -751,6 +889,38 @@ export class PayoutRetentionService {
     ).length;
 
     return { prunedProofs, activeCount };
+  }
+
+  /**
+   * Applies an account deletion request to a stored payout record, honoring
+   * legal/audit retention exceptions. Returns the retention decision and, when
+   * the record was de-identified or deleted, the resulting deletion proof.
+   */
+  public applyAccountDeletion(
+    reference: string,
+    options?: { requestedBy?: string; hasOpenDispute?: boolean; now?: number },
+  ): { decision: RetentionDecision; proof?: DeletionProof } {
+    const existing = this.records.get(reference);
+    if (!existing) {
+      throw new Error(`Payout record not found for reference: ${reference}`);
+    }
+
+    const decision = evaluateRetention({
+      status: existing.status,
+      createdAt: existing.createdAt,
+      settledAt: existing.settledAt,
+      hasOpenDispute: options?.hasOpenDispute,
+      now: options?.now,
+    });
+
+    if (decision.action === 'retain') {
+      return { decision };
+    }
+
+    const proof = this.deletePayoutPii(reference, 'user_request', {
+      requestedBy: options?.requestedBy,
+    });
+    return { decision, proof };
   }
 
   public getDeletionProof(reference: string): DeletionProof | null {

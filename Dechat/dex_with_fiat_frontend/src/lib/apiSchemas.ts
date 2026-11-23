@@ -11,6 +11,11 @@ import {
   strictCreateRecipientSchema,
   strictVerifyAccountSchema,
 } from './bankAccountSchemas';
+import {
+  redirectDestinationSchema,
+  callbackDestinationSchema,
+  deepLinkDestinationSchema,
+} from './urlValidation';
 
 export {
   countrySchema,
@@ -117,6 +122,42 @@ export const transferStatusSchema = z.object({
 });
 
 export type TransferStatusInput = z.infer<typeof transferStatusSchema>;
+
+// Destination validation for auth and payment flows. These wrap the
+// centralized validator in `urlValidation.ts` so that request payloads reject
+// non-allowlisted schemes/hosts, scheme/host confusion, and percent-encoded
+// bypasses at the schema boundary rather than trusting downstream consumers.
+export const redirectUrlSchema = redirectDestinationSchema;
+export const callbackUrlSchema = callbackDestinationSchema;
+export const deepLinkUrlSchema = deepLinkDestinationSchema;
+
+export type RedirectUrl = z.infer<typeof redirectUrlSchema>;
+export type CallbackUrl = z.infer<typeof callbackUrlSchema>;
+export type DeepLinkUrl = z.infer<typeof deepLinkUrlSchema>;
+
+// Schema for the auth redirect request payload. Only the allowlisted
+// `redirectUrl` destination is accepted; unknown keys are rejected so callers
+// cannot smuggle an alternate destination field past validation.
+export const authRedirectRequestSchema = z
+  .object({
+    redirectUrl: redirectUrlSchema,
+  })
+  .strict();
+
+export type AuthRedirectRequest = z.infer<typeof authRedirectRequestSchema>;
+
+// Schema for the payment callback request payload. `callbackUrl` and the
+// optional `deepLink` are both validated against their allowlists.
+export const paymentCallbackRequestSchema = z
+  .object({
+    callbackUrl: callbackUrlSchema,
+    deepLink: deepLinkUrlSchema.optional(),
+  })
+  .strict();
+
+export type PaymentCallbackRequest = z.infer<
+  typeof paymentCallbackRequestSchema
+>;
 
 // Schema for the payment-status/stream endpoint query string. The stream is
 // keyed by the client session id minted in `clientSession.ts` (a UUID), so a
@@ -389,6 +430,116 @@ export async function validateResponseContract(
   }
   return validateRouteResponse(route, response.status, body);
 }
+
+/**
+ * Read-model freshness metadata attached to indexed results.
+ *
+ * Indexed projections can lag the source ledger, so every response that
+ * exposes indexed state must also carry the cursor / update time it was
+ * derived from. Consumers use this to avoid presenting a stale projection as
+ * confirmed settlement state.
+ */
+export const freshnessSchema = z
+  .object({
+    /** Source ledger cursor the projection was built from, if known. */
+    sourceLedgerCursor: z.number().int().nonnegative().nullable(),
+    /** ISO-8601 timestamp of when the projection was indexed. */
+    indexedAt: z.string().datetime().nullable(),
+    /** ISO-8601 timestamp of the last database update for the projection. */
+    dbUpdatedAt: z.string().datetime().nullable(),
+    /** True when the projection is known to lag the source ledger. */
+    isStale: z.boolean(),
+    /** Age (in ms) beyond which the projection is considered stale. */
+    stalenessThresholdMs: z.number().int().nonnegative(),
+  })
+  .strict();
+
+export type FreshnessMetadata = z.infer<typeof freshnessSchema>;
+
+export interface BuildFreshnessMetadataInput {
+  /** Cursor of the source ledger the projection was built from. */
+  cursor: number | null | undefined;
+  /** Latest cursor observed on the source ledger, if known. */
+  latestLedger?: number | null;
+  /** ISO-8601 timestamp of the last database update, if known. */
+  dbUpdatedAt?: string | null;
+  /** Current time in epoch milliseconds (defaults to `Date.now()`). */
+  now?: number;
+  /** Age (in ms) beyond which the projection is considered stale. */
+  thresholdMs?: number;
+}
+
+export const DEFAULT_STALENESS_THRESHOLD_MS = 5 * 60 * 1000;
+
+/**
+ * Build freshness metadata for an indexed result.
+ *
+ * A projection is stale when either:
+ * - its cursor lags the latest known ledger cursor, or
+ * - its last database update is older than `thresholdMs`.
+ *
+ * A missing cursor is treated as stale: without a cursor we cannot prove the
+ * projection is current, so it must not be presented as confirmed state.
+ */
+export function buildFreshnessMetadata({
+  cursor,
+  latestLedger,
+  dbUpdatedAt,
+  now = Date.now(),
+  thresholdMs = DEFAULT_STALENESS_THRESHOLD_MS,
+}: BuildFreshnessMetadataInput): FreshnessMetadata {
+  const sourceLedgerCursor =
+    typeof cursor === 'number' && Number.isFinite(cursor) ? cursor : null;
+
+  const cursorLags =
+    sourceLedgerCursor === null ||
+    (typeof latestLedger === 'number' &&
+      Number.isFinite(latestLedger) &&
+      sourceLedgerCursor < latestLedger);
+
+  let dbTooOld = false;
+  if (dbUpdatedAt) {
+    const updatedAtMs = Date.parse(dbUpdatedAt);
+    if (Number.isNaN(updatedAtMs)) {
+      dbTooOld = true;
+    } else {
+      dbTooOld = now - updatedAtMs > thresholdMs;
+    }
+  }
+
+  return {
+    sourceLedgerCursor,
+    indexedAt: new Date(now).toISOString(),
+    dbUpdatedAt: dbUpdatedAt ?? null,
+    isStale: cursorLags || dbTooOld,
+    stalenessThresholdMs: thresholdMs,
+  };
+}
+
+/**
+ * Data lineage for FX and settlement calculations (issue #252).
+ *
+ * Persisted alongside every displayed and paid amount so an auditor can
+ * recompute it: which calculation version produced it, which inputs were
+ * consumed, which currency metadata version was used, and how rounding was
+ * applied.
+ */
+export const calculationLineageSchema = z
+  .object({
+    /** Version identifier of the calculation implementation. */
+    calculationVersion: z.string().min(1, 'calculationVersion is required'),
+    /** Identifiers of the inputs consumed by the calculation. */
+    inputSourceIds: z.array(z.string().min(1)).min(1),
+    /** Version identifier of the currency metadata used. */
+    currencyMetadataVersion: z.string().min(1, 'currencyMetadataVersion is required'),
+    /** Rounding mode applied to the result (e.g. 'half-up', 'half-even'). */
+    roundingMode: z.string().min(1, 'roundingMode is required'),
+    /** Signed difference introduced by rounding, in the result's minor unit. */
+    roundingDelta: z.number(),
+  })
+  .strict();
+
+export type CalculationLineage = z.infer<typeof calculationLineageSchema>;
 
 /**
  * Error thrown by {@link fetchWithRetry} when the server answers with a

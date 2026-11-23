@@ -4,95 +4,63 @@ import path from 'path';
 import { ContractEvent } from '../../../types/events';
 import { applyRateLimit, getClientIp } from '@/lib/rateLimit';
 import { eventsQuerySchema } from '@/lib/apiSchemas';
+import { enforceCorsPolicy } from '@/lib/cors';
 
 const DATA_DIR = path.join(process.cwd(), 'data');
 const EVENTS_FILE = path.join(DATA_DIR, 'contract-events.json');
-const ACTIVE_PROJECTION_FILE = path.join(DATA_DIR, 'contract-events.active.json');
+const INDEXER_STATE_FILE = path.join(DATA_DIR, 'indexer-state.json');
 const RATE_LIMIT = { maxRequests: 30, windowMs: 60_000 };
 
-interface ActiveProjectionPointer {
-  version: number;
-  checksum: string;
-  file: string;
-  rebuiltAt?: string;
+interface IndexerState {
+  sourceLedgerCursor?: number | null;
+  latestKnownLedger?: number | null;
+  updatedAt?: string | null;
 }
 
-interface ResolvedProjection {
-  events: ContractEvent[];
-  projectionVersion: number | null;
-  projectionChecksum: string | null;
-  rebuildInProgress: boolean;
+interface FreshnessMetadata {
+  sourceLedgerCursor: number | null;
+  indexedAt: string | null;
+  isStale: boolean;
 }
 
-function readActivePointer(): ActiveProjectionPointer | null {
+function readFreshnessMetadata(): FreshnessMetadata {
+  const fallback: FreshnessMetadata = {
+    sourceLedgerCursor: null,
+    indexedAt: null,
+    isStale: true,
+  };
+
   try {
-    if (!fs.existsSync(ACTIVE_PROJECTION_FILE)) return null;
-    const raw = fs.readFileSync(ACTIVE_PROJECTION_FILE, 'utf8');
-    const parsed = JSON.parse(raw) as Partial<ActiveProjectionPointer>;
-    if (
-      typeof parsed.version !== 'number' ||
-      typeof parsed.checksum !== 'string' ||
-      typeof parsed.file !== 'string'
-    ) {
-      return null;
-    }
+    if (!fs.existsSync(INDEXER_STATE_FILE)) return fallback;
+
+    const state: IndexerState = JSON.parse(
+      fs.readFileSync(INDEXER_STATE_FILE, 'utf8'),
+    );
+
+    const cursor =
+      typeof state.sourceLedgerCursor === 'number'
+        ? state.sourceLedgerCursor
+        : null;
+    const latest =
+      typeof state.latestKnownLedger === 'number'
+        ? state.latestKnownLedger
+        : null;
+
     return {
-      version: parsed.version,
-      checksum: parsed.checksum,
-      file: parsed.file,
-      rebuiltAt: parsed.rebuiltAt,
+      sourceLedgerCursor: cursor,
+      indexedAt: typeof state.updatedAt === 'string' ? state.updatedAt : null,
+      isStale: cursor === null || latest === null || cursor < latest,
     };
   } catch (error) {
-    console.error('Error reading active projection pointer:', error);
-    return null;
+    console.error('Error reading indexer freshness metadata:', error);
+    return fallback;
   }
-}
-
-function resolveProjection(): ResolvedProjection {
-  const pointer = readActivePointer();
-
-  if (pointer) {
-    // Resolve the pointer's file relative to DATA_DIR and refuse path escapes.
-    const resolved = path.resolve(DATA_DIR, pointer.file);
-    const relative = path.relative(DATA_DIR, resolved);
-    const isInsideDataDir = relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative);
-
-    if (isInsideDataDir && fs.existsSync(resolved)) {
-      try {
-        const events = JSON.parse(fs.readFileSync(resolved, 'utf8')) as ContractEvent[];
-        return {
-          events,
-          projectionVersion: pointer.version,
-          projectionChecksum: pointer.checksum,
-          rebuildInProgress: false,
-        };
-      } catch (error) {
-        console.error('Error reading active projection file:', error);
-      }
-    }
-  }
-
-  // Fallback: legacy single-file projection (no version metadata available).
-  if (!fs.existsSync(EVENTS_FILE)) {
-    return {
-      events: [],
-      projectionVersion: pointer?.version ?? null,
-      projectionChecksum: pointer?.checksum ?? null,
-      rebuildInProgress: pointer !== null,
-    };
-  }
-
-  const events = JSON.parse(fs.readFileSync(EVENTS_FILE, 'utf8')) as ContractEvent[];
-  return {
-    events,
-    projectionVersion: pointer?.version ?? null,
-    projectionChecksum: pointer?.checksum ?? null,
-    // A pointer exists but its target was unreadable: a rebuild is likely in flight.
-    rebuildInProgress: pointer !== null,
-  };
 }
 
 export async function GET(request: NextRequest) {
+  const corsResponse = enforceCorsPolicy(request, '/api/events');
+  if (corsResponse) return corsResponse;
+
   const ip = getClientIp(request);
   const limited = applyRateLimit(ip, '/api/events', RATE_LIMIT);
   if (limited) return limited;
@@ -118,8 +86,17 @@ export async function GET(request: NextRequest) {
 
     const { limit, offset } = validationResult.data;
 
-    const { events, projectionVersion, projectionChecksum, rebuildInProgress } =
-      resolveProjection();
+    const freshness = readFreshnessMetadata();
+
+    if (!fs.existsSync(EVENTS_FILE)) {
+      return NextResponse.json({
+        events: [],
+        total: 0,
+        limit,
+        offset,
+        ...freshness,
+      });
+    }
 
     // Paginate and return
     const paginatedEvents = events.slice(offset, offset + limit);
@@ -129,9 +106,7 @@ export async function GET(request: NextRequest) {
       total: events.length,
       limit,
       offset,
-      projectionVersion,
-      projectionChecksum,
-      rebuildInProgress,
+      ...freshness,
     });
   } catch (error) {
     console.error('Error fetching indexed events:', error);

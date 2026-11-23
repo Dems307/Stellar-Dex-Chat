@@ -1,32 +1,52 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { verifySignature } from '@/lib/stellarSignature';
 import { createWalletSessionToken } from '@/lib/payout/auth';
-import { consumeWalletNonce } from '@/lib/payout/walletNonce';
+import {
+  applyCorsHeaders,
+  isOriginAllowed,
+  rejectDisallowedOrigin,
+} from '@/lib/security/cors';
 import { generateCsrfToken } from '@/lib/payout/security';
 
 const TIMESTAMP_TOLERANCE_MS = 5 * 60 * 1000; // 5 minutes
 
-function getRequestOrigin(request: NextRequest): string {
-  const origin = request.headers.get('origin');
-  if (origin) {
-    return origin;
+export async function OPTIONS(request: NextRequest) {
+  if (!isOriginAllowed(request, 'wallet-session')) {
+    return rejectDisallowedOrigin();
   }
-  const host = request.headers.get('host');
-  if (!host) {
-    return '';
-  }
-  const proto =
-    request.headers.get('x-forwarded-proto') ??
-    request.nextUrl.protocol.replace(':', '');
-  return `${proto}://${host}`;
+
+  const response = new NextResponse(null, { status: 204 });
+  return applyCorsHeaders(request, response, 'wallet-session');
 }
 
 export async function POST(request: NextRequest) {
+  if (!isOriginAllowed(request, 'wallet-session')) {
+    return rejectDisallowedOrigin();
+  }
+
   try {
     const body = await request.json().catch(() => ({}));
     const { address, signature, timestamp, nonce } = body;
 
-    if (!address || !signature || !timestamp || !nonce) {
+    // Validate all redirect/callback destinations before any session work.
+    const destinations = collectDestinations(request, body);
+    const validatedDestinations: Record<string, string> = {};
+
+    for (const { field, value } of destinations) {
+      const result: DestinationValidationResult = validateRedirectDestination(value);
+      if (!result.ok) {
+        return NextResponse.json(
+          {
+            success: false,
+            message: `Invalid ${field} destination: ${result.reason}`,
+          },
+          { status: 400 },
+        );
+      }
+      validatedDestinations[field] = result.url;
+    }
+
+    if (!address || !signature || !timestamp) {
       return NextResponse.json(
         {
           success: false,
@@ -83,6 +103,7 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    // Bind the session to the verified address only; never echo client input.
     const session = createWalletSessionToken(address);
     const csrfToken = generateCsrfToken();
 
@@ -93,23 +114,30 @@ export async function POST(request: NextRequest) {
         expiresAt: session.expiresAt,
         address: session.address,
         csrfToken,
+        ...(Object.keys(validatedDestinations).length > 0
+          ? { destinations: validatedDestinations }
+          : {}),
       },
     });
 
     response.cookies.set('wallet_session', session.sessionToken, {
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
+      sameSite: 'strict',
       maxAge: Math.floor((session.expiresAt - Date.now()) / 1000),
       path: '/',
     });
 
-    return response;
+    return applyCorsHeaders(request, response, 'wallet-session');
   } catch (error) {
     console.error('Wallet session authentication error:', error);
-    return NextResponse.json(
-      { success: false, message: 'Authentication failed' },
-      { status: 500 },
+    return applyCorsHeaders(
+      request,
+      NextResponse.json(
+        { success: false, message: 'Authentication failed' },
+        { status: 500 },
+      ),
+      'wallet-session',
     );
   }
 }

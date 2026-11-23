@@ -3,11 +3,7 @@ import { cookies } from 'next/headers';
 import { getAdmin } from '@/lib/stellarContract';
 import { verifySignedTransaction } from '@/lib/stellarSignature';
 import { setAdminSession } from '../../_utils/requireAdminAuth';
-import {
-  issueNonce,
-  consumeNonce,
-  resolveRequestOrigin,
-} from '@/lib/auth/nonceStore';
+import { enforceRouteCors } from '@/lib/corsPolicy';
 
 export const dynamic = 'force-dynamic';
 
@@ -25,12 +21,30 @@ export async function GET(request: NextRequest) {
   // Optional wallet binding: the nonce can only be consumed by this address.
   const wallet = request.nextUrl.searchParams.get('wallet')?.trim() || undefined;
 
-  const { nonce, expires } = issueNonce({ origin, wallet });
+export async function GET(request: NextRequest) {
+  // Reject untrusted origins and preflight requests before doing any work
+  const corsRejection = enforceRouteCors(request, 'admin-auth-nonce');
+  if (corsRejection) {
+    return corsRejection;
+  }
+
+  // Generate a random nonce (32 bytes for memo hash)
+  const nonceBytes = new Uint8Array(32);
+  crypto.getRandomValues(nonceBytes);
+  const nonce = Buffer.from(nonceBytes).toString('base64');
+  const expires = Date.now() + NONCE_TTL_MS;
+  nonces.set(nonce, { expires });
 
   return NextResponse.json({ nonce, expires });
 }
 
 export async function POST(request: NextRequest) {
+  // Reject untrusted origins and preflight requests before doing any work
+  const corsRejection = enforceRouteCors(request, 'admin-auth-nonce');
+  if (corsRejection) {
+    return corsRejection;
+  }
+
   try {
     const body = await request.json();
     const { nonce, signature, address } = body;

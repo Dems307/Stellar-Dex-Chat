@@ -156,38 +156,21 @@ export class SorobanEventIndexer {
   }
 
   /**
-   * Record a failed ingest attempt so health diagnostics can surface retries.
+   * Highest ledger the indexer has observed (0 when nothing has been ingested).
    */
-  public recordIngestFailure(): void {
-    this.retryCount = clampNonNegative(this.retryCount + 1);
+  public getLatestKnownLedger(): number {
+    return this.cursor.lastLedger;
   }
 
   /**
-   * Bounded health snapshot with no customer identifiers.
-   * `chainTipLedger` is the current chain head used to compute ledger lag.
+   * Read-model freshness metadata for API responses. `sourceLedgerCursor` is the
+   * ledger the indexed projection is current through; `indexedAt` is when that
+   * cursor last advanced (0 if the indexer has never ingested an event).
    */
-  public getHealthSnapshot(chainTipLedger: number): IndexerHealthSnapshot {
-    const tip = clampNonNegative(chainTipLedger);
-    const lastLedger = clampNonNegative(this.cursor.lastLedger);
-    const ledgerLag = clampNonNegative(tip - lastLedger);
-
-    let oldestUnprocessedEvent: IndexerHealthSnapshot['oldestUnprocessedEvent'] = null;
-    if (this.oldestUnprocessedLedger !== null && this.oldestUnprocessedAt !== null) {
-      const ageSeconds = clampNonNegative((Date.now() - this.oldestUnprocessedAt) / 1000);
-      oldestUnprocessedEvent = {
-        ledger: clampNonNegative(this.oldestUnprocessedLedger),
-        ageSeconds,
-      };
-    }
-
+  public getFreshness(): { sourceLedgerCursor: number; indexedAt: number } {
     return {
-      cursor: {
-        lastLedger,
-        lastEventIndex: clampNonNegative(this.cursor.lastEventIndex),
-      },
-      ledgerLag,
-      retryCount: clampNonNegative(this.retryCount),
-      oldestUnprocessedEvent,
+      sourceLedgerCursor: this.cursor.lastLedger,
+      indexedAt: this.cursor.updatedAt,
     };
   }
 

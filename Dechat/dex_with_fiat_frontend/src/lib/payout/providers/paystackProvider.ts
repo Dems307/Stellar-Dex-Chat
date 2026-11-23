@@ -12,6 +12,7 @@ import {
   providerIdempotencyRegistry,
 } from '../providerIdempotency';
 import { executeWithTimeoutBudget } from '../timeoutBudget';
+import { redactForLog } from '../../logging/redaction';
 
 import type {
   CancelTransferInput,
@@ -74,6 +75,27 @@ function normalizePaystackStatus(status?: string): NormalizedPayoutStatus {
 function asRecord(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object') {
     throw new Error('Paystack returned an invalid response');
+  }
+  return value as Record<string, unknown>;
+}
+
+function toPayoutProviderError(
+  message: string,
+  code: string,
+  status: number | undefined,
+  retryable: boolean,
+  providerCode?: string,
+  error?: { response?: { data?: unknown } },
+): PayoutProviderError {
+  return new PayoutProviderError({
+    message,
+    code,
+    statusCode: status,
+    retryable,
+    providerCode,
+    rawResponse: error?.response?.data,
+  });
+}
   }
   return value as Record<string, unknown>;
 }
@@ -234,9 +256,15 @@ const paystackProvider: PayoutProvider = {
 
   async createRecipient(
     input: CreateRecipientInput,
-  ): Promise<CreatedRecipient> {
+  ): Promise<CreateRecipientResult> {
     const credential = credentialManager.getActiveCredential();
+
     if (!credential?.secretKey) {
+      console.warn(
+        redactForLog(
+          'Paystack secret key not found, using mock recipient creation',
+        ),
+      );
       return {
         recipientCode: `RCP_${crypto.randomUUID()}`,
         name: input.name,
@@ -412,13 +440,20 @@ const paystackProvider: PayoutProvider = {
 
   async checkTransferStatus(
     input: TransferStatusInput,
-  ): Promise<TransferStatus> {
-    const credential = credentialManager.getCredential(input.credentialVersion);
-    if (!credential?.secretKey) {
+  ): Promise<TransferStatusResult> {
+    const { reference, credentialVersion } = input;
+    // Look up versioned credential for existing in-flight intent, or fallback to active
+    const cred = credentialManager.getCredential(credentialVersion);
+
+    if (!cred || !cred.secretKey) {
+      console.warn(
+        redactForLog('Paystack secret key not found, using mock transfer status'),
+      );
+
       return {
-        reference: input.reference,
+        reference,
         status: 'pending',
-        providerReference: input.reference,
+        providerReference: reference,
         rawResponse: { mock: true },
       };
     }
@@ -473,6 +508,8 @@ const paystackProvider: PayoutProvider = {
   async cancelTransfer(
     input: CancelTransferInput,
   ): Promise<CancelTransferResult> {
+    const { reference } = input;
+
     const status = await this.checkTransferStatus({
       reference: input.reference,
     });
@@ -495,6 +532,43 @@ const paystackProvider: PayoutProvider = {
         message: `Transfer is already in final state: ${status.status}`,
         providerReference: status.providerReference,
       };
+    }
+
+    if (!PAYSTACK_SECRET_KEY) {
+      console.warn(
+        redactForLog(
+          'Paystack secret key not found, using mock transfer cancellation',
+        ),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      return {
+        status: 'settled',
+        cancellable: false,
+        message: 'Transfer has already settled and cannot be cancelled',
+        providerReference: status.providerReference,
+      };
+    }
+    if (
+      status.status === 'failed' ||
+      status.status === 'reversed' ||
+      status.status === 'cancelled'
+    ) {
+      return {
+        status: 'rejected',
+        cancellable: false,
+        message: `Transfer is already in final state: ${status.status}`,
+        providerReference: status.providerReference,
+      };
+    }
+    return {
+      status: 'confirmed',
+      cancellable: true,
+      message:
+        input.reason || 'Transfer cancellation is eligible for processing',
+      providerReference: status.providerReference,
+    };
+  },
+};
     }
     return {
       status: 'confirmed',

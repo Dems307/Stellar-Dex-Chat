@@ -1,4 +1,4 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextResponse, NextRequest } from 'next/server';
 import { getProviderCircuitBreakerHealth } from '@/lib/payout/circuitBreaker';
 import {
   ReleaseHealthGate,
@@ -9,123 +9,31 @@ import {
 
 export const runtime = 'edge';
 
-/**
- * Bounded indexer health snapshot.
- *
- * Only aggregate, non-identifying values are exposed here: ledger cursors,
- * lag, retry counts and the age of the oldest unprocessed event. Wallet
- * addresses, transaction hashes and any other customer identifiers must
- * never be added to this payload.
- */
-export interface IndexerHealthSnapshot {
-  cursorLedger: number | null;
-  cursorEventIndex: number | null;
-  ledgerLag: number | null;
-  retryCount: number;
-  oldestUnprocessedEventLedger: number | null;
-  oldestUnprocessedEventAgeSeconds: number | null;
-}
+// Health endpoint is a non-financial, read-only route. It must not be
+// callable cross-origin by untrusted parties, and it never needs to answer
+// preflight requests. Keep the response minimal and free of sensitive data.
+const ALLOWED_ORIGINS: ReadonlySet<string> = new Set(
+  (process.env.HEALTH_ALLOWED_ORIGINS ?? '')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter((origin) => origin.length > 0),
+);
 
-export type IndexerHealthStatus = 'ok' | 'degraded';
-
-/** Ledger lag (in ledgers) above which the indexer is considered degraded. */
-export const LEDGER_LAG_DEGRADED_THRESHOLD = 100;
-/** Ledger lag (in ledgers) above which the indexer is considered critical. */
-export const LEDGER_LAG_CRITICAL_THRESHOLD = 500;
-/** Retry count above which the indexer is considered degraded. */
-export const RETRY_COUNT_DEGRADED_THRESHOLD = 5;
-/** Retry count above which the indexer is considered critical. */
-export const RETRY_COUNT_CRITICAL_THRESHOLD = 20;
-/** Age (seconds) of the oldest unprocessed event above which the indexer is degraded. */
-export const OLDEST_EVENT_AGE_DEGRADED_THRESHOLD_SECONDS = 300;
-/** Age (seconds) of the oldest unprocessed event above which the indexer is critical. */
-export const OLDEST_EVENT_AGE_CRITICAL_THRESHOLD_SECONDS = 900;
-
-const EMPTY_SNAPSHOT: IndexerHealthSnapshot = {
-  cursorLedger: null,
-  cursorEventIndex: null,
-  ledgerLag: null,
-  retryCount: 0,
-  oldestUnprocessedEventLedger: null,
-  oldestUnprocessedEventAgeSeconds: null,
-};
-
-function toFiniteNumber(value: unknown): number | null {
-  return typeof value === 'number' && Number.isFinite(value) ? value : null;
-}
-
-/**
- * Normalizes an arbitrary health source into the bounded snapshot shape,
- * dropping any unexpected or identifying fields.
- */
-export function normalizeIndexerHealth(
-  source: Partial<IndexerHealthSnapshot> | null | undefined,
-): IndexerHealthSnapshot {
-  if (!source) {
-    return { ...EMPTY_SNAPSHOT };
+function isAllowedOrigin(origin: string | null): boolean {
+  if (!origin) {
+    // Same-origin / non-browser requests do not send an Origin header.
+    return true;
   }
-
-  return {
-    cursorLedger: toFiniteNumber(source.cursorLedger),
-    cursorEventIndex: toFiniteNumber(source.cursorEventIndex),
-    ledgerLag: toFiniteNumber(source.ledgerLag),
-    retryCount: toFiniteNumber(source.retryCount) ?? 0,
-    oldestUnprocessedEventLedger: toFiniteNumber(source.oldestUnprocessedEventLedger),
-    oldestUnprocessedEventAgeSeconds: toFiniteNumber(source.oldestUnprocessedEventAgeSeconds),
-  };
+  return ALLOWED_ORIGINS.has(origin);
 }
 
-/**
- * Loads the current indexer health snapshot.
- *
- * The indexer publishes its snapshot to a shared health provider; when that
- * provider is unavailable we fall back to an empty snapshot so the health
- * route still responds with bounded data.
- */
-export async function loadIndexerHealth(): Promise<IndexerHealthSnapshot> {
-  try {
-    const provider = (globalThis as { __indexerHealthProvider?: () => unknown })
-      .__indexerHealthProvider;
-
-    if (typeof provider !== 'function') {
-      return { ...EMPTY_SNAPSHOT };
-    }
-
-    const snapshot = await provider();
-    return normalizeIndexerHealth(snapshot as Partial<IndexerHealthSnapshot> | null);
-  } catch {
-    return { ...EMPTY_SNAPSHOT };
+function corsHeaders(origin: string | null): Record<string, string> {
+  if (!origin) {
+    return {};
   }
-}
-
-/**
- * Classifies the snapshot against the alert thresholds.
- *
- * Returns 'degraded' when any metric crosses its degraded threshold and
- * whether the snapshot is critical (used to decide the HTTP status code).
- */
-export function evaluateIndexerHealth(snapshot: IndexerHealthSnapshot): {
-  status: IndexerHealthStatus;
-  critical: boolean;
-} {
-  const ledgerLag = snapshot.ledgerLag ?? 0;
-  const retryCount = snapshot.retryCount ?? 0;
-  const oldestEventAge = snapshot.oldestUnprocessedEventAgeSeconds ?? 0;
-
-  const critical =
-    ledgerLag > LEDGER_LAG_CRITICAL_THRESHOLD ||
-    retryCount > RETRY_COUNT_CRITICAL_THRESHOLD ||
-    oldestEventAge > OLDEST_EVENT_AGE_CRITICAL_THRESHOLD_SECONDS;
-
-  const degraded =
-    critical ||
-    ledgerLag > LEDGER_LAG_DEGRADED_THRESHOLD ||
-    retryCount > RETRY_COUNT_DEGRADED_THRESHOLD ||
-    oldestEventAge > OLDEST_EVENT_AGE_DEGRADED_THRESHOLD_SECONDS;
-
   return {
-    status: degraded ? 'degraded' : 'ok',
-    critical,
+    'Access-Control-Allow-Origin': origin,
+    Vary: 'Origin',
   };
 }
 
@@ -183,6 +91,19 @@ function decisionToStatus(decision: ReleaseHealthDecision): number {
 }
 
 export async function GET(request: NextRequest) {
+  const origin = request.headers.get('origin');
+
+  if (!isAllowedOrigin(origin)) {
+    return NextResponse.json(
+      {
+        status: 'error',
+        timestamp: new Date().toISOString(),
+        message: 'Origin not allowed',
+      },
+      { status: 403 },
+    );
+  }
+
   try {
     const indexer = await loadIndexerHealth();
     const { status, critical } = evaluateIndexerHealth(indexer);
@@ -212,7 +133,7 @@ export async function GET(request: NextRequest) {
         indexer,
         providerCircuits: getProviderCircuitBreakerHealth(),
       },
-      { status: httpStatus },
+      { status: httpStatus, headers: corsHeaders(origin) },
     );
   } catch (error) {
     return NextResponse.json(
@@ -221,9 +142,47 @@ export async function GET(request: NextRequest) {
         timestamp: new Date().toISOString(),
         message: error instanceof Error ? error.message : 'Health check failed',
       },
-      { status: 503 },
+      { status: 503, headers: corsHeaders(origin) },
     );
   }
+}
+
+// Reject preflight requests: this endpoint does not support cross-origin
+// state-changing or credentialed access.
+export async function OPTIONS() {
+  return new NextResponse(null, {
+    status: 405,
+    headers: { Allow: 'GET' },
+  });
+}
+
+// Reject any state-changing method explicitly.
+export async function POST() {
+  return new NextResponse(null, {
+    status: 405,
+    headers: { Allow: 'GET' },
+  });
+}
+
+export async function PUT() {
+  return new NextResponse(null, {
+    status: 405,
+    headers: { Allow: 'GET' },
+  });
+}
+
+export async function PATCH() {
+  return new NextResponse(null, {
+    status: 405,
+    headers: { Allow: 'GET' },
+  });
+}
+
+export async function DELETE() {
+  return new NextResponse(null, {
+    status: 405,
+    headers: { Allow: 'GET' },
+  });
 }
 
 // ---------------------------------------------------------------------------

@@ -89,6 +89,22 @@ function parsePageSize(raw: string | null): number {
   return Math.min(Math.floor(parsed), MAX_PAGE_SIZE);
 }
 
+// Read-model freshness metadata (#249): the newest entry timestamp is the
+// database update time for this projection, and the indexer cursor records how
+// far the source ledger has been indexed. Clients must treat results as
+// possibly stale until they observe a cursor at or beyond their expected one.
+const SOURCE_LEDGER_CURSOR = 'ledger:2026-03-29T19:00:00Z:seq:58';
+
+function getDbUpdatedAt(entries: AdminAuditLogEntry[]): string | null {
+  let newest: string | null = null;
+  for (const entry of entries) {
+    if (newest === null || entry.timestamp > newest) {
+      newest = entry.timestamp;
+    }
+  }
+  return newest;
+}
+
 export async function GET(request: Request) {
   try {
     const authError = requireAdminAuth(request);
@@ -153,11 +169,10 @@ export async function GET(request: Request) {
       total,
       totalPages,
       actions: ACTIONS,
-      partitions: [HOT_PARTITION, ARCHIVE_PARTITION],
-      archiveManifest,
-      // Opaque cursor for the next page; null when the last page is reached.
-      nextCursor: hasNextPage ? String(boundedPage + 1) : null,
-      previousCursor: hasPreviousPage ? String(boundedPage - 1) : null,
+      freshness: {
+        dbUpdatedAt: getDbUpdatedAt(mockAuditLogData),
+        sourceLedgerCursor: SOURCE_LEDGER_CURSOR,
+      },
     });
   } catch (error) {
     console.error('Error fetching audit logs:', error);

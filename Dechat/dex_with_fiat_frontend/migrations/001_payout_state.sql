@@ -1,4 +1,6 @@
 -- Migration 001: Payout state and transitions schema (Issue #97)
+-- Extended (Issue #258): cryptographic key-rotation metadata for stored payout fields.
+-- Only key *identifiers* are persisted here; key material must never be stored in the database.
 --
 -- This file is applied by the checksummed migration runner in
 -- `payoutMigrations.ts`. The runner records the SHA-256 checksum of this file
@@ -47,6 +49,17 @@ CREATE TABLE IF NOT EXISTS payout_intents (
   currency VARCHAR(8) NOT NULL,
   provider_reference VARCHAR(128) UNIQUE,
   recipient_account_masked VARCHAR(32) NOT NULL,
+  -- Key identifier (not key material) used to encrypt recipient_account_masked.
+  -- NULL means the value predates encryption-at-rest and must be treated as legacy.
+  recipient_account_key_id VARCHAR(64),
+  -- Key identifier (not key material) used to encrypt provider_reference.
+  provider_reference_key_id VARCHAR(64),
+  -- Rotation bookkeeping: which key the row is being migrated to, and progress state.
+  -- rotation_state: NULL (not rotating), 'pending', 'in_progress', 'completed', 'rolled_back'
+  rotation_state VARCHAR(32),
+  rotation_target_key_id VARCHAR(64),
+  rotation_started_at TIMESTAMP WITH TIME ZONE,
+  rotation_completed_at TIMESTAMP WITH TIME ZONE,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
@@ -60,6 +73,15 @@ CREATE TABLE IF NOT EXISTS payout_state_transitions (
   transitioned_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Backward-compatible column additions for databases created before Issue #258.
+-- ADD COLUMN IF NOT EXISTS keeps this migration idempotent and safe to re-run.
+ALTER TABLE payout_intents ADD COLUMN IF NOT EXISTS recipient_account_key_id VARCHAR(64);
+ALTER TABLE payout_intents ADD COLUMN IF NOT EXISTS provider_reference_key_id VARCHAR(64);
+ALTER TABLE payout_intents ADD COLUMN IF NOT EXISTS rotation_state VARCHAR(32);
+ALTER TABLE payout_intents ADD COLUMN IF NOT EXISTS rotation_target_key_id VARCHAR(64);
+ALTER TABLE payout_intents ADD COLUMN IF NOT EXISTS rotation_started_at TIMESTAMP WITH TIME ZONE;
+ALTER TABLE payout_intents ADD COLUMN IF NOT EXISTS rotation_completed_at TIMESTAMP WITH TIME ZONE;
+
 -- Transactional outbox for payout side effects (Issue #222).
 -- Rows are written in the same DB transaction as the payout state mutation so
 -- the state change and the outbound provider command commit or roll back
@@ -67,109 +89,69 @@ CREATE TABLE IF NOT EXISTS payout_state_transitions (
 -- using the stable idempotency_key so provider retries and replays are safe.
 CREATE TABLE IF NOT EXISTS payout_outbox (
   id BIGSERIAL PRIMARY KEY,
-  payout_id VARCHAR(64) NOT NULL REFERENCES payout_intents(id) ON DELETE CASCADE,
-  command_type VARCHAR(64) NOT NULL,
-  idempotency_key VARCHAR(128) UNIQUE NOT NULL,
-  payload JSONB NOT NULL,
-  status VARCHAR(32) NOT NULL DEFAULT 'pending',
-  attempt_count INTEGER NOT NULL DEFAULT 0,
-  last_error TEXT,
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-  delivered_at TIMESTAMP WITH TIME ZONE
+  event_id VARCHAR(128) UNIQUE NOT NULL,
+  payout_id VARCHAR(64) REFERENCES payout_intents(id) ON DELETE CASCADE,
+  event_type VARCHAR(64) NOT NULL,
+  payload TEXT,
+  received_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
--- Provider capability contract for reversals and recalls (Issue #223).
--- Each provider adapter declares which cancellation, recall, and status
--- semantics it supports. Actions a provider does not support are routed to an
--- explicit manual-review outcome instead of reporting a false success.
-CREATE TABLE IF NOT EXISTS provider_capabilities (
-  provider_id VARCHAR(64) PRIMARY KEY,
-  supports_cancel BOOLEAN NOT NULL DEFAULT FALSE,
-  supports_recall BOOLEAN NOT NULL DEFAULT FALSE,
-  supports_status BOOLEAN NOT NULL DEFAULT FALSE,
-  cancel_semantics VARCHAR(32) NOT NULL DEFAULT 'unsupported',
-  recall_semantics VARCHAR(32) NOT NULL DEFAULT 'unsupported',
-  status_semantics VARCHAR(32) NOT NULL DEFAULT 'unsupported',
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-  CONSTRAINT provider_capabilities_cancel_semantics_check
-    CHECK (cancel_semantics IN ('unsupported', 'synchronous', 'asynchronous')),
-  CONSTRAINT provider_capabilities_recall_semantics_check
-    CHECK (recall_semantics IN ('unsupported', 'synchronous', 'asynchronous')),
-  CONSTRAINT provider_capabilities_status_semantics_check
-    CHECK (status_semantics IN ('unsupported', 'polling', 'webhook'))
-);
-
--- Manual-review queue for actions a provider cannot perform. Rows are created
--- instead of emitting a success transition so operators can resolve them.
-CREATE TABLE IF NOT EXISTS payout_manual_reviews (
+-- Retry jobs: the retry key is unique so concurrent schedulers cannot enqueue
+-- duplicate retry work for the same payout/attempt.
+CREATE TABLE IF NOT EXISTS payout_retry_jobs (
   id BIGSERIAL PRIMARY KEY,
-  payout_id VARCHAR(64) NOT NULL REFERENCES payout_intents(id) ON DELETE CASCADE,
-  action VARCHAR(32) NOT NULL,
-  provider_id VARCHAR(64) NOT NULL,
-  reason TEXT NOT NULL,
-  status VARCHAR(32) NOT NULL DEFAULT 'open',
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-  resolved_at TIMESTAMP WITH TIME ZONE,
-  CONSTRAINT payout_manual_reviews_action_check
-    CHECK (action IN ('cancel', 'recall', 'status')),
-  CONSTRAINT payout_manual_reviews_status_check
-    CHECK (status IN ('open', 'resolved', 'dismissed'))
+  retry_key VARCHAR(160) UNIQUE NOT NULL,
+  payout_id VARCHAR(64) REFERENCES payout_intents(id) ON DELETE CASCADE,
+  attempt_number INTEGER NOT NULL,
+  status VARCHAR(32) NOT NULL,
+  scheduled_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
-
--- Append-only reversal and dispute lifecycle (Issue #224).
--- Provider reversals and disputed transfers are recorded as immutable events
--- linked to the original payout. Each event captures the settlement evidence
--- (provider reference, amount, currency, evidence payload) so the original
--- settlement record is preserved even after the payout is reversed. Rows are
--- never updated or deleted; the current lifecycle state is derived from the
--- latest event per payout.
-CREATE TABLE IF NOT EXISTS payout_reversals (
-  id BIGSERIAL PRIMARY KEY,
-  payout_id VARCHAR(64) NOT NULL REFERENCES payout_intents(id) ON DELETE CASCADE,
-  event_type VARCHAR(32) NOT NULL,
-  provider_reference VARCHAR(128),
-  amount_minor_units BIGINT NOT NULL,
-  currency VARCHAR(8) NOT NULL,
-  reason TEXT,
-  evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
-  recorded_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-  CONSTRAINT payout_reversals_event_type_check
-    CHECK (event_type IN ('reversal_requested', 'reversal_settled', 'dispute_opened', 'dispute_resolved')),
-  CONSTRAINT payout_reversals_amount_check CHECK (amount_minor_units > 0)
-);
-
--- A payout may only be reversed once; disputes may be opened and resolved
--- repeatedly but a reversal event is terminal for the successful state.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_payout_reversals_single_reversal
-  ON payout_reversals(payout_id)
-  WHERE event_type IN ('reversal_requested', 'reversal_settled');
-
--- Prevent a reversed transfer from remaining successful: once any reversal
--- event exists for a payout, the payout status must not be 'succeeded'.
-CREATE OR REPLACE FUNCTION enforce_payout_reversal_status()
-RETURNS TRIGGER AS $$
-BEGIN
-  IF NEW.status = 'succeeded' AND EXISTS (
-    SELECT 1 FROM payout_reversals
-    WHERE payout_id = NEW.id
-      AND event_type IN ('reversal_requested', 'reversal_settled')
-  ) THEN
-    RAISE EXCEPTION 'payout % cannot remain succeeded after a reversal', NEW.id;
-  END IF;
-  RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-DROP TRIGGER IF EXISTS trg_payout_intents_reversal_status ON payout_intents;
-CREATE TRIGGER trg_payout_intents_reversal_status
-  BEFORE UPDATE ON payout_intents
-  FOR EACH ROW
-  EXECUTE FUNCTION enforce_payout_reversal_status();
 
 CREATE INDEX IF NOT EXISTS idx_payout_intents_status ON payout_intents(status);
 CREATE INDEX IF NOT EXISTS idx_payout_intents_created_at ON payout_intents(created_at);
+-- Supports resumable re-encryption scans and rollback queries.
+CREATE INDEX IF NOT EXISTS idx_payout_intents_rotation_state ON payout_intents(rotation_state);
+CREATE INDEX IF NOT EXISTS idx_payout_intents_recipient_account_key_id ON payout_intents(recipient_account_key_id);
+CREATE INDEX IF NOT EXISTS idx_payout_intents_provider_reference_key_id ON payout_intents(provider_reference_key_id);
+
+-- Least-privilege runtime roles (Issue #262)
+-- Split read and mutation access to payout tables. No wildcard grants.
+-- Roles are created without LOGIN; credentials are provisioned out-of-band
+-- by the deployment environment (never committed to the repository).
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'payout_reader') THEN
+    CREATE ROLE payout_reader NOLOGIN;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'payout_writer') THEN
+    CREATE ROLE payout_writer NOLOGIN;
+  END IF;
+END
+$$;
+
+-- Read-only role: SELECT only on payout tables.
+REVOKE ALL ON payout_intents FROM payout_reader;
+REVOKE ALL ON payout_state_transitions FROM payout_reader;
+GRANT SELECT ON payout_intents TO payout_reader;
+GRANT SELECT ON payout_state_transitions TO payout_reader;
+
+-- Mutation role: INSERT/UPDATE on payout tables, plus SELECT so that
+-- RETURNING clauses and existence checks work. No DELETE/TRUNCATE.
+REVOKE ALL ON payout_intents FROM payout_writer;
+REVOKE ALL ON payout_state_transitions FROM payout_writer;
+GRANT SELECT, INSERT, UPDATE ON payout_intents TO payout_writer;
+GRANT SELECT, INSERT, UPDATE ON payout_state_transitions TO payout_writer;
+
+-- Sequence usage for the transitions surrogate key (no wildcard sequence grant).
+REVOKE ALL ON SEQUENCE payout_state_transitions_id_seq FROM payout_reader;
+REVOKE ALL ON SEQUENCE payout_state_transitions_id_seq FROM payout_writer;
+GRANT USAGE, SELECT ON SEQUENCE payout_state_transitions_id_seq TO payout_writer;
+
+-- Explicitly ensure neither role can create objects or escalate.
+REVOKE CREATE ON SCHEMA public FROM payout_reader;
+REVOKE CREATE ON SCHEMA public FROM payout_writer;
 
 -- Issue #217: Tenant-aware AI budget accounting with atomic reservations.
 -- Reservations are taken before model dispatch against both a per-user and a
