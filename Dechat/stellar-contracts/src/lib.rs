@@ -12,6 +12,8 @@ pub mod network_matrix;
 // ── Constants ─────────────────────────────────────────────────────────────
 pub const MIN_TTL: u32 = 518_400; // ~30 days
 pub const MAX_TTL: u32 = 535_680; // ~31 days
+pub const MAX_WITHDRAWAL_QUEUE_DEPTH: u64 = 100;
+pub const MAX_ESCROW_MIGRATION_BATCH_SIZE: u32 = 25;
 const MAX_REFERENCE_LEN: u32 = 64;
 const MAX_SIGNERS: u32 = 20;
 const WINDOW_LEDGERS: u32 = 17_280; // ~24 hours
@@ -81,6 +83,9 @@ pub enum Error {
     LimitCapCannotBeLowered = 319,
     RateLimitExceeded = 320,
     DepositRateLimitExceeded = 321,
+    TokenDepositsDisabled = 322,
+    TokenNotRetirable = 323,
+    InvalidPageSize = 324,
 
     // --- 400 series: Funds & Balances ---
     InsufficientFunds = 401,
@@ -93,6 +98,7 @@ pub enum Error {
     WithdrawalLocked = 502,
     OperatorDailyLimitExceeded = 503,
     QueueIndexMigrationRequired = 504,
+    QueueLimitReached = 505,
 
     // --- 600 series: Governance & Timelock ---
     ActionNotQueued = 601,
@@ -114,11 +120,14 @@ pub enum Error {
     OracleConfidenceTooLow = 708,
     OracleConfigInvalid = 709,
     FiatConversionOverflow = 710,
+    OracleUnavailable = 711,
 
     // --- 800 series: Quota & Migration ---
     WithdrawalQuotaExceeded = 801,
     MigrationAlreadyComplete = 802,
     BatchOperationFailed = 803,
+    MigrationInvalidState = 804,
+    MigrationSchemaMismatch = 805,
 
     // --- 900 series: Replay Protection ---
     InvalidNonce = 901,
@@ -146,10 +155,44 @@ pub enum Error {
     CancellationNotApproved = 1203,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TokenRetirementReadiness {
+    pub deposits_enabled: bool,
+    pub total_liabilities: i128,
+    pub net_deposited: i128,
+    pub fee_remainder: i128,
+    pub escrow_migration_complete: bool,
+    pub can_remove: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum OracleReadStatus {
+    Unconfigured = 0,
+    Unavailable = 1,
+    Missing = 2,
+    FutureDated = 3,
+    Stale = 4,
+    LowConfidence = 5,
+    Valid = 6,
+    InvalidPrice = 7,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OracleHealth {
+    pub status: OracleReadStatus,
+    pub oracle: Option<Address>,
+    pub observed_at: Option<u32>,
+    pub current_ledger: u32,
+}
+
 // ── Models ────────────────────────────────────────────────────────────────
 pub const AUDIT_SCHEMA_VERSION: u32 = 1;
 pub const MAX_AUDIT_PAGE_SIZE: u32 = 100;
-pub const MAX_QUEUE_MIGRATION_PAGE_SIZE: u32 = 25;
+pub const MAX_QUEUE_MIGRATION_PAGE_SIZE: u32 = MAX_ESCROW_MIGRATION_BATCH_SIZE;
 const MAX_RECEIPTS_TO_EXTEND_PER_WITHDRAWAL: u32 = 100;
 pub const MAX_RISK_TIER: u32 = 32;
 pub const RISK_AGING_INTERVAL_LEDGERS: u32 = 720;
@@ -953,6 +996,21 @@ pub struct TokenRegisteredEvent {
 
 #[contractevent]
 #[derive(Clone, Debug)]
+pub struct TokenDepositsEnabledEvent {
+    pub version: u32,
+    pub token: Address,
+    pub enabled: bool,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct TokenRemovedEvent {
+    pub version: u32,
+    pub token: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
 pub struct TokenPrecisionMigratedEvent {
     pub version: u32,
     pub token: Address,
@@ -1254,6 +1312,8 @@ pub enum DataKey {
     Paused,
     Token, // Default token
     TokenRegistry(Address),
+    TokenDepositsEnabled(Address),
+    TokenRetired(Address),
     AllowlistEnabled,
     Allowed(Address),
     LastDeposit(Address),
@@ -1364,6 +1424,16 @@ pub enum DataKey {
     TierQueueTail(u32),
     TierQueueNext(u64),
     TierQueuePrev(u64),
+    GlobalFiatLimit,
+    FiatWindowLedgers,
+    OracleConfig(Address),
+    TokenPrecision(Address),
+    ReceiptToken(BytesN<32>),
+    FeeBps,
+    FeeRemainder(Address),
+    FeeGrossDeposited(Address),
+    FeeNetDeposited(Address),
+    GlobalDailyVolume,
 }
 
 pub const ORACLE_PRICE_DECIMALS: i128 = 10_000_000;
@@ -1500,6 +1570,9 @@ impl FiatBridge {
         env.storage()
             .persistent()
             .set(&DataKey::TokenRegistry(token.clone()), &config);
+        env.storage()
+            .instance()
+            .set(&DataKey::TokenDepositsEnabled(token.clone()), &true);
         if !env
             .storage()
             .persistent()
@@ -1735,6 +1808,14 @@ impl FiatBridge {
             .persistent()
             .get(&DataKey::TokenRegistry(token.clone()))
             .ok_or(Error::TokenNotWhitelisted)?;
+        if !env
+            .storage()
+            .instance()
+            .get(&DataKey::TokenDepositsEnabled(token.clone()))
+            .unwrap_or(true)
+        {
+            return Err(Error::TokenDepositsDisabled);
+        }
         // ── Issue #113: minimum deposit floor ────────────────────────────
         let min_deposit: i128 = env
             .storage()
@@ -1751,7 +1832,16 @@ impl FiatBridge {
 
         // Fiat Limit & Slippage
         let actual_price = Self::validate_fiat_limit(&env, &from, &token, amount)?;
-        Self::check_slippage(&env, expected_price, actual_price, max_slippage)?;
+        let slippage_price = if expected_price > 0 && actual_price == 0 {
+            let observation = Self::validated_oracle_observation(&env, &token)?;
+            if observation.price <= 0 {
+                return Err(Error::OraclePriceInvalid);
+            }
+            observation.price
+        } else {
+            actual_price
+        };
+        Self::check_slippage(&env, expected_price, slippage_price, max_slippage)?;
 
         // Transfer and verify balance deltas (Issue #25)
         let token_client = token::Client::new(&env, &token);
@@ -2105,13 +2195,11 @@ impl FiatBridge {
         memo_hash: Option<BytesN<32>>,
         risk_tier: u32,
     ) -> Result<u64, Error> {
-        env.storage().instance().extend_ttl(MIN_TTL, MAX_TTL);
         Self::validate_memo_hash(&env, &memo_hash)?;
         let _admin = Self::require_admin(&env)?;
         Self::require_not_paused_scope(&env, PauseScope::WithdrawalRequests)?;
         Self::require_queue_index_ready(&env)?;
         Self::require_circuit_breaker_clear(&env)?;
-        Self::check_and_increment_rate_limit(&env, Symbol::new(&env, "withdrawal_request"))?;
 
         if amount <= 0 {
             return Err(Error::ZeroAmount);
@@ -2119,6 +2207,31 @@ impl FiatBridge {
         if risk_tier > MAX_RISK_TIER {
             return Err(Error::InvalidAmount);
         }
+
+        let queue_len: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::WithdrawQueueLen)
+            .unwrap_or(0);
+        if queue_len >= MAX_WITHDRAWAL_QUEUE_DEPTH {
+            return Err(Error::QueueLimitReached);
+        }
+        let next_queue_len = queue_len.checked_add(1).ok_or(Error::Overflow)?;
+        let request_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextRequestID)
+            .unwrap_or(0);
+        let next_request_id = request_id.checked_add(1).ok_or(Error::Overflow)?;
+        let tier_len: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TierQueueLen(risk_tier))
+            .unwrap_or(0);
+        let next_tier_len = tier_len.checked_add(1).ok_or(Error::Overflow)?;
+
+        env.storage().instance().extend_ttl(MIN_TTL, MAX_TTL);
+        Self::check_and_increment_rate_limit(&env, Symbol::new(&env, "withdrawal_request"))?;
 
         // Denylist
         Self::reject_if_denied(&env, &to)?;
@@ -2152,22 +2265,11 @@ impl FiatBridge {
             .instance()
             .get(&DataKey::WithdrawalExpiryWindow)
             .unwrap_or(WITHDRAWAL_EXPIRY_WINDOW_LEDGERS);
-        let request_id: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::NextRequestID)
-            .unwrap_or(0);
         let request_min_ttl = MIN_TTL
             .saturating_add(lock_period)
             .saturating_add(cooldown_ledgers)
             .saturating_add(expiry_window);
         Self::extend_receipt_ttls_for_depositor(&env, &to, request_min_ttl);
-
-        let queue_len: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::WithdrawQueueLen)
-            .unwrap_or(0);
 
         let request = WithdrawRequest {
             to: to.clone(),
@@ -2203,22 +2305,17 @@ impl FiatBridge {
         );
         env.storage()
             .instance()
-            .set(&DataKey::NextRequestID, &(request_id + 1));
+            .set(&DataKey::NextRequestID, &next_request_id);
 
         env.storage()
             .instance()
-            .set(&DataKey::WithdrawQueueLen, &(queue_len + 1));
+            .set(&DataKey::WithdrawQueueLen, &next_queue_len);
 
         // ── Issue #226: per-tier queue tracking ──────────────────────────
-        let tier_len: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TierQueueLen(risk_tier))
-            .unwrap_or(0);
         Self::append_withdrawal_queue_index(&env, request_id, risk_tier, request_min_ttl);
         env.storage()
             .instance()
-            .set(&DataKey::TierQueueLen(risk_tier), &(tier_len + 1));
+            .set(&DataKey::TierQueueLen(risk_tier), &next_tier_len);
         let mut config: TokenConfig = env
             .storage()
             .persistent()
@@ -2364,17 +2461,11 @@ impl FiatBridge {
 
         // Slippage check
         if expected_price > 0 {
-            let oracle_addr: Address = env
-                .storage()
-                .instance()
-                .get(&DataKey::Oracle)
-                .ok_or(Error::OracleNotSet)?;
-            let oracle = crate::oracle::OracleClient::new(&env, &oracle_addr);
-            let actual_price = oracle.get_price(&request.token).unwrap_or(0);
-            if actual_price <= 0 {
+            let observation = Self::validated_oracle_observation(&env, &request.token)?;
+            if observation.price <= 0 {
                 return Err(Error::OraclePriceInvalid);
             }
-            Self::check_slippage(&env, expected_price, actual_price, max_slippage)?;
+            Self::check_slippage(&env, expected_price, observation.price, max_slippage)?;
         }
 
         // Commit the nonce advance now that every validation check has passed.
@@ -3226,6 +3317,147 @@ impl FiatBridge {
         }
     }
 
+    /// Enable or disable new deposits for a registered token.
+    /// Disabling deposits does not block withdrawals or settlement of queued liabilities.
+    pub fn set_token_deposits_enabled(
+        env: Env,
+        token: Address,
+        enabled: bool,
+    ) -> Result<(), Error> {
+        let _admin = Self::require_admin(&env)?;
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::TokenRegistry(token.clone()))
+        {
+            return Err(Error::TokenNotWhitelisted);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::TokenDepositsEnabled(token.clone()), &enabled);
+        TokenDepositsEnabledEvent {
+            version: EVENT_VERSION,
+            token,
+            enabled,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Return bounded, constant-time readiness data for retiring a token.
+    pub fn get_token_retirement_readiness(
+        env: Env,
+        token: Address,
+    ) -> Result<TokenRetirementReadiness, Error> {
+        let config: TokenConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TokenRegistry(token.clone()))
+            .ok_or(Error::TokenNotWhitelisted)?;
+        let net_deposited = config
+            .total_deposited
+            .checked_sub(config.total_withdrawn)
+            .ok_or(Error::InternalError)?;
+        if config.total_deposited < 0
+            || config.total_withdrawn < 0
+            || config.total_liabilities < 0
+            || config.total_deposited < config.total_withdrawn
+        {
+            return Err(Error::InternalError);
+        }
+        let deposits_enabled = env
+            .storage()
+            .instance()
+            .get(&DataKey::TokenDepositsEnabled(token.clone()))
+            .unwrap_or(true);
+        let accrued_fees: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FeeVault(token.clone()))
+            .unwrap_or(0);
+        let fee_remainder: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FeeRemainder(token.clone()))
+            .unwrap_or(0);
+        if accrued_fees < 0 || fee_remainder < 0 {
+            return Err(Error::InternalError);
+        }
+        let default_token: Option<Address> = env.storage().instance().get(&DataKey::Token);
+        let receipt_counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ReceiptCounter)
+            .unwrap_or(0);
+        let escrow_version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::EscrowStorageVersion)
+            .unwrap_or(0);
+        let escrow_migration_complete =
+            receipt_counter == 0 || escrow_version == ESCROW_STORAGE_VERSION;
+        let can_remove = !deposits_enabled
+            && config.total_liabilities == 0
+            && net_deposited == 0
+            && accrued_fees == 0
+            && fee_remainder == 0
+            && escrow_migration_complete
+            && default_token.as_ref() != Some(&token);
+
+        Ok(TokenRetirementReadiness {
+            deposits_enabled,
+            total_liabilities: config.total_liabilities,
+            net_deposited,
+            fee_remainder,
+            escrow_migration_complete,
+            can_remove,
+        })
+    }
+
+    /// Remove a retired token only after all deposited value and queued liabilities have settled.
+    pub fn remove_token(env: Env, token: Address) -> Result<(), Error> {
+        let _admin = Self::require_admin(&env)?;
+        let readiness = Self::get_token_retirement_readiness(env.clone(), token.clone())?;
+        if !readiness.can_remove {
+            return Err(Error::TokenNotRetirable);
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::TokenRegistry(token.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::TokenPrecision(token.clone()));
+        if let Some(slot) = env
+            .storage()
+            .persistent()
+            .get::<_, u64>(&DataKey::TokenAllowlistEnabledSlot(token.clone()))
+        {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::TokenAllowlistEnabledIndex(slot));
+            env.storage()
+                .persistent()
+                .remove(&DataKey::TokenAllowlistEnabledSlot(token.clone()));
+        }
+        env.storage()
+            .instance()
+            .remove(&DataKey::TokenDepositsEnabled(token.clone()));
+        env.storage()
+            .instance()
+            .remove(&DataKey::TokenAllowlistEnabled(token.clone()));
+        env.storage()
+            .persistent()
+            .set(&DataKey::TokenRetired(token.clone()), &true);
+        TokenRemovedEvent {
+            version: EVENT_VERSION,
+            token,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
     /// Registers an asset in the token registry with an initial deposit/withdrawal limit and validated precision.
     ///
     /// # Supported Stellar Token Behavior (SEP-41)
@@ -3247,8 +3479,18 @@ impl FiatBridge {
         }
 
         let reg_key = DataKey::TokenRegistry(token.clone());
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::TokenRetired(token.clone()))
+        {
+            return Err(Error::AlreadyInitialized);
+        }
         if let Some(existing) = env.storage().persistent().get::<_, TokenConfig>(&reg_key) {
-            if existing.total_deposited > 0 || existing.total_withdrawn > 0 {
+            if existing.total_deposited > 0
+                || existing.total_withdrawn > 0
+                || existing.total_liabilities > 0
+            {
                 return Err(Error::AlreadyInitialized);
             }
         }
@@ -3265,6 +3507,9 @@ impl FiatBridge {
             total_liabilities: 0,
         };
         env.storage().persistent().set(&reg_key, &config);
+        env.storage()
+            .instance()
+            .set(&DataKey::TokenDepositsEnabled(token.clone()), &true);
         env.storage()
             .persistent()
             .set(&DataKey::TokenPrecision(token.clone()), &decimals);
@@ -3557,104 +3802,87 @@ impl FiatBridge {
         token: &Address,
         amount: i128,
     ) -> Result<i128, Error> {
-        let user_fiat_limit = env.storage().instance().get::<_, i128>(&DataKey::FiatLimit);
-        let global_fiat_limit = env
+        let user_limit = env
             .storage()
             .instance()
-            .get::<_, i128>(&DataKey::GlobalFiatLimit);
-
-        let user_active = user_fiat_limit.is_some() && user_fiat_limit != Some(0);
-        let global_active = global_fiat_limit.is_some() && global_fiat_limit != Some(0);
-
-        if !user_active && !global_active {
+            .get::<_, i128>(&DataKey::FiatLimit)
+            .unwrap_or(0);
+        let global_limit = env
+            .storage()
+            .instance()
+            .get::<_, i128>(&DataKey::GlobalFiatLimit)
+            .unwrap_or(0);
+        if user_limit <= 0 && global_limit <= 0 {
             return Ok(0);
         }
 
-        let oracle_addr = env.storage().instance().get::<_, Address>(&DataKey::Oracle);
-        let price = if let Some(addr) = oracle_addr {
-            // Issue #7: reject stale, future-dated, missing or low-confidence
-            // observations before the price is used for any limit decision.
-            let observation = crate::oracle::validate_observation(env, &addr, token)?;
-            observation.price
-        } else {
-            return Err(Error::OracleNotSet);
-        };
+        let observation = Self::validated_oracle_observation(env, token)?;
+        if observation.price <= 0 {
+            return Err(Error::OraclePriceInvalid);
+        }
+        let usd_cents = crate::math::convert_token_to_fiat(
+            amount,
+            observation.price,
+            Self::get_token_precision_internal(env, token),
+            ORACLE_PRICE_DECIMALS,
+        )?;
+        let current_ledger = env.ledger().sequence();
+        let window_ledgers = Self::get_fiat_window(env.clone());
 
-        if let Some(limit) = fiat_limit {
-            // Issue #8: single checked token→fiat conversion helper.
-            let usd_cents = crate::math::convert_token_to_fiat(
-                amount,
-                price,
-                TOKEN_DECIMALS,
-                ORACLE_PRICE_DECIMALS,
-            )?;
-            let curr = env.ledger().sequence();
+        if user_limit > 0 {
             let mut vol: UserDailyVolume = env
                 .storage()
                 .instance()
                 .get(&DataKey::UserDailyVolume(depositor.clone()))
                 .unwrap_or(UserDailyVolume {
                     usd_cents: 0,
-                    window_start: curr,
+                    window_start: current_ledger,
                 });
 
-                if curr >= vol.window_start.saturating_add(window_ledgers) {
-                    vol.usd_cents = 0;
-                    vol.window_start = curr;
-                }
-                if vol
-                    .usd_cents
-                    .checked_add(usd_cents)
-                    .ok_or(Error::Overflow)?
-                    > limit
-                {
-                    return Err(Error::ExceedsFiatLimit);
-                }
-                vol.usd_cents = vol
-                    .usd_cents
-                    .checked_add(usd_cents)
-                    .ok_or(Error::Overflow)?;
-                env.storage()
-                    .instance()
-                    .set(&DataKey::UserDailyVolume(depositor.clone()), &vol);
+            if current_ledger >= vol.window_start.saturating_add(window_ledgers) {
+                vol.usd_cents = 0;
+                vol.window_start = current_ledger;
             }
+            let next_volume = vol
+                .usd_cents
+                .checked_add(usd_cents)
+                .ok_or(Error::Overflow)?;
+            if next_volume > user_limit {
+                return Err(Error::ExceedsFiatLimit);
+            }
+            vol.usd_cents = next_volume;
+            env.storage()
+                .instance()
+                .set(&DataKey::UserDailyVolume(depositor.clone()), &vol);
         }
 
-        // Check and accumulate global volume cap
-        if let Some(global_limit) = global_fiat_limit {
-            if global_limit > 0 {
-                let mut global_vol: GlobalDailyVolume = env
-                    .storage()
-                    .instance()
-                    .get(&DataKey::GlobalDailyVolume)
-                    .unwrap_or(GlobalDailyVolume {
-                        usd_cents: 0,
-                        window_start: curr,
-                    });
-
-                if curr >= global_vol.window_start.saturating_add(window_ledgers) {
-                    global_vol.usd_cents = 0;
-                    global_vol.window_start = curr;
-                }
-                if global_vol
-                    .usd_cents
-                    .checked_add(usd_cents)
-                    .ok_or(Error::Overflow)?
-                    > global_limit
-                {
-                    return Err(Error::ExceedsFiatLimit);
-                }
-                global_vol.usd_cents = global_vol
-                    .usd_cents
-                    .checked_add(usd_cents)
-                    .ok_or(Error::Overflow)?;
-                env.storage()
-                    .instance()
-                    .set(&DataKey::GlobalDailyVolume, &global_vol);
+        if global_limit > 0 {
+            let mut global_vol: GlobalDailyVolume = env
+                .storage()
+                .instance()
+                .get(&DataKey::GlobalDailyVolume)
+                .unwrap_or(GlobalDailyVolume {
+                    usd_cents: 0,
+                    window_start: current_ledger,
+                });
+            if current_ledger >= global_vol.window_start.saturating_add(window_ledgers) {
+                global_vol.usd_cents = 0;
+                global_vol.window_start = current_ledger;
             }
+            let next_volume = global_vol
+                .usd_cents
+                .checked_add(usd_cents)
+                .ok_or(Error::Overflow)?;
+            if next_volume > global_limit {
+                return Err(Error::ExceedsFiatLimit);
+            }
+            global_vol.usd_cents = next_volume;
+            env.storage()
+                .instance()
+                .set(&DataKey::GlobalDailyVolume, &global_vol);
         }
 
-        Ok(price)
+        Ok(observation.price)
     }
 
     /// Configure the freshness and confidence bounds enforced on oracle
@@ -3682,6 +3910,114 @@ impl FiatBridge {
     /// Return the configured `(max_age_ledgers, min_confidence)` for `oracle`.
     pub fn get_oracle_config(env: Env, oracle: Address) -> Option<(u32, u32)> {
         env.storage().instance().get(&DataKey::OracleConfig(oracle))
+    }
+
+    /// Read oracle health without making the price payload part of the view response.
+    /// The call is bounded to one configured oracle and returns stale, missing, and
+    /// unavailable states instead of trapping the diagnostic query.
+    pub fn get_oracle_health(env: Env, token: Address) -> OracleHealth {
+        let current_ledger = env.ledger().sequence();
+        let oracle: Option<Address> = env.storage().instance().get(&DataKey::Oracle);
+        let Some(oracle) = oracle else {
+            return OracleHealth {
+                status: OracleReadStatus::Unconfigured,
+                oracle: None,
+                observed_at: None,
+                current_ledger,
+            };
+        };
+        let (observed_at, result) =
+            Self::read_oracle_observation(&env, &oracle, &token, current_ledger);
+        OracleHealth {
+            status: result
+                .as_ref()
+                .map(|_| OracleReadStatus::Valid)
+                .unwrap_or_else(|error| Self::oracle_read_status(error)),
+            oracle: Some(oracle),
+            observed_at,
+            current_ledger,
+        }
+    }
+
+    fn oracle_read_status(error: &crate::oracle::OracleError) -> OracleReadStatus {
+        match error {
+            crate::oracle::OracleError::OracleMissing => OracleReadStatus::Missing,
+            crate::oracle::OracleError::OracleStale => OracleReadStatus::Stale,
+            crate::oracle::OracleError::OracleFutureDated => OracleReadStatus::FutureDated,
+            crate::oracle::OracleError::OracleLowConfidence => OracleReadStatus::LowConfidence,
+            crate::oracle::OracleError::OracleUnavailable => OracleReadStatus::Unavailable,
+            crate::oracle::OracleError::OraclePriceInvalid => OracleReadStatus::InvalidPrice,
+        }
+    }
+
+    fn map_oracle_error(error: crate::oracle::OracleError) -> Error {
+        match error {
+            crate::oracle::OracleError::OracleMissing => Error::OracleObservationMissing,
+            crate::oracle::OracleError::OracleStale => Error::OracleObservationStale,
+            crate::oracle::OracleError::OracleFutureDated => {
+                Error::OracleObservationFutureDated
+            }
+            crate::oracle::OracleError::OracleLowConfidence => Error::OracleConfidenceTooLow,
+            crate::oracle::OracleError::OracleUnavailable => Error::OracleUnavailable,
+            crate::oracle::OracleError::OraclePriceInvalid => Error::OraclePriceInvalid,
+        }
+    }
+
+    fn read_oracle_observation(
+        env: &Env,
+        oracle: &Address,
+        token: &Address,
+        current_ledger: u32,
+    ) -> (
+        Option<u32>,
+        Result<crate::oracle::OracleObservation, crate::oracle::OracleError>,
+    ) {
+        let client = crate::oracle::ObservationOracleClient::new(env, oracle);
+        let observation = match client.try_get_observation(token) {
+            Ok(Ok(observation)) => observation,
+            Ok(Err(_)) | Err(_) => {
+                crate::oracle::emit_unavailable_diagnostic(env, oracle, current_ledger);
+                return (
+                    None,
+                    Err(crate::oracle::OracleError::OracleUnavailable),
+                );
+            }
+        };
+        let observed_at = observation.as_ref().map(|value| value.recorded_at);
+        let (max_age_ledgers, min_confidence) = env
+            .storage()
+            .instance()
+            .get::<_, (u32, u32)>(&DataKey::OracleConfig(oracle.clone()))
+            .unwrap_or_else(|| {
+                let defaults = crate::oracle::OracleConfig::default();
+                (defaults.max_age_ledgers, defaults.min_confidence as u32)
+            });
+        let config = crate::oracle::OracleConfig {
+            max_age_ledgers,
+            min_confidence: min_confidence as i128,
+        };
+        let result = crate::oracle::validate_observation(
+            env,
+            oracle,
+            observation,
+            &config,
+            current_ledger,
+        );
+        (observed_at, result)
+    }
+
+    fn validated_oracle_observation(
+        env: &Env,
+        token: &Address,
+    ) -> Result<crate::oracle::OracleObservation, Error> {
+        let oracle: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Oracle)
+            .ok_or(Error::OracleNotSet)?;
+        let (_, result) =
+            Self::read_oracle_observation(env, &oracle, token, env.ledger().sequence());
+        result.map_err(Self::map_oracle_error)
     }
 
     fn enforce_daily_deposit_limit(
@@ -5958,8 +6294,14 @@ impl FiatBridge {
             .get(&DataKey::EscrowStorageVersion)
             .unwrap_or(0);
 
-        if current_version >= ESCROW_STORAGE_VERSION {
+        if current_version > ESCROW_STORAGE_VERSION {
+            return Err(Error::MigrationSchemaMismatch);
+        }
+        if current_version == ESCROW_STORAGE_VERSION {
             return Err(Error::MigrationAlreadyComplete);
+        }
+        if batch_size == 0 || batch_size > MAX_ESCROW_MIGRATION_BATCH_SIZE {
+            return Err(Error::InvalidPageSize);
         }
 
         let cursor: u64 = env
@@ -5973,50 +6315,132 @@ impl FiatBridge {
             .instance()
             .get(&DataKey::ReceiptCounter)
             .unwrap_or(0);
+        if cursor > receipt_counter {
+            return Err(Error::MigrationInvalidState);
+        }
+        let default_token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .ok_or(Error::MigrationInvalidState)?;
+        Self::check_invariants(&env, &default_token)
+            .map_err(|_| Error::MigrationInvalidState)?;
 
-        let mut migrated_count: u32 = 0;
+        let end = cursor
+            .checked_add(batch_size as u64)
+            .ok_or(Error::Overflow)?
+            .min(receipt_counter);
+
+        // Validate the complete batch before writing any migrated records.
+        // Soroban rolls back failed invocations, and this preflight also keeps
+        // malformed legacy state from advancing the migration cursor.
         let mut current_id = cursor;
-
-        while current_id < receipt_counter && migrated_count < batch_size {
-            // Look up the hash stored at this sequential index position
-            if let Some(receipt_hash) = env
+        while current_id < end {
+            let receipt_hash: BytesN<32> = env
                 .storage()
                 .temporary()
-                .get::<_, BytesN<32>>(&DataKey::ReceiptIndex(current_id))
-            {
-                if let Some(receipt) = env
+                .get(&DataKey::ReceiptIndex(current_id))
+                .ok_or(Error::MigrationInvalidState)?;
+            let receipt: Receipt = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Receipt(receipt_hash.clone()))
+                .ok_or(Error::MigrationInvalidState)?;
+            if receipt.id != receipt_hash
+                || receipt.amount <= 0
+                || env
                     .storage()
                     .persistent()
-                    .get::<_, Receipt>(&DataKey::Receipt(receipt_hash))
-                {
-                    let escrow = EscrowRecord {
-                        version: ESCROW_STORAGE_VERSION,
-                        depositor: receipt.depositor,
-                        token: env
-                            .storage()
-                            .instance()
-                            .get(&DataKey::Token)
-                            .unwrap_or_else(|| {
-                                Address::from_string(&soroban_sdk::String::from_str(&env, ""))
-                            }),
-                        amount: receipt.amount,
-                        ledger: receipt.ledger,
-                        migrated: true,
-                    };
-                    env.storage()
-                        .persistent()
-                        .set(&DataKey::EscrowRecord(current_id), &escrow);
-                    migrated_count += 1;
-                }
+                    .has(&DataKey::EscrowRecord(current_id))
+            {
+                return Err(Error::MigrationInvalidState);
             }
-            current_id += 1;
+            let token = env
+                .storage()
+                .persistent()
+                .get::<_, Address>(&DataKey::ReceiptToken(receipt_hash))
+                .unwrap_or_else(|| default_token.clone());
+            Self::check_invariants(&env, &token)
+                .map_err(|_| Error::MigrationInvalidState)?;
+            current_id = current_id.checked_add(1).ok_or(Error::Overflow)?;
+        }
+
+        let mut migrated_count: u32 = 0;
+        current_id = cursor;
+        while current_id < end {
+            let receipt_hash: BytesN<32> = env
+                .storage()
+                .temporary()
+                .get(&DataKey::ReceiptIndex(current_id))
+                .ok_or(Error::MigrationInvalidState)?;
+            let receipt: Receipt = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Receipt(receipt_hash.clone()))
+                .ok_or(Error::MigrationInvalidState)?;
+            let token = env
+                .storage()
+                .persistent()
+                .get::<_, Address>(&DataKey::ReceiptToken(receipt_hash))
+                .unwrap_or_else(|| default_token.clone());
+            let escrow = EscrowRecord {
+                version: ESCROW_STORAGE_VERSION,
+                depositor: receipt.depositor,
+                token: token.clone(),
+                amount: receipt.amount,
+                ledger: receipt.ledger,
+                migrated: true,
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::EscrowRecord(current_id), &escrow);
+            migrated_count = migrated_count.checked_add(1).ok_or(Error::Overflow)?;
+            current_id = current_id.checked_add(1).ok_or(Error::Overflow)?;
+        }
+
+        // Postconditions are checked before the cursor or version is committed.
+        current_id = cursor;
+        while current_id < end {
+            let receipt_hash: BytesN<32> = env
+                .storage()
+                .temporary()
+                .get(&DataKey::ReceiptIndex(current_id))
+                .ok_or(Error::MigrationInvalidState)?;
+            let receipt: Receipt = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Receipt(receipt_hash.clone()))
+                .ok_or(Error::MigrationInvalidState)?;
+            let token = env
+                .storage()
+                .persistent()
+                .get::<_, Address>(&DataKey::ReceiptToken(receipt_hash))
+                .unwrap_or_else(|| default_token.clone());
+            let migrated: EscrowRecord = env
+                .storage()
+                .persistent()
+                .get(&DataKey::EscrowRecord(current_id))
+                .ok_or(Error::MigrationInvalidState)?;
+            if migrated.version != ESCROW_STORAGE_VERSION
+                || !migrated.migrated
+                || migrated.amount <= 0
+                || migrated.amount != receipt.amount
+                || migrated.depositor != receipt.depositor
+                || migrated.ledger != receipt.ledger
+                || migrated.token != token
+            {
+                return Err(Error::MigrationInvalidState);
+            }
+            Self::check_invariants(&env, &token)
+                .map_err(|_| Error::MigrationInvalidState)?;
+            current_id = current_id.checked_add(1).ok_or(Error::Overflow)?;
         }
 
         env.storage()
             .instance()
-            .set(&DataKey::EscrowMigrationCursor, &current_id);
+            .set(&DataKey::EscrowMigrationCursor, &end);
 
-        if current_id >= receipt_counter {
+        if end >= receipt_counter {
             env.storage()
                 .instance()
                 .set(&DataKey::EscrowStorageVersion, &ESCROW_STORAGE_VERSION);
@@ -6024,7 +6448,7 @@ impl FiatBridge {
 
         MigrationEvent {
             version: EVENT_VERSION,
-            cursor: current_id,
+            cursor: end,
             migrated_count,
         }
         .publish(&env);
@@ -6072,9 +6496,35 @@ impl FiatBridge {
             return Err(Error::InvalidAmount);
         }
 
+        let cursor = u64::try_from(cursor).map_err(|_| Error::InvalidAmount)?;
+        let receipt_counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ReceiptCounter)
+            .unwrap_or(0);
+        let current_cursor: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::EscrowMigrationCursor)
+            .unwrap_or(0);
+        if cursor < current_cursor
+            || cursor > receipt_counter
+            || cursor - current_cursor > MAX_ESCROW_MIGRATION_BATCH_SIZE as u64
+        {
+            return Err(Error::MigrationInvalidState);
+        }
+        for id in current_cursor..cursor {
+            if !env
+                .storage()
+                .persistent()
+                .has(&DataKey::EscrowRecord(id))
+            {
+                return Err(Error::MigrationInvalidState);
+            }
+        }
         env.storage()
             .instance()
-            .set(&DataKey::EscrowMigrationCursor, &(cursor as u64));
+            .set(&DataKey::EscrowMigrationCursor, &cursor);
         Ok(())
     }
 
@@ -6676,6 +7126,14 @@ impl FiatBridge {
         if cursor != saved_cursor {
             return Err(Error::InvalidAmount);
         }
+        let total_requests: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextRequestID)
+            .unwrap_or(0);
+        if cursor > total_requests {
+            return Err(Error::MigrationInvalidState);
+        }
         if !env
             .storage()
             .instance()
@@ -6703,25 +7161,22 @@ impl FiatBridge {
             }
         }
 
-        let total_requests: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::NextRequestID)
-            .unwrap_or(0);
         let mut current_id = cursor;
         let mut scanned = 0;
         while current_id < total_requests && scanned < limit {
-            if let Some(mut request) = env
+            if let Some(request) = env
                 .storage()
                 .persistent()
                 .get::<_, WithdrawRequest>(&DataKey::WithdrawQueue(current_id))
             {
                 if request.risk_tier > MAX_RISK_TIER {
-                    request.risk_tier = MAX_RISK_TIER;
-                    env.storage()
-                        .persistent()
-                        .set(&DataKey::WithdrawQueue(current_id), &request);
+                    return Err(Error::MigrationInvalidState);
                 }
+                if request.amount <= 0 {
+                    return Err(Error::MigrationInvalidState);
+                }
+                Self::check_invariants(&env, &request.token)
+                    .map_err(|_| Error::MigrationInvalidState)?;
                 let min_ttl = Self::withdrawal_request_index_ttl(&env, current_id);
                 env.storage().persistent().extend_ttl(
                     &DataKey::WithdrawQueue(current_id),
@@ -6750,18 +7205,30 @@ impl FiatBridge {
                     .instance()
                     .get(&DataKey::WithdrawQueueLen)
                     .unwrap_or(0);
+                let next_queue_len = queue_len.checked_add(1).ok_or(Error::Overflow)?;
                 env.storage()
                     .instance()
-                    .set(&DataKey::WithdrawQueueLen, &(queue_len + 1));
+                    .set(&DataKey::WithdrawQueueLen, &next_queue_len);
                 let tier_len: u64 = env
                     .storage()
                     .instance()
                     .get(&DataKey::TierQueueLen(request.risk_tier))
                     .unwrap_or(0);
+                let next_tier_len = tier_len.checked_add(1).ok_or(Error::Overflow)?;
                 env.storage().instance().set(
                     &DataKey::TierQueueLen(request.risk_tier),
-                    &(tier_len + 1),
+                    &next_tier_len,
                 );
+                Self::check_invariants(&env, &request.token)
+                    .map_err(|_| Error::MigrationInvalidState)?;
+            } else if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<_, LiabilityAuditView>(&DataKey::LiabilityRecord(current_id))
+            {
+                if record.status == LiabilityAuditStatus::Queued {
+                    return Err(Error::MigrationInvalidState);
+                }
             }
             current_id += 1;
             scanned += 1;
@@ -7096,34 +7563,63 @@ impl FiatBridge {
     /// Its original execution deadline remains unchanged.
     pub fn migrate_upgrade_proposal_timing(env: Env) -> Result<(), Error> {
         let _admin = Self::require_admin(&env)?;
-        if env
+        let proposal: Option<UpgradeProposal> = env
             .storage()
             .instance()
-            .has(&DataKey::UpgradeProposalTiming)
-        {
-            return Ok(());
-        }
-        if let Some(proposal) = env
+            .get(&DataKey::UpgradeProposal);
+        let existing_timing: Option<UpgradeProposalTiming> = env
             .storage()
             .instance()
-            .get::<_, UpgradeProposal>(&DataKey::UpgradeProposal)
-        {
-            let delay = env
-                .storage()
-                .instance()
-                .get(&DataKey::UpgradeDelay)
-                .unwrap_or(MIN_UPGRADE_DELAY);
-            env.storage().instance().set(
-                &DataKey::UpgradeProposalTiming,
-                &UpgradeProposalTiming {
+            .get(&DataKey::UpgradeProposalTiming);
+
+        match (proposal, existing_timing) {
+            (None, None) => Ok(()),
+            (None, Some(_)) => Err(Error::MigrationInvalidState),
+            (Some(proposal), Some(timing)) => {
+                if timing.wasm_hash != proposal.wasm_hash
+                    || timing.executable_after != proposal.executable_after
+                    || timing.delay < MIN_UPGRADE_DELAY
+                    || timing.proposed_at.checked_add(timing.delay)
+                        != Some(timing.executable_after)
+                {
+                    return Err(Error::MigrationInvalidState);
+                }
+                Ok(())
+            }
+            (Some(proposal), None) => {
+                let delay: u32 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::UpgradeDelay)
+                    .unwrap_or(MIN_UPGRADE_DELAY);
+                if delay < MIN_UPGRADE_DELAY {
+                    return Err(Error::MigrationInvalidState);
+                }
+                let proposed_at = proposal
+                    .executable_after
+                    .checked_sub(delay)
+                    .ok_or(Error::MigrationInvalidState)?;
+                let timing = UpgradeProposalTiming {
                     wasm_hash: proposal.wasm_hash,
-                    proposed_at: proposal.executable_after.saturating_sub(delay),
+                    proposed_at,
                     delay,
                     executable_after: proposal.executable_after,
-                },
-            );
+                };
+                env.storage().instance().set(
+                    &DataKey::UpgradeProposalTiming,
+                    &timing,
+                );
+                let stored: UpgradeProposalTiming = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::UpgradeProposalTiming)
+                    .ok_or(Error::MigrationInvalidState)?;
+                if stored != timing {
+                    return Err(Error::MigrationInvalidState);
+                }
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     // ── Issue #100: Multi-sig Logic ──────────────────────────────────────────
@@ -8299,6 +8795,12 @@ mod test_get_deploy_config_hash_invariants;
 
 #[cfg(test)]
 mod test_issue_1437;
+
+#[cfg(test)]
+mod test_issue_184_oracle_read_availability;
+
+#[cfg(test)]
+mod test_issue_185_token_lifecycle;
 
 #[cfg(test)]
 mod test_migrate_escrow_invariants;

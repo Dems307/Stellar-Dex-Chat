@@ -38,6 +38,11 @@ Generated from the `Error` enum in `Dechat/stellar-contracts/src/lib.rs`.
 | 317 | `InvalidAmount` | Constraints | Amount format is invalid |
 | 318 | `SelfReferentialAddress` | Constraints | Address cannot reference itself |
 | 319 | `LimitCapCannotBeLowered` | Constraints | Cannot lower an existing limit cap |
+| 320 | `RateLimitExceeded` | Constraints | Operation rate limit exceeded |
+| 321 | `DepositRateLimitExceeded` | Constraints | Deposit rate limit exceeded |
+| 322 | `TokenDepositsDisabled` | Constraints | New deposits are disabled for this registered token |
+| 323 | `TokenNotRetirable` | Constraints | Token has not met the safe-removal conditions |
+| 324 | `InvalidPageSize` | Constraints | Requested page or migration batch size is outside its allowed range |
 | 401 | `InsufficientFunds` | Funds & Balances | Contract balance insufficient for withdrawal |
 | 402 | `NoFeesToWithdraw` | Funds & Balances | No accumulated fees to withdraw |
 | 403 | `TransferFailed` | Funds & Balances | Token transfer failed or returned unexpected balance delta |
@@ -46,6 +51,7 @@ Generated from the `Error` enum in `Dechat/stellar-contracts/src/lib.rs`.
 | 502 | `WithdrawalLocked` | Withdrawal Queue | Withdrawal request not yet unlocked |
 | 503 | `OperatorDailyLimitExceeded` | Withdrawal Queue | Operator's daily withdrawal limit exceeded |
 | 504 | `QueueIndexMigrationRequired` | Withdrawal Queue | Existing queue index backfill must complete before queue mutations |
+| 505 | `QueueLimitReached` | Withdrawal Queue | Maximum active withdrawal queue depth reached |
 | 601 | `ActionNotQueued` | Governance & Timelock | Admin action is not queued |
 | 602 | `ActionNotReady` | Governance & Timelock | Admin action timelock has not elapsed |
 | 603 | `InactivityThresholdNotReached` | Governance & Timelock | Inactivity threshold not yet reached |
@@ -57,9 +63,18 @@ Generated from the `Error` enum in `Dechat/stellar-contracts/src/lib.rs`.
 | 702 | `OraclePriceInvalid` | External Services | Oracle returned invalid price |
 | 703 | `SlippageExceeded` | External Services | Slippage exceeds configured maximum |
 | 704 | `SlippageTooHigh` | External Services | Slippage is too high for this operation |
+| 705 | `OracleObservationMissing` | External Services | Oracle returned no observation |
+| 706 | `OracleObservationStale` | External Services | Oracle observation exceeds its configured age |
+| 707 | `OracleObservationFutureDated` | External Services | Oracle observation is dated after the current ledger |
+| 708 | `OracleConfidenceTooLow` | External Services | Oracle observation confidence is below the configured threshold |
+| 709 | `OracleConfigInvalid` | External Services | Oracle freshness or confidence configuration is invalid |
+| 710 | `FiatConversionOverflow` | External Services | Oracle-based fiat conversion overflowed |
+| 711 | `OracleUnavailable` | External Services | Oracle invocation failed or its response could not be decoded |
 | 801 | `WithdrawalQuotaExceeded` | Quota & Migration | Withdrawal quota exceeded |
 | 802 | `MigrationAlreadyComplete` | Quota & Migration | Data migration already complete |
 | 803 | `BatchOperationFailed` | Quota & Migration | Batch operation failed |
+| 804 | `MigrationInvalidState` | Quota & Migration | Migration preconditions or postconditions failed |
+| 805 | `MigrationSchemaMismatch` | Quota & Migration | Stored schema version is newer than this migration supports |
 | 901 | `InvalidNonce` | Replay Protection | Provided nonce is ahead of current (jump) |
 | 902 | `StaleNonce` | Replay Protection | Provided nonce is behind current (replay) |
 | 1001 | `BelowMinimum` | Deposit Floor | Amount below minimum deposit |
@@ -79,12 +94,12 @@ Generated from the `Error` enum in `Dechat/stellar-contracts/src/lib.rs`.
 | Arithmetic | 10 | Overflow prevention |
 | Initialization | 101–104 | Contract lifecycle and state |
 | Authorization | 201–207 | Access control and permissions |
-| Constraints | 301–319 | Amount, limit, and business rule validation |
+| Constraints | 301–324 | Amount, limit, and business rule validation |
 | Funds & Balances | 401–402 | Balance checks and fee management |
-| Withdrawal Queue | 501–504 | Withdrawal request processing |
+| Withdrawal Queue | 501–505 | Withdrawal request processing |
 | Governance & Timelock | 601–607 | Admin actions and contract upgrades |
-| External Services | 701–704 | Oracle and pricing integration |
-| Quota & Migration | 801–803 | Quota enforcement and data migrations |
+| External Services | 701–711 | Oracle and pricing integration |
+| Quota & Migration | 801–805 | Quota enforcement and data migrations |
 | Replay Protection | 901–902 | Nonce validation |
 | Deposit Floor | 1001 | Minimum deposit enforcement |
 | Multi-sig | 1101–1108 | Multi-signature proposal and execution |
