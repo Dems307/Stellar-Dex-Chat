@@ -111,6 +111,34 @@ Regression tests for wallet permissions should cover:
 - Denial of a signing request: no partially authenticated session and a recoverable UI state.
 - Recovery: retrying after a denial requests the permission again cleanly.
 
+## Pre-submit revalidation
+
+Wallet state can change between the moment a user confirms a transaction and the moment we hand the signed XDR to the network. To prevent submitting a transaction that no longer matches what the user approved, we revalidate the wallet session immediately before submission.
+
+### Revalidation contract
+
+After the user confirms and immediately before submitting the XDR, re-read the following values and compare them against the snapshot captured at confirmation time:
+
+1. **Active wallet address** — the connected account's public key.
+2. **Network passphrase** — the network the wallet is currently pointed at.
+3. **Configured contract identity** — the contract ID the app is configured to interact with.
+
+If any of these values changed since confirmation, abort the submission and surface a recoverable, user-facing message explaining that the wallet or network changed and the action must be retried. Do not submit the stale XDR.
+
+### Financial safety
+
+Revalidation is a read-only check and never mutates on-chain state. It complements, and must not weaken, existing safeguards: double-submit protection still prevents duplicate submissions, and audit logging still records the attempt and the abort reason. An aborted submission leaves the app in a recoverable state so the user can re-confirm against the current wallet and network.
+
+### Testing revalidation
+
+Regression tests for pre-submit revalidation should cover:
+
+- The normal path: unchanged address, passphrase, and contract identity submit successfully.
+- A changed wallet address aborts submission with a recoverable message.
+- A changed network passphrase aborts submission with a recoverable message.
+- A changed contract identity aborts submission with a recoverable message.
+- Recovery: after an abort, re-confirming against the current wallet and network submits cleanly.
+
 ## Commit and PR conventions
 
 - Keep changes scoped to the issue you are solving.

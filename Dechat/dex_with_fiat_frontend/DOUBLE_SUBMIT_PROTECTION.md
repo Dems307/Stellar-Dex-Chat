@@ -99,6 +99,45 @@ Location: `src/components/StellarFiatModal.tsx`
 - Added `isTxProcessing` to button disabled condition
 - Idempotency key passed to transaction handlers
 
+## Pre-Submit Wallet Revalidation
+
+Location: `src/components/StellarFiatModal.tsx`
+
+Double-submit protection alone is not enough for signed XDR submissions: the
+wallet account, network, or configured contract identity can change between the
+moment the user confirms and the moment the signed transaction is submitted.
+Immediately before submission the flow re-reads the live values and compares
+them against the snapshot captured at confirmation time.
+
+**Revalidated values:**
+
+- Active wallet address (public key)
+- Network passphrase
+- Configured contract identity (contract ID)
+
+**Behavior:**
+
+- The snapshot is captured when the user confirms the action.
+- After confirmation and immediately before submitting the XDR, the current
+  wallet address, network passphrase, and contract identity are re-read.
+- If any of the three values differs from the snapshot, submission is aborted
+  before any XDR is sent.
+- The abort surfaces a recoverable, user-facing message explaining which value
+  changed and asking the user to review and retry. No transaction is submitted
+  and no funds move.
+- Existing financial safety properties are preserved: the idempotent action
+  guard still prevents double submission, and the abort path is logged for
+  audit/diagnostics without recording secrets or real user data.
+
+**Intentional behavior change:** a submission that would previously have
+proceeded with a stale wallet/network/contract identity now aborts with a
+recoverable error instead of being sent. This is the intended safety property.
+
+**Regression tests** cover the normal path (values unchanged, submission
+proceeds) and the failure/recovery edge cases (wallet address changed, network
+passphrase changed, contract identity changed), asserting that submission is
+aborted and a recoverable message is shown.
+
 ## Diagnostic Logging
 
 All suppressed duplicate attempts are logged to the console with the following information:
@@ -164,6 +203,17 @@ Tests cover:
 - ✅ Idempotency key inclusion in API requests
 - ✅ Button disabled state while processing
 - ✅ Logging suppressed attempts
+
+**Pre-Submit Revalidation Tests**
+Location: `src/components/__tests__/StellarFiatModal.revalidation.test.tsx`
+
+Tests cover:
+
+- ✅ Normal path: unchanged wallet/network/contract submits the XDR
+- ✅ Aborts with recoverable message when wallet address changed
+- ✅ Aborts with recoverable message when network passphrase changed
+- ✅ Aborts with recoverable message when contract identity changed
+- ✅ No XDR submitted on abort
 
 ## API Integration
 
