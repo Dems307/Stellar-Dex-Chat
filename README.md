@@ -70,3 +70,6 @@ MIT
 
 <!-- handsoff-issue-205 -->
 - #205: Make transaction status subscriptions reconnect without gaps
+
+<!-- handsoff-issue-192 -->
+- #192: Show a decoded transaction effects diff before wallet signing
