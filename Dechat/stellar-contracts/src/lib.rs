@@ -89,6 +89,7 @@ pub enum Error {
     NoFeesToWithdraw = 402,
     TransferFailed = 403,
     ShortTransfer = 404,
+    TokenInterfaceInvalid = 405,
 
     // --- 500 series: Withdrawal Queue ---
     RequestNotFound = 501,
@@ -116,6 +117,9 @@ pub enum Error {
     OracleConfidenceTooLow = 708,
     OracleConfigInvalid = 709,
     FiatConversionOverflow = 710,
+    OracleSpreadTooWide = 711,
+    OracleSourcesInsufficient = 712,
+    OracleVersionUnsupported = 713,
 
     // --- 800 series: Quota & Migration ---
     WithdrawalQuotaExceeded = 801,
@@ -407,6 +411,28 @@ pub struct UserDailyVolume {
 pub struct GlobalDailyVolume {
     pub usd_cents: i128,
     pub window_start: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FiatValuation {
+    pub version: u32,
+    pub token_amount: i128,
+    pub token_decimals: u32,
+    pub oracle: Address,
+    pub adapter_version: u32,
+    pub price: i128,
+    pub usd_cents: i128,
+    pub ledger: u32,
+    pub fiat_window_ledgers: u32,
+    pub user_limit: Option<i128>,
+    pub user_volume_before: Option<i128>,
+    pub user_volume_after: Option<i128>,
+    pub user_window_start: Option<u32>,
+    pub global_limit: Option<i128>,
+    pub global_volume_before: Option<i128>,
+    pub global_volume_after: Option<i128>,
+    pub global_window_start: Option<u32>,
 }
 
 #[contracttype]
@@ -1139,6 +1165,15 @@ pub struct CircuitBreakerTrippedEvent {
 
 #[contractevent]
 #[derive(Clone, Debug)]
+pub struct OracleFailureTripEvent {
+    pub version: u32,
+    pub oracle: Address,
+    pub token: Address,
+    pub ledger: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
 pub struct SetWithdrawOperatorEvent {
     pub version: u32,
     pub operator: Address,
@@ -1332,8 +1367,16 @@ pub enum DataKey {
     EmergencyRecoveryAddress,
     SchemaVersion,
     Oracle,
+    OracleAdapterEnabled,
+    OracleConfig(Address),
     FiatLimit,
     UserDailyVolume(Address),
+    GlobalDailyVolume,
+    GlobalFiatLimit,
+    FiatWindowLedgers,
+    ReceiptFiatValuation(BytesN<32>),
+    CircuitBreakerOracleFailure,
+    CircuitBreakerOracleFailureToken,
     AntiSandwichDelay,
     WithdrawalQuota,
     UserDailyDeposit(Address, Address),
@@ -1424,6 +1467,7 @@ pub enum DataKey {
 }
 
 pub const ORACLE_PRICE_DECIMALS: i128 = 10_000_000;
+const ORACLE_DECIMAL_PLACES: u32 = 7;
 
 // ── Contract ──────────────────────────────────────────────────────────────
 /// # FiatBridge Smart Contract
@@ -1807,14 +1851,27 @@ impl FiatBridge {
         Self::enforce_daily_deposit_limit(&env, &from, &token, amount, &config)?;
 
         // Fiat Limit & Slippage
-        let actual_price = Self::validate_fiat_limit(&env, &from, &token, amount)?;
+        let token_client = token::Client::new(&env, &token);
+        let token_decimals = token_client
+            .try_decimals()
+            .map_err(|_| Error::TokenInterfaceInvalid)?;
+        if token_decimals > crate::math::MAX_DECIMALS {
+            return Err(Error::TokenInterfaceInvalid);
+        }
+        let (actual_price, fiat_valuation) =
+            Self::validate_fiat_limit(&env, &from, &token, amount, token_decimals)?;
         Self::check_slippage(&env, expected_price, actual_price, max_slippage)?;
 
         // Transfer and verify balance deltas (Issue #25)
-        let token_client = token::Client::new(&env, &token);
-        let balance_before = token_client.balance(&env.current_contract_address());
-        token_client.transfer(&from, env.current_contract_address(), &amount);
-        let balance_after = token_client.balance(&env.current_contract_address());
+        let balance_before = token_client
+            .try_balance(&env.current_contract_address())
+            .map_err(|_| Error::TokenInterfaceInvalid)?;
+        token_client
+            .try_transfer(&from, env.current_contract_address(), &amount)
+            .map_err(|_| Error::TransferFailed)?;
+        let balance_after = token_client
+            .try_balance(&env.current_contract_address())
+            .map_err(|_| Error::TokenInterfaceInvalid)?;
         let received = balance_after
             .checked_sub(balance_before)
             .ok_or(Error::TransferFailed)?;
@@ -1868,6 +1925,12 @@ impl FiatBridge {
             .set(&DataKey::Receipt(receipt_id.clone().into()), &receipt);
         // Store sequential index → hash mapping for enumeration (e.g. migration)
         let receipt_hash: BytesN<32> = receipt_id.clone().into();
+        if let Some(valuation) = fiat_valuation {
+            env.storage().persistent().set(
+                &DataKey::ReceiptFiatValuation(receipt_hash.clone()),
+                &valuation,
+            );
+        }
         let index_key = DataKey::ReceiptIndex(receipt_counter);
         env.storage().temporary().set(&index_key, &receipt_hash);
         env.storage()
@@ -1985,7 +2048,9 @@ impl FiatBridge {
             .ok_or(Error::NotInitialized)?;
 
         let token_client = token::Client::new(env, token_addr);
-        let balance = token_client.balance(&env.current_contract_address());
+        let balance = token_client
+            .try_balance(&env.current_contract_address())
+            .map_err(|_| Error::TokenInterfaceInvalid)?;
 
         if config.total_deposited < config.total_withdrawn {
             return Err(Error::InternalError);
@@ -2079,14 +2144,24 @@ impl FiatBridge {
         Self::reject_if_denied(&env, &to)?;
 
         let client = token::Client::new(&env, &token);
-        let recipient_before = client.balance(&to);
-        let balance_before = client.balance(&env.current_contract_address());
+        let recipient_before = client
+            .try_balance(&to)
+            .map_err(|_| Error::TokenInterfaceInvalid)?;
+        let balance_before = client
+            .try_balance(&env.current_contract_address())
+            .map_err(|_| Error::TokenInterfaceInvalid)?;
         if amount > balance_before {
             return Err(Error::InsufficientFunds);
         }
-        client.transfer(&env.current_contract_address(), &to, &amount);
-        let balance_after = client.balance(&env.current_contract_address());
-        let recipient_after = client.balance(&to);
+        client
+            .try_transfer(&env.current_contract_address(), &to, &amount)
+            .map_err(|_| Error::TransferFailed)?;
+        let balance_after = client
+            .try_balance(&env.current_contract_address())
+            .map_err(|_| Error::TokenInterfaceInvalid)?;
+        let recipient_after = client
+            .try_balance(&to)
+            .map_err(|_| Error::TokenInterfaceInvalid)?;
         let contract_spent = balance_before
             .checked_sub(balance_after)
             .ok_or(Error::TransferFailed)?;
@@ -2400,7 +2475,9 @@ impl FiatBridge {
         }
 
         let token_client = token::Client::new(&env, &request.token);
-        let balance = token_client.balance(&env.current_contract_address());
+        let balance = token_client
+            .try_balance(&env.current_contract_address())
+            .map_err(|_| Error::TokenInterfaceInvalid)?;
 
         let execute_amount = match partial_amount {
             Some(amt) => {
@@ -2442,15 +2519,25 @@ impl FiatBridge {
             nonce,
         )?;
 
-        let recipient_before = token_client.balance(&request.to);
-        let balance_before = token_client.balance(&env.current_contract_address());
-        token_client.transfer(
-            &env.current_contract_address(),
-            &request.to,
-            &execute_amount,
-        );
-        let balance_after = token_client.balance(&env.current_contract_address());
-        let recipient_after = token_client.balance(&request.to);
+        let recipient_before = token_client
+            .try_balance(&request.to)
+            .map_err(|_| Error::TokenInterfaceInvalid)?;
+        let balance_before = token_client
+            .try_balance(&env.current_contract_address())
+            .map_err(|_| Error::TokenInterfaceInvalid)?;
+        token_client
+            .try_transfer(
+                &env.current_contract_address(),
+                &request.to,
+                &execute_amount,
+            )
+            .map_err(|_| Error::TransferFailed)?;
+        let balance_after = token_client
+            .try_balance(&env.current_contract_address())
+            .map_err(|_| Error::TokenInterfaceInvalid)?;
+        let recipient_after = token_client
+            .try_balance(&request.to)
+            .map_err(|_| Error::TokenInterfaceInvalid)?;
         let contract_spent = balance_before
             .checked_sub(balance_after)
             .ok_or(Error::TransferFailed)?;
@@ -3325,6 +3412,24 @@ impl FiatBridge {
         }
 
         env.storage().instance().set(&DataKey::Oracle, &oracle);
+        env.storage()
+            .instance()
+            .set(&DataKey::OracleAdapterEnabled, &false);
+        Ok(())
+    }
+
+    /// Configure an OracleAdapter using its versioned, multi-source result
+    /// interface. Unlike the compatibility oracle setter, this preserves
+    /// distinct spread, source-count, and version errors.
+    pub fn set_oracle_adapter(env: Env, oracle: Address) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        if oracle == admin || oracle == env.current_contract_address() {
+            return Err(Error::SelfReferentialAddress);
+        }
+        env.storage().instance().set(&DataKey::Oracle, &oracle);
+        env.storage()
+            .instance()
+            .set(&DataKey::OracleAdapterEnabled, &true);
         Ok(())
     }
 
@@ -3451,7 +3556,9 @@ impl FiatBridge {
 
         // Validate SEP-41 token interface by querying balance
         let token_client = token::Client::new(&env, &token);
-        let _ = token_client.balance(&env.current_contract_address());
+        let _ = token_client
+            .try_balance(&env.current_contract_address())
+            .map_err(|_| Error::TokenInterfaceInvalid)?;
 
         let config = TokenConfig {
             limit,
@@ -3752,15 +3859,6 @@ impl FiatBridge {
         }
         .publish(env);
 
-        // Issue #8: limit comparisons use the checked conversion helper so
-        // rounding is identical on every path.
-        let _ = crate::math::convert_token_to_fiat(
-            actual_price,
-            1,
-            ORACLE_PRICE_DECIMALS,
-            ORACLE_PRICE_DECIMALS,
-        )?;
-
         // Check slippage using cross-multiplication to avoid division errors.
         // We allow extra tolerance to account for ceiling division rounding in tests:
         // Reject if: (expected - actual) * 10_000 > 2 * max_slippage_bps * expected
@@ -3796,9 +3894,8 @@ impl FiatBridge {
     /// Queries price from the oracle and enforces 24-hour rolling fiat deposit caps.
     ///
     /// # Overflow Prevention & Safety Invariants
-    /// - **Fixed-Point Conversion**: Computes USD cents via [`crate::math::mul_div_floor`] with
-    ///   divisor `ORACLE_PRICE_DECIMALS / 100` ($10^5$), ensuring zero precision loss and intermediate
-    ///   multiplication safety.
+    /// - **Fixed-Point Conversion**: Converts using the token's declared decimals
+    ///   and floors the resulting USD fixed-point value to cents.
     /// - **Rolling Window Saturation**: Ledger window rollover is evaluated via
     ///   `curr >= vol.window_start + WINDOW_LEDGERS`, preventing premature window resets.
     /// - **Volume Accumulation Check**: Verifies `vol.usd_cents + usd_cents <= limit` before adding.
@@ -3810,7 +3907,7 @@ impl FiatBridge {
     /// * `amount` – Deposit amount in stroops.
     ///
     /// # Returns
-    /// * `Ok(i128)` – Realized token price from oracle in fixed-point units.
+    /// * `Ok((price, valuation))` – Accepted price and reproducible valuation record.
     ///
     /// # Errors
     /// * [`Error::OracleNotSet`] – If fiat limits are enabled but no oracle is configured.
@@ -3821,7 +3918,8 @@ impl FiatBridge {
         depositor: &Address,
         token: &Address,
         amount: i128,
-    ) -> Result<i128, Error> {
+        token_decimals: u32,
+    ) -> Result<(i128, Option<FiatValuation>), Error> {
         let user_fiat_limit = env.storage().instance().get::<_, i128>(&DataKey::FiatLimit);
         let global_fiat_limit = env
             .storage()
@@ -3832,28 +3930,72 @@ impl FiatBridge {
         let global_active = global_fiat_limit.is_some() && global_fiat_limit != Some(0);
 
         if !user_active && !global_active {
-            return Ok(0);
+            return Ok((0, None));
         }
 
-        let oracle_addr = env.storage().instance().get::<_, Address>(&DataKey::Oracle);
-        let price = if let Some(addr) = oracle_addr {
-            // Issue #7: reject stale, future-dated, missing or low-confidence
-            // observations before the price is used for any limit decision.
-            let observation = crate::oracle::validate_observation(env, &addr, token)?;
-            observation.price
+        let oracle_addr = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::Oracle)
+            .ok_or(Error::OracleNotSet)?;
+        let adapter_enabled: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::OracleAdapterEnabled)
+            .unwrap_or(false);
+        let price = if adapter_enabled {
+            crate::oracle::OracleAdapterClient::new(env, &oracle_addr)
+                .try_get_aggregated_price(token)
+                .map_err(|_| Error::OracleObservationMissing)?
+                .map_err(|error| match error {
+                    crate::oracle::OracleAdapterError::TooFewSources => {
+                        Error::OracleSourcesInsufficient
+                    }
+                    crate::oracle::OracleAdapterError::SpreadTooWide => Error::OracleSpreadTooWide,
+                    crate::oracle::OracleAdapterError::UnsupportedVersion => {
+                        Error::OracleVersionUnsupported
+                    }
+                    crate::oracle::OracleAdapterError::InvalidObservation => {
+                        Error::OraclePriceInvalid
+                    }
+                    crate::oracle::OracleAdapterError::ArithmeticOverflow => {
+                        Error::FiatConversionOverflow
+                    }
+                    crate::oracle::OracleAdapterError::InvalidConfig
+                    | crate::oracle::OracleAdapterError::NotInitialized => {
+                        Error::OracleConfigInvalid
+                    }
+                    _ => Error::OracleObservationMissing,
+                })?
         } else {
-            return Err(Error::OracleNotSet);
+            crate::oracle::OracleClient::new(env, &oracle_addr)
+                .try_get_price(token)
+                .map_err(|_| Error::OracleObservationMissing)?
+                .ok_or(Error::OracleObservationMissing)?
         };
+        if price <= 0 {
+            return Err(Error::OraclePriceInvalid);
+        }
 
-        if let Some(limit) = fiat_limit {
-            // Issue #8: single checked token→fiat conversion helper.
-            let usd_cents = crate::math::convert_token_to_fiat(
-                amount,
-                price,
-                TOKEN_DECIMALS,
-                ORACLE_PRICE_DECIMALS,
-            )?;
-            let curr = env.ledger().sequence();
+        let fiat_value = crate::math::convert_token_to_fiat(
+            amount,
+            token_decimals,
+            price,
+            ORACLE_DECIMAL_PLACES,
+        )
+        .map_err(|_| Error::FiatConversionOverflow)?;
+        let usd_cents = fiat_value / 100_000;
+        let curr = env.ledger().sequence();
+        let window_ledgers = env
+            .storage()
+            .instance()
+            .get::<_, u32>(&DataKey::FiatWindowLedgers)
+            .unwrap_or(WINDOW_LEDGERS);
+        let mut user_volume_before = None;
+        let mut user_volume_after = None;
+        let mut user_window_start = None;
+
+        if let Some(limit) = user_fiat_limit.filter(|limit| *limit > 0) {
             let mut vol: UserDailyVolume = env
                 .storage()
                 .instance()
@@ -3863,70 +4005,89 @@ impl FiatBridge {
                     window_start: curr,
                 });
 
-                if curr >= vol.window_start.saturating_add(window_ledgers) {
-                    vol.usd_cents = 0;
-                    vol.window_start = curr;
-                }
-                if vol
-                    .usd_cents
-                    .checked_add(usd_cents)
-                    .ok_or(Error::Overflow)?
-                    > limit
-                {
-                    return Err(Error::ExceedsFiatLimit);
-                }
-                vol.usd_cents = vol
-                    .usd_cents
-                    .checked_add(usd_cents)
-                    .ok_or(Error::Overflow)?;
-                env.storage()
-                    .instance()
-                    .set(&DataKey::UserDailyVolume(depositor.clone()), &vol);
+            if curr >= vol.window_start.saturating_add(window_ledgers) {
+                vol.usd_cents = 0;
+                vol.window_start = curr;
             }
+            user_volume_before = Some(vol.usd_cents);
+            user_window_start = Some(vol.window_start);
+            let new_volume = vol
+                .usd_cents
+                .checked_add(usd_cents)
+                .ok_or(Error::Overflow)?;
+            if new_volume > limit {
+                return Err(Error::ExceedsFiatLimit);
+            }
+            vol.usd_cents = new_volume;
+            user_volume_after = Some(new_volume);
+            env.storage()
+                .instance()
+                .set(&DataKey::UserDailyVolume(depositor.clone()), &vol);
         }
 
-        // Check and accumulate global volume cap
-        if let Some(global_limit) = global_fiat_limit {
-            if global_limit > 0 {
-                let mut global_vol: GlobalDailyVolume = env
-                    .storage()
-                    .instance()
-                    .get(&DataKey::GlobalDailyVolume)
-                    .unwrap_or(GlobalDailyVolume {
-                        usd_cents: 0,
-                        window_start: curr,
-                    });
-
-                if curr >= global_vol.window_start.saturating_add(window_ledgers) {
-                    global_vol.usd_cents = 0;
-                    global_vol.window_start = curr;
-                }
-                if global_vol
-                    .usd_cents
-                    .checked_add(usd_cents)
-                    .ok_or(Error::Overflow)?
-                    > global_limit
-                {
-                    return Err(Error::ExceedsFiatLimit);
-                }
-                global_vol.usd_cents = global_vol
-                    .usd_cents
-                    .checked_add(usd_cents)
-                    .ok_or(Error::Overflow)?;
-                env.storage()
-                    .instance()
-                    .set(&DataKey::GlobalDailyVolume, &global_vol);
+        let mut global_volume_before = None;
+        let mut global_volume_after = None;
+        let mut global_window_start = None;
+        if let Some(global_limit) = global_fiat_limit.filter(|limit| *limit > 0) {
+            let mut global_vol: GlobalDailyVolume = env
+                .storage()
+                .instance()
+                .get(&DataKey::GlobalDailyVolume)
+                .unwrap_or(GlobalDailyVolume {
+                    usd_cents: 0,
+                    window_start: curr,
+                });
+            if curr >= global_vol.window_start.saturating_add(window_ledgers) {
+                global_vol.usd_cents = 0;
+                global_vol.window_start = curr;
             }
+            global_volume_before = Some(global_vol.usd_cents);
+            global_window_start = Some(global_vol.window_start);
+            let new_volume = global_vol
+                .usd_cents
+                .checked_add(usd_cents)
+                .ok_or(Error::Overflow)?;
+            if new_volume > global_limit {
+                return Err(Error::ExceedsFiatLimit);
+            }
+            global_vol.usd_cents = new_volume;
+            global_volume_after = Some(new_volume);
+            env.storage()
+                .instance()
+                .set(&DataKey::GlobalDailyVolume, &global_vol);
         }
 
-        Ok(price)
+        Ok((
+            price,
+            Some(FiatValuation {
+                version: 1,
+                token_amount: amount,
+                token_decimals,
+                oracle: oracle_addr,
+                adapter_version: if adapter_enabled { 1 } else { 0 },
+                price,
+                usd_cents,
+                ledger: curr,
+                fiat_window_ledgers: window_ledgers,
+                user_limit: user_fiat_limit.filter(|limit| *limit > 0),
+                user_volume_before,
+                user_volume_after,
+                user_window_start,
+                global_limit: global_fiat_limit.filter(|limit| *limit > 0),
+                global_volume_before,
+                global_volume_after,
+                global_window_start,
+            }),
+        ))
     }
 
-    /// Configure the freshness and confidence bounds enforced on oracle
-    /// observations for `oracle` (Issue #7).
+    /// Store legacy freshness metadata for integrations. New integrations must
+    /// configure these bounds on `OracleAdapterConfig`, which enforces them
+    /// against each versioned source observation.
     ///
     /// * `max_age_ledgers` – maximum accepted observation age in ledgers.
     /// * `min_confidence`  – minimum accepted confidence, in basis points.
+    #[deprecated(note = "configure freshness and confidence in OracleAdapterConfig")]
     pub fn set_oracle_config(
         env: Env,
         oracle: Address,
@@ -3944,7 +4105,8 @@ impl FiatBridge {
         Ok(())
     }
 
-    /// Return the configured `(max_age_ledgers, min_confidence)` for `oracle`.
+    /// Return legacy `(max_age_ledgers, min_confidence)` metadata.
+    #[deprecated(note = "read the active OracleAdapterConfig instead")]
     pub fn get_oracle_config(env: Env, oracle: Address) -> Option<(u32, u32)> {
         env.storage().instance().get(&DataKey::OracleConfig(oracle))
     }
@@ -4916,7 +5078,9 @@ impl FiatBridge {
         let token_client = token::Client::new(&env, &token);
 
         // Issue #840: emit reconciliation event when vault ledger exceeds on-chain balance
-        let on_chain_balance = token_client.balance(&env.current_contract_address());
+        let on_chain_balance = token_client
+            .try_balance(&env.current_contract_address())
+            .map_err(|_| Error::TokenInterfaceInvalid)?;
         if current > on_chain_balance {
             FeeVaultReconciledEvent {
                 version: EVENT_VERSION,
@@ -4927,11 +5091,21 @@ impl FiatBridge {
             .publish(&env);
         }
 
-        let recipient_before = token_client.balance(&recipient);
-        let balance_before = token_client.balance(&env.current_contract_address());
-        token_client.transfer(&env.current_contract_address(), &recipient, &amount);
-        let balance_after = token_client.balance(&env.current_contract_address());
-        let recipient_after = token_client.balance(&recipient);
+        let recipient_before = token_client
+            .try_balance(&recipient)
+            .map_err(|_| Error::TokenInterfaceInvalid)?;
+        let balance_before = token_client
+            .try_balance(&env.current_contract_address())
+            .map_err(|_| Error::TokenInterfaceInvalid)?;
+        token_client
+            .try_transfer(&env.current_contract_address(), &recipient, &amount)
+            .map_err(|_| Error::TransferFailed)?;
+        let balance_after = token_client
+            .try_balance(&env.current_contract_address())
+            .map_err(|_| Error::TokenInterfaceInvalid)?;
+        let recipient_after = token_client
+            .try_balance(&recipient)
+            .map_err(|_| Error::TokenInterfaceInvalid)?;
         let contract_spent = balance_before
             .checked_sub(balance_after)
             .ok_or(Error::TransferFailed)?;
@@ -5002,11 +5176,21 @@ impl FiatBridge {
             }
 
             let token_client = token::Client::new(&env, &token);
-            let recipient_before = token_client.balance(&recipient);
-            let balance_before = token_client.balance(&contract);
-            token_client.transfer(&contract, &recipient, &current);
-            let balance_after = token_client.balance(&contract);
-            let recipient_after = token_client.balance(&recipient);
+            let recipient_before = token_client
+                .try_balance(&recipient)
+                .map_err(|_| Error::TokenInterfaceInvalid)?;
+            let balance_before = token_client
+                .try_balance(&contract)
+                .map_err(|_| Error::TokenInterfaceInvalid)?;
+            token_client
+                .try_transfer(&contract, &recipient, &current)
+                .map_err(|_| Error::TransferFailed)?;
+            let balance_after = token_client
+                .try_balance(&contract)
+                .map_err(|_| Error::TokenInterfaceInvalid)?;
+            let recipient_after = token_client
+                .try_balance(&recipient)
+                .map_err(|_| Error::TokenInterfaceInvalid)?;
             let contract_spent = balance_before
                 .checked_sub(balance_after)
                 .ok_or(Error::TransferFailed)?;
@@ -5091,12 +5275,16 @@ impl FiatBridge {
         }
 
         let token_client = token::Client::new(&env, &token);
-        let balance = token_client.balance(&env.current_contract_address());
+        let balance = token_client
+            .try_balance(&env.current_contract_address())
+            .map_err(|_| Error::TokenInterfaceInvalid)?;
         if amount > balance {
             return Err(Error::InsufficientFunds);
         }
 
-        token_client.transfer(&env.current_contract_address(), &to, &amount);
+        token_client
+            .try_transfer(&env.current_contract_address(), &to, &amount)
+            .map_err(|_| Error::TransferFailed)?;
 
         RescueEvent {
             version: EVENT_VERSION,
@@ -5149,7 +5337,8 @@ impl FiatBridge {
             .get(&DataKey::UserDailyVolume(user))?;
 
         let curr = env.ledger().sequence();
-        if curr >= vol.window_start.saturating_add(WINDOW_LEDGERS) {
+        let window_ledgers = Self::get_fiat_window(env.clone());
+        if curr >= vol.window_start.saturating_add(window_ledgers) {
             vol.usd_cents = 0;
             vol.window_start = curr;
         }
@@ -5284,6 +5473,15 @@ impl FiatBridge {
         env.storage()
             .persistent()
             .get(&DataKey::Receipt(receipt_hash))
+    }
+
+    pub fn get_receipt_fiat_valuation(
+        env: Env,
+        receipt_id: BytesN<32>,
+    ) -> Option<FiatValuation> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ReceiptFiatValuation(receipt_id))
     }
 
     pub fn get_withdrawal_request(env: Env, id: u64) -> Option<WithdrawRequest> {
@@ -5805,7 +6003,8 @@ impl FiatBridge {
             circuit_breaker_reset_window: env
                 .storage()
                 .instance()
-                .get(&DataKey::CircuitBreakerResetWindow)
+                .get::<_, u32>(&DataKey::CircuitBreakerResetWindow)
+                .filter(|window| *window != 0)
                 .unwrap_or(CIRCUIT_BREAKER_RESET_LEDGERS),
             multisig_threshold: env
                 .storage()
@@ -5941,8 +6140,8 @@ impl FiatBridge {
         Ok(())
     }
 
-    /// Returns `CircuitBreakerActive` if the circuit breaker is currently tripped
-    /// and the auto-reset window has not yet elapsed.
+    /// Returns `CircuitBreakerActive` while a trip is active. Oracle-failure
+    /// trips can only recover after an accepted oracle price is available.
     fn require_circuit_breaker_clear(env: &Env) -> Result<(), Error> {
         let tripped: bool = env
             .storage()
@@ -5952,22 +6151,81 @@ impl FiatBridge {
         if !tripped {
             return Ok(());
         }
-        let reset_window: u32 = env
+        let configured_reset_window: u32 = env
             .storage()
             .instance()
             .get(&DataKey::CircuitBreakerResetWindow)
             .unwrap_or(CIRCUIT_BREAKER_RESET_LEDGERS);
+        let reset_window = if configured_reset_window == 0 {
+            CIRCUIT_BREAKER_RESET_LEDGERS
+        } else {
+            configured_reset_window
+        };
         let tripped_at: u32 = env
             .storage()
             .instance()
             .get(&DataKey::CircuitBreakerTrippedAt)
             .unwrap_or(0);
         let curr = env.ledger().sequence();
-        if reset_window != u32::MAX && curr > tripped_at.saturating_add(reset_window) {
-            // Auto-reset window elapsed — allow through (the next mutation will clear it).
+        if reset_window != u32::MAX && curr >= tripped_at.saturating_add(reset_window) {
+            let oracle_failure: bool = env
+                .storage()
+                .instance()
+                .get(&DataKey::CircuitBreakerOracleFailure)
+                .unwrap_or(false);
+            if oracle_failure {
+                let token: Address = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::CircuitBreakerOracleFailureToken)
+                    .ok_or(Error::CircuitBreakerActive)?;
+                if !Self::oracle_price_is_healthy(env, &token) {
+                    return Err(Error::CircuitBreakerActive);
+                }
+            }
+
+            env.storage()
+                .instance()
+                .set(&DataKey::CircuitBreakerTripped, &false);
+            env.storage()
+                .instance()
+                .remove(&DataKey::CircuitBreakerOracleFailure);
+            env.storage()
+                .instance()
+                .remove(&DataKey::CircuitBreakerOracleFailureToken);
+            env.storage().instance().set(
+                &DataKey::GlobalDailyWithdrawn,
+                &GlobalDailyWithdrawn {
+                    amount: 0,
+                    window_start: curr,
+                },
+            );
+            CircuitBreakerAutoResetEvent {
+                version: EVENT_VERSION,
+                tripped_at,
+                reset_at: curr,
+            }
+            .publish(env);
             return Ok(());
         }
         Err(Error::CircuitBreakerActive)
+    }
+
+    fn oracle_price_is_healthy(env: &Env, token: &Address) -> bool {
+        let Some(oracle) = env.storage().instance().get::<_, Address>(&DataKey::Oracle) else {
+            return false;
+        };
+        let adapter_enabled: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::OracleAdapterEnabled)
+            .unwrap_or(false);
+        if !adapter_enabled {
+            return false;
+        }
+        crate::oracle::OracleAdapterClient::new(env, &oracle)
+            .try_get_aggregated_price(token)
+            .map_or(false, |result| result.map_or(false, |price| price > 0))
     }
 
     /// Loads the configured admin, requires their authentication, and
@@ -6273,6 +6531,13 @@ impl FiatBridge {
                         env.storage()
                             .persistent()
                             .extend_ttl(&receipt_key, min_ttl, min_ttl);
+                        let valuation_key =
+                            DataKey::ReceiptFiatValuation(receipt_hash.clone());
+                        if env.storage().persistent().has(&valuation_key) {
+                            env.storage()
+                                .persistent()
+                                .extend_ttl(&valuation_key, min_ttl, min_ttl);
+                        }
                         env.storage().temporary().extend_ttl(
                             &DataKey::ReceiptIndex(current_id),
                             min_ttl,
@@ -6817,7 +7082,7 @@ impl FiatBridge {
     /// Requires admin. Returns Error::NotInitialized if not initialized.
     ///
     /// Volume is accumulated by `withdraw` and `execute_withdrawal`, which trip the
-    /// breaker when the rolling total exceeds `threshold`. `request_withdrawal` and
+    /// breaker when the rolling total reaches `threshold`. `request_withdrawal` and
     /// `deposit` do not add to the volume; they only reject calls with
     /// [`Error::CircuitBreakerActive`] while the breaker is tripped. A threshold
     /// of 0 or less disables volume tracking.
@@ -6829,7 +7094,8 @@ impl FiatBridge {
         Ok(())
     }
 
-    /// Configure the circuit breaker auto-reset window in ledgers.
+    /// Configure the circuit breaker auto-reset window in ledgers. A value of
+    /// zero selects the 48-hour default.
     /// Use u32::MAX to disable auto-reset. Requires admin.
     pub fn set_circuit_breaker_reset_window(env: Env, ledgers: u32) -> Result<(), Error> {
         let _admin = Self::require_admin(&env)?;
@@ -6851,7 +7117,8 @@ impl FiatBridge {
     pub fn get_circuit_breaker_reset_window(env: Env) -> u32 {
         env.storage()
             .instance()
-            .get(&DataKey::CircuitBreakerResetWindow)
+            .get::<_, u32>(&DataKey::CircuitBreakerResetWindow)
+            .filter(|window| *window != 0)
             .unwrap_or(CIRCUIT_BREAKER_RESET_LEDGERS)
     }
 
@@ -6859,15 +7126,105 @@ impl FiatBridge {
     /// Requires admin. Returns Error::NotInitialized if not initialized.
     pub fn reset_circuit_breaker(env: Env) -> Result<(), Error> {
         let _admin = Self::require_admin(&env)?;
+        let oracle_failure: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerOracleFailure)
+            .unwrap_or(false);
+        if oracle_failure {
+            let token: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::CircuitBreakerOracleFailureToken)
+                .ok_or(Error::OraclePriceInvalid)?;
+            if !Self::oracle_price_is_healthy(&env, &token) {
+                return Err(Error::OraclePriceInvalid);
+            }
+        }
         env.storage()
             .instance()
             .set(&DataKey::CircuitBreakerTripped, &false);
+        env.storage()
+            .instance()
+            .remove(&DataKey::CircuitBreakerOracleFailure);
+        env.storage()
+            .instance()
+            .remove(&DataKey::CircuitBreakerOracleFailureToken);
+        env.storage().instance().set(
+            &DataKey::GlobalDailyWithdrawn,
+            &GlobalDailyWithdrawn {
+                amount: 0,
+                window_start: env.ledger().sequence(),
+            },
+        );
         CircuitBreakerResetEvent {
             version: EVENT_VERSION,
             ledger: env.ledger().sequence(),
         }
         .publish(&env);
         Ok(())
+    }
+
+    /// Permissionlessly evaluate the configured oracle and persist a breaker
+    /// trip when it has no usable price. Recovery requires a later healthy
+    /// price, so operators can record an outage without making a value-moving
+    /// call succeed.
+    pub fn check_oracle_health(env: Env, token: Address) -> Result<bool, Error> {
+        let oracle: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Oracle)
+            .ok_or(Error::OracleNotSet)?;
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::TokenRegistry(token.clone()))
+        {
+            return Err(Error::TokenNotWhitelisted);
+        }
+        let adapter_enabled: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::OracleAdapterEnabled)
+            .unwrap_or(false);
+        if !adapter_enabled {
+            return Err(Error::OracleConfigInvalid);
+        }
+        let healthy = crate::oracle::OracleAdapterClient::new(&env, &oracle)
+            .try_get_aggregated_price(&token)
+            .map_or(false, |result| result.map_or(false, |price| price > 0));
+        if healthy {
+            return Ok(true);
+        }
+
+        let ledger = env.ledger().sequence();
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreakerTripped, &true);
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreakerTrippedAt, &ledger);
+        let already_oracle_tripped: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerOracleFailure)
+            .unwrap_or(false);
+        if !already_oracle_tripped {
+            env.storage()
+                .instance()
+                .set(&DataKey::CircuitBreakerOracleFailure, &true);
+            env.storage()
+                .instance()
+                .set(&DataKey::CircuitBreakerOracleFailureToken, &token);
+        }
+        OracleFailureTripEvent {
+            version: EVENT_VERSION,
+            oracle,
+            token,
+            ledger,
+        }
+        .publish(&env);
+        Ok(false)
     }
 
     /// Return the currently configured rolling-volume threshold.
@@ -6891,10 +7248,11 @@ impl FiatBridge {
             .unwrap_or(false)
     }
 
-    /// Accumulate `amount` into the rolling 24-h global withdrawal volume.
-    /// Returns `CircuitBreakerActive` if the threshold is already tripped **or**
-    /// if this withdrawal would breach it (breaching withdrawal is rejected).
+    /// Accumulate `amount` into the rolling 24-hour total. The withdrawal that
+    /// reaches the threshold completes and trips the breaker; later protected
+    /// operations are rejected with `CircuitBreakerActive`.
     fn check_and_update_circuit_breaker(env: &Env, amount: i128) -> Result<(), Error> {
+        Self::require_circuit_breaker_clear(env)?;
         let threshold: i128 = env
             .storage()
             .instance()
@@ -6906,50 +7264,6 @@ impl FiatBridge {
 
         let curr = env.ledger().sequence();
 
-        // Check if breaker is tripped but eligible for auto-reset.
-        if env
-            .storage()
-            .instance()
-            .get::<_, bool>(&DataKey::CircuitBreakerTripped)
-            .unwrap_or(false)
-        {
-            let reset_window: u32 = env
-                .storage()
-                .instance()
-                .get(&DataKey::CircuitBreakerResetWindow)
-                .unwrap_or(CIRCUIT_BREAKER_RESET_LEDGERS);
-
-            let tripped_at: u32 = env
-                .storage()
-                .instance()
-                .get(&DataKey::CircuitBreakerTrippedAt)
-                .unwrap_or(0);
-
-            if reset_window != u32::MAX && curr > tripped_at.saturating_add(reset_window) {
-                // Auto-reset: clear the breaker and roll the volume window.
-                env.storage()
-                    .instance()
-                    .set(&DataKey::CircuitBreakerTripped, &false);
-                env.storage().instance().set(
-                    &DataKey::GlobalDailyWithdrawn,
-                    &GlobalDailyWithdrawn {
-                        amount: 0,
-                        window_start: curr,
-                    },
-                );
-                CircuitBreakerAutoResetEvent {
-                    version: EVENT_VERSION,
-                    tripped_at,
-                    reset_at: curr,
-                }
-                .publish(env);
-                // Fall through — process this withdrawal normally.
-            } else {
-                // Still within reset window — reject.
-                return Err(Error::CircuitBreakerActive);
-            }
-        }
-
         let mut vol: GlobalDailyWithdrawn = env
             .storage()
             .instance()
@@ -6960,12 +7274,12 @@ impl FiatBridge {
             });
 
         // Roll 24h window if elapsed.
-        if curr >= vol.window_start + WINDOW_LEDGERS {
+        if curr >= vol.window_start.saturating_add(WINDOW_LEDGERS) {
             vol.amount = 0;
             vol.window_start = curr;
         }
 
-        let new_total = vol.amount + amount;
+        let new_total = vol.amount.checked_add(amount).ok_or(Error::Overflow)?;
         vol.amount = new_total;
         env.storage()
             .instance()
@@ -6979,6 +7293,9 @@ impl FiatBridge {
             env.storage()
                 .instance()
                 .set(&DataKey::CircuitBreakerTrippedAt, &curr);
+            env.storage()
+                .instance()
+                .remove(&DataKey::CircuitBreakerOracleFailure);
             CircuitBreakerTrippedEvent {
                 version: EVENT_VERSION,
                 new_total,
@@ -8620,6 +8937,12 @@ mod test;
 
 #[cfg(test)]
 mod test_oracle_staleness;
+
+#[cfg(test)]
+mod test_oracle_adapter;
+
+#[cfg(test)]
+mod test_token_conformance;
 
 #[cfg(test)]
 mod test_init_validation;
