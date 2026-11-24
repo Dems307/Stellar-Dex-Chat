@@ -56,6 +56,30 @@ Baselines should only change when the UI change is intentional and reviewed. Whe
 
 If a snapshot fails unexpectedly, treat it as a potential regression first — investigate before reaching for `--update-snapshots`.
 
+## Event compatibility fixtures
+
+Every state-changing public contract method has a deterministic golden fixture that snapshots its emitted event topics and payload encoding. Fixtures live in `fixtures/events/golden_events.json` and are asserted by the contract regression tests, so any change to an event topic or payload field fails the check until the fixture is regenerated intentionally.
+
+### Schema versioning
+
+The fixture file carries an explicit `schemaVersion`. When you change an event topic or any payload field:
+
+1. Bump `schemaVersion` in `fixtures/events/golden_events.json`.
+2. Add a compatibility note to the PR description explaining the change, its impact on downstream consumers (indexers, API, UI), and any migration steps.
+3. Regenerate the affected fixtures (see below) and review the diff — only the events you intentionally changed should move.
+
+A fixture change without a `schemaVersion` bump, or a `schemaVersion` bump without a compatibility note, is treated as a failing check. Do not hand-edit encoded topics or payloads to make a test pass; regenerate from the contract instead.
+
+### Regenerating fixtures
+
+Regenerate the golden fixtures from the current contract build after an intentional event change:
+
+```bash
+pnpm fixtures:events -- --update
+```
+
+Review the regenerated `fixtures/events/golden_events.json` in the PR diff and confirm it contains no credentials or real user data — use deterministic, synthetic values only.
+
 ## Contract deployment manifest
 
 Every contract deployment publishes a machine-readable manifest so operators and tooling can verify what is live without reading source. The manifest records the deployment `network`, the deployed Wasm `wasmHash`, the `contractId`, the contract `specVersion`, and the required `admin`/`oracle` configuration.
