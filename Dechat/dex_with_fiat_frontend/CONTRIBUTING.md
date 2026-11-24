@@ -56,88 +56,87 @@ Baselines should only change when the UI change is intentional and reviewed. Whe
 
 If a snapshot fails unexpectedly, treat it as a potential regression first — investigate before reaching for `--update-snapshots`.
 
-## Wallet session lifecycle
+## Event compatibility fixtures
 
-Logging out is a security boundary, not just a UI reset. When a user logs out we must ensure a second account can never observe the previous account's drafts or transaction data.
+Every state-changing public contract method has a deterministic golden fixture that snapshots its emitted event topics and payload encoding. Fixtures live in `fixtures/events/golden_events.json` and are asserted by the contract regression tests, so any change to an event topic or payload field fails the check until the fixture is regenerated intentionally.
 
-### Logout contract
+### Schema versioning
 
-On logout the app performs the following, in order:
+The fixture file carries an explicit `schemaVersion`. When you change an event topic or any payload field:
 
-1. **Revoke the server wallet session.** Call the existing session-revocation endpoint through the shared API client. Revocation is best-effort: a network failure or an already-expired/unauthorized session must not block the local logout. Log the failure and continue.
-2. **Clear account-scoped caches.** Drop any cached drafts, quotes, balances, and transaction history keyed to the previous account so they cannot leak into the next session.
-3. **Reset pending UI state.** Cancel in-flight requests and clear pending transaction/quote state so stale spinners or optimistic rows do not survive the logout.
-4. **Tear down subscriptions.** Unsubscribe from wallet, RPC, and quote streams tied to the previous session.
+1. Bump `schemaVersion` in `fixtures/events/golden_events.json`.
+2. Add a compatibility note to the PR description explaining the change, its impact on downstream consumers (indexers, API, UI), and any migration steps.
+3. Regenerate the affected fixtures (see below) and review the diff — only the events you intentionally changed should move.
 
-### Financial safety
+A fixture change without a `schemaVersion` bump, or a `schemaVersion` bump without a compatibility note, is treated as a failing check. Do not hand-edit encoded topics or payloads to make a test pass; regenerate from the contract instead.
 
-Logout must never mutate on-chain state or cancel a transaction that has already been broadcast. Revocation only affects the server-side session and local caches; any submitted transaction continues to settle independently. If revocation fails, surface it in logs but still complete the local cleanup so the next account starts from a clean slate.
+### Regenerating fixtures
 
-### Testing logout
+Regenerate the golden fixtures from the current contract build after an intentional event change:
 
-Regression tests for logout should cover:
+```bash
+pnpm fixtures:events -- --update
+```
 
-- The normal path: session revoked, caches cleared, subscriptions torn down.
-- Revocation failure (network error): local cleanup still completes.
-- Authorization edge case (session already expired or unauthorized): logout still succeeds locally.
-- Recovery: logging in as a second account shows no drafts or transaction data from the first.
+Review the regenerated `fixtures/events/golden_events.json` in the PR diff and confirm it contains no credentials or real user data — use deterministic, synthetic values only.
 
-## Wallet permissions
+## Contract deployment manifest
 
-We request the least-privilege wallet permission needed for each action instead of a blanket connect-and-sign flow. Each action asks only for the account or signing operation it actually needs, and the prompt is explained to the user at the point of request.
+Every contract deployment publishes a machine-readable manifest so operators and tooling can verify what is live without reading source. The manifest records the deployment `network`, the deployed Wasm `wasmHash`, the `contractId`, the contract `specVersion`, and the required `admin`/`oracle` configuration.
 
-### Permission tiers
+### Generating a manifest
 
-- **Read-only account access** — connecting to view balances, quotes, and history. No signing capability is requested.
-- **Message signing** — authenticating a session or proving account ownership. Requests a signature only; it does not authorize a transaction.
-- **Transaction signing** — submitting an order or payout. Requested only at the moment the user confirms a specific transaction, scoped to that transaction.
+Generate the manifest from the deployed artifact after a successful deploy. The generator derives the Wasm hash and contract ID from the artifact itself rather than accepting them by hand, so the manifest always reflects what was actually deployed:
 
-### Prompting and denial
+```bash
+pnpm manifest:generate -- --network testnet --artifact ./target/dex_with_fiat.wasm
+```
 
-- Explain the scope of each prompt in the UI before it is triggered so the user knows exactly what is being requested and why.
-- If the user denies a permission or signing request, do not create a partially authenticated session. Leave the app in a recoverable state: no stale connected state, no half-signed session, and a clear retry path.
-- A denial at the transaction-signing step must not leave an optimistic pending row or a session that appears authenticated for signing.
+Commit the generated manifest alongside the deployment record. Do not hand-edit `wasmHash`, `contractId`, or `specVersion` — regenerate instead.
 
-### Financial safety
+### Validation
 
-Requesting a permission never mutates on-chain state. Denying a signing request simply aborts that action; any previously broadcast transaction continues to settle independently. Least-privilege requests must not weaken existing safety checks — pre-submit revalidation and typed transaction state still apply.
+Before promoting a deployment, validate the manifest against the deployed artifact:
 
-### Testing permissions
+```bash
+pnpm manifest:validate -- --manifest ./deployments/testnet.json --artifact ./target/dex_with_fiat.wasm
+```
 
-Regression tests for wallet permissions should cover:
+Validation fails when:
 
-- The normal path: each action requests only its minimal permission tier.
-- Denial of account access: no connected state is established.
-- Denial of a signing request: no partially authenticated session and a recoverable UI state.
-- Recovery: retrying after a denial requests the permission again cleanly.
+- The manifest `wasmHash` does not match the artifact's hash.
+- The manifest `contractId` or `specVersion` is missing or inconsistent with the artifact.
+- The manifest `network` does not match the deployment target network (cross-network configuration is rejected).
+- Required `admin` or `oracle` configuration is absent.
 
-## Pre-submit revalidation
+A failed validation must block the deployment — never override it to force a promotion. If validation fails, regenerate the manifest from the correct artifact and network and re-run the check.
 
-Wallet state can change between the moment a user confirms a transaction and the moment we hand the signed XDR to the network. To prevent submitting a transaction that no longer matches what the user approved, we revalidate the wallet session immediately before submission.
+## Emergency pause and recovery drill
 
-### Revalidation contract
+Operators should rehearse the emergency pause and recovery flow on a testnet or local network before relying on it in production. The drill is a repeatable simulation that pauses the contract, confirms that mutations are blocked while read-only views remain available, verifies that queued liabilities are preserved, and rehearses authorized recovery.
 
-After the user confirms and immediately before submitting the XDR, re-read the following values and compare them against the snapshot captured at confirmation time:
+### Running the drill
 
-1. **Active wallet address** — the connected account's public key.
-2. **Network passphrase** — the network the wallet is currently pointed at.
-3. **Configured contract identity** — the contract ID the app is configured to interact with.
+Run the drill against a testnet or local network deployment (never against mainnet):
 
-If any of these values changed since confirmation, abort the submission and surface a recoverable, user-facing message explaining that the wallet or network changed and the action must be retried. Do not submit the stale XDR.
+```bash
+pnpm drill:pause-recovery -- --network testnet --manifest ./deployments/testnet.json
+```
 
-### Financial safety
+The drill uses the `admin` identity from the manifest to authorize pause and unpause. It does not accept or store credentials — sign with the operator's configured local key or wallet as usual.
 
-Revalidation is a read-only check and never mutates on-chain state. It complements, and must not weaken, existing safeguards: double-submit protection still prevents duplicate submissions, and audit logging still records the attempt and the abort reason. An aborted submission leaves the app in a recoverable state so the user can re-confirm against the current wallet and network.
+### What the drill verifies
 
-### Testing revalidation
+1. **Pause** — the authorized `admin` pauses the contract and the pause is observable in contract state.
+2. **Blocked mutations** — state-changing calls (e.g. swaps, deposits, withdrawals, payouts) are rejected while paused.
+3. **Available views** — read-only views (balances, quotes, queued liabilities) continue to return data while paused.
+4. **Queued liabilities** — liabilities queued before the pause are preserved and remain visible; nothing is silently dropped.
+5. **Authorized recovery** — the authorized `admin` unpauses the contract and mutations succeed again, with queued liabilities handled correctly.
+6. **Unauthorized attempts** — pause and unpause calls from a non-admin identity are rejected, and the contract remains in its prior state.
 
-Regression tests for pre-submit revalidation should cover:
+### Failure handling
 
-- The normal path: unchanged address, passphrase, and contract identity submit successfully.
-- A changed wallet address aborts submission with a recoverable message.
-- A changed network passphrase aborts submission with a recoverable message.
-- A changed contract identity aborts submission with a recoverable message.
-- Recovery: after an abort, re-confirming against the current wallet and network submits cleanly.
+If any step fails, the drill exits non-zero and reports which step failed. Treat a failed drill as a blocker: do not promote a deployment whose pause/recovery drill does not pass. Investigate the failure and re-run the drill after fixing the underlying issue — never bypass the drill to force a promotion.
 
 ## Commit and PR conventions
 
