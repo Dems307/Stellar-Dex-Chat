@@ -18,6 +18,7 @@ const WINDOW_LEDGERS: u32 = 17_280; // ~24 hours
 const CIRCUIT_BREAKER_RESET_LEDGERS: u32 = 34_560; // ~48 hours (2 × WINDOW_LEDGERS)
 const WITHDRAWAL_EXPIRY_WINDOW_LEDGERS: u32 = 17_280; // ~24 hours — reserved for future withdrawal expiry feature
 const MIN_TIMELOCK_DELAY: u32 = 34_560; // 48 hours
+const FEE_BPS_DENOMINATOR: i128 = 10_000;
 /// Default inactivity threshold for operators in ledger units.
 ///
 /// Operators must send a heartbeat within this window to remain active.
@@ -81,6 +82,7 @@ pub enum Error {
     LimitCapCannotBeLowered = 319,
     RateLimitExceeded = 320,
     DepositRateLimitExceeded = 321,
+    InvalidPageSize = 322,
 
     // --- 400 series: Funds & Balances ---
     InsufficientFunds = 401,
@@ -144,6 +146,8 @@ pub enum Error {
     CancellationNotRequested = 1202,
     /// The cancellation has not been approved by an admin yet.
     CancellationNotApproved = 1203,
+    AdminRecoveryAlreadyPending = 1204,
+    AdminRecoveryNotPending = 1205,
 }
 
 // ── Models ────────────────────────────────────────────────────────────────
@@ -227,6 +231,21 @@ pub struct LiabilityAuditView {
 pub struct LiabilityAuditPage {
     pub records: Vec<LiabilityAuditView>,
     pub next_cursor: Option<u64>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TokenEscrowAccounting {
+    pub version: u32,
+    pub token: Address,
+    pub precision: u32,
+    pub token_balance: i128,
+    pub user_assets: i128,
+    pub pending_withdrawal_liability: i128,
+    pub fee_liability: i128,
+    pub rounding_remainder_numerator: i128,
+    pub rounding_remainder_denominator: i128,
+    pub unassigned_dust: i128,
 }
 
 /// Scheduling metadata for a single queued withdrawal request.
@@ -416,6 +435,17 @@ pub struct UpgradeProposalTiming {
     pub proposed_at: u32,
     pub delay: u32,
     pub executable_after: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminRecoveryProposal {
+    pub previous_admin: Address,
+    pub successor: Address,
+    pub recovery: Address,
+    pub proposed_at: u32,
+    pub execute_after: u32,
+    pub admin_activity_ledger: u32,
 }
 
 #[contracttype]
@@ -799,6 +829,26 @@ pub struct AdminTransferEvent {
     pub version: u32,
     pub old_admin: Address,
     pub new_admin: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct AdminRecoveryProposedEvent {
+    pub version: u32,
+    pub previous_admin: Address,
+    pub successor: Address,
+    pub recovery: Address,
+    pub proposed_at: u32,
+    pub execute_after: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct AdminRecoveryExecutedEvent {
+    pub version: u32,
+    pub previous_admin: Address,
+    pub successor: Address,
+    pub recovery: Address,
 }
 
 #[contractevent]
@@ -1364,6 +1414,13 @@ pub enum DataKey {
     TierQueueTail(u32),
     TierQueueNext(u64),
     TierQueuePrev(u64),
+    AdminRecoveryProposal,
+    ReceiptToken(BytesN<32>),
+    LiabilityRecord(u64),
+    FeeRemainder(Address),
+    FeeGrossDeposited(Address),
+    FeeNetDeposited(Address),
+    TokenPrecision(Address),
 }
 
 pub const ORACLE_PRICE_DECIMALS: i128 = 10_000_000;
@@ -1991,6 +2048,7 @@ impl FiatBridge {
 
         if caller == admin {
             caller.require_auth();
+            Self::record_admin_activity(&env);
         } else if let Some(op) = operator {
             if caller == op {
                 caller.require_auth();
@@ -3105,6 +3163,7 @@ impl FiatBridge {
             .ok_or(Error::NotInitialized)?;
         env.storage().instance().set(&DataKey::Admin, &pending);
         env.storage().instance().remove(&DataKey::PendingAdmin);
+        Self::record_admin_activity(&env);
         AdminTransferEvent {
             version: EVENT_VERSION,
             old_admin,
@@ -3112,6 +3171,143 @@ impl FiatBridge {
         }
         .publish(&env);
         Ok(())
+    }
+
+    /// Starts delayed recovery using the preconfigured recovery address, but
+    /// only after the current admin has been inactive for the configured window.
+    pub fn propose_admin_recovery(env: Env, successor: Address) -> Result<(), Error> {
+        let recovery: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::EmergencyRecoveryAddress)
+            .ok_or(Error::NoEmergencyRecoveryAddress)?;
+        recovery.require_auth();
+
+        let previous_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        if successor == previous_admin || successor == recovery {
+            return Err(Error::InvalidRecipient);
+        }
+        if successor == env.current_contract_address() {
+            return Err(Error::Unauthorized);
+        }
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::AdminRecoveryProposal)
+        {
+            return Err(Error::AdminRecoveryAlreadyPending);
+        }
+
+        let current_ledger = env.ledger().sequence();
+        let admin_activity_ledger: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LastAdminActionLedger)
+            .unwrap_or(current_ledger);
+        let inactivity_threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::InactivityThreshold)
+            .unwrap_or(DEFAULT_INACTIVITY_THRESHOLD);
+        if current_ledger.saturating_sub(admin_activity_ledger) < inactivity_threshold {
+            return Err(Error::InactivityThresholdNotReached);
+        }
+        let execute_after = current_ledger
+            .checked_add(MIN_TIMELOCK_DELAY)
+            .ok_or(Error::Overflow)?;
+        let proposal = AdminRecoveryProposal {
+            previous_admin: previous_admin.clone(),
+            successor: successor.clone(),
+            recovery: recovery.clone(),
+            proposed_at: current_ledger,
+            execute_after,
+            admin_activity_ledger,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::AdminRecoveryProposal, &proposal);
+        env.storage().instance().extend_ttl(MIN_TTL, MAX_TTL);
+
+        AdminRecoveryProposedEvent {
+            version: EVENT_VERSION,
+            previous_admin,
+            successor,
+            recovery,
+            proposed_at: current_ledger,
+            execute_after,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Completes a recovery proposal after its timelock and explicit successor
+    /// authorization. Any intervening admin action invalidates the proposal.
+    pub fn execute_admin_recovery(env: Env) -> Result<(), Error> {
+        let proposal: AdminRecoveryProposal = env
+            .storage()
+            .instance()
+            .get(&DataKey::AdminRecoveryProposal)
+            .ok_or(Error::AdminRecoveryNotPending)?;
+        if env.ledger().sequence() <= proposal.execute_after {
+            return Err(Error::ActionNotReady);
+        }
+
+        let current_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        let current_recovery: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::EmergencyRecoveryAddress)
+            .ok_or(Error::NoEmergencyRecoveryAddress)?;
+        let current_activity: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LastAdminActionLedger)
+            .unwrap_or(0);
+        if current_admin != proposal.previous_admin
+            || current_recovery != proposal.recovery
+            || current_activity != proposal.admin_activity_ledger
+        {
+            return Err(Error::ActionNotQueued);
+        }
+
+        proposal.successor.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::Admin, &proposal.successor);
+        env.storage()
+            .instance()
+            .remove(&DataKey::AdminRecoveryProposal);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        Self::record_admin_activity(&env);
+
+        AdminRecoveryExecutedEvent {
+            version: EVENT_VERSION,
+            previous_admin: proposal.previous_admin.clone(),
+            successor: proposal.successor.clone(),
+            recovery: proposal.recovery,
+        }
+        .publish(&env);
+        AdminTransferEvent {
+            version: EVENT_VERSION,
+            old_admin: proposal.previous_admin,
+            new_admin: proposal.successor,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    pub fn get_admin_recovery_proposal(env: Env) -> Option<AdminRecoveryProposal> {
+        env.storage()
+            .instance()
+            .get(&DataKey::AdminRecoveryProposal)
     }
 
     // ── Fiat Limits & Oracle ──────────────────────────────────────────────
@@ -3373,24 +3569,91 @@ impl FiatBridge {
         }
     }
 
+    /// Returns the per-token balance decomposition in the token's smallest unit.
+    ///
+    /// `unassigned_dust` includes unsolicited transfers and other balance not
+    /// represented by user assets or the fee vault. Fractional fee residue is
+    /// tracked separately as a numerator over `rounding_remainder_denominator`.
+    pub fn get_token_escrow_accounting(
+        env: Env,
+        token: Address,
+    ) -> Result<TokenEscrowAccounting, Error> {
+        let config: TokenConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TokenRegistry(token.clone()))
+            .ok_or(Error::TokenNotWhitelisted)?;
+        let user_assets = config
+            .total_deposited
+            .checked_sub(config.total_withdrawn)
+            .ok_or(Error::InternalError)?;
+        if user_assets < config.total_liabilities {
+            return Err(Error::InternalError);
+        }
+
+        let fee_liability: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FeeVault(token.clone()))
+            .unwrap_or(0);
+        if fee_liability < 0 {
+            return Err(Error::InternalError);
+        }
+        let rounding_remainder_numerator: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FeeRemainder(token.clone()))
+            .unwrap_or(0);
+        if !(0..FEE_BPS_DENOMINATOR).contains(&rounding_remainder_numerator) {
+            return Err(Error::InternalError);
+        }
+
+        let token_balance = token::Client::new(&env, &token)
+            .balance(&env.current_contract_address());
+        let accounted = user_assets
+            .checked_add(fee_liability)
+            .ok_or(Error::Overflow)?;
+        let unassigned_dust = token_balance
+            .checked_sub(accounted)
+            .ok_or(Error::InsufficientFunds)?;
+
+        Ok(TokenEscrowAccounting {
+            version: AUDIT_SCHEMA_VERSION,
+            token: token.clone(),
+            precision: Self::get_token_precision_internal(&env, &token),
+            token_balance,
+            user_assets,
+            pending_withdrawal_liability: config.total_liabilities,
+            fee_liability,
+            rounding_remainder_numerator,
+            rounding_remainder_denominator: FEE_BPS_DENOMINATOR,
+            unassigned_dust,
+        })
+    }
+
     pub fn compute_fee_with_remainder(
         env: &Env,
         token: &Address,
         gross_amount: i128,
     ) -> Result<(i128, i128), Error> {
+        if gross_amount <= 0 {
+            return Err(Error::ZeroAmount);
+        }
         let fee_bps: u32 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
         if fee_bps == 0 {
             let gross_key = DataKey::FeeGrossDeposited(token.clone());
             let cur_gross: i128 = env.storage().persistent().get(&gross_key).unwrap_or(0);
+            let new_gross = cur_gross.checked_add(gross_amount).ok_or(Error::Overflow)?;
             env.storage()
                 .persistent()
-                .set(&gross_key, &(cur_gross.saturating_add(gross_amount)));
+                .set(&gross_key, &new_gross);
 
             let net_key = DataKey::FeeNetDeposited(token.clone());
             let cur_net: i128 = env.storage().persistent().get(&net_key).unwrap_or(0);
+            let new_net = cur_net.checked_add(gross_amount).ok_or(Error::Overflow)?;
             env.storage()
                 .persistent()
-                .set(&net_key, &(cur_net.saturating_add(gross_amount)));
+                .set(&net_key, &new_net);
 
             return Ok((0, gross_amount));
         }
@@ -3403,8 +3666,8 @@ impl FiatBridge {
             .ok_or(Error::Overflow)?;
         let total_num = product.checked_add(current_rem).ok_or(Error::Overflow)?;
 
-        let fee = total_num / 10_000;
-        let new_rem = total_num % 10_000;
+        let fee = total_num / FEE_BPS_DENOMINATOR;
+        let new_rem = total_num % FEE_BPS_DENOMINATOR;
         let net = gross_amount.checked_sub(fee).ok_or(Error::Overflow)?;
 
         env.storage().persistent().set(&rem_key, &new_rem);
@@ -3425,15 +3688,17 @@ impl FiatBridge {
 
         let gross_key = DataKey::FeeGrossDeposited(token.clone());
         let cur_gross: i128 = env.storage().persistent().get(&gross_key).unwrap_or(0);
+        let new_gross = cur_gross.checked_add(gross_amount).ok_or(Error::Overflow)?;
         env.storage()
             .persistent()
-            .set(&gross_key, &(cur_gross.saturating_add(gross_amount)));
+            .set(&gross_key, &new_gross);
 
         let net_key = DataKey::FeeNetDeposited(token.clone());
         let cur_net: i128 = env.storage().persistent().get(&net_key).unwrap_or(0);
+        let new_net = cur_net.checked_add(net).ok_or(Error::Overflow)?;
         env.storage()
             .persistent()
-            .set(&net_key, &(cur_net.saturating_add(net)));
+            .set(&net_key, &new_net);
 
         Ok((fee, net))
     }
@@ -4533,7 +4798,8 @@ impl FiatBridge {
 
         let key = DataKey::FeeVault(token.clone());
         let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        env.storage().persistent().set(&key, &(current + amount));
+        let updated = current.checked_add(amount).ok_or(Error::Overflow)?;
+        env.storage().persistent().set(&key, &updated);
 
         FeeAccruedEvent {
             version: EVENT_VERSION,
@@ -5074,7 +5340,7 @@ impl FiatBridge {
     ///
     /// # Arguments
     /// * `cursor` - Starting sequence index (0-based)
-    /// * `limit` - Number of records to return (1..=MAX_AUDIT_PAGE_SIZE)
+    /// * `limit` - Maximum number of sequence IDs to inspect (1..=MAX_AUDIT_PAGE_SIZE)
     ///
     /// # Errors
     /// * `Error::InvalidPageSize` if limit == 0 or limit > MAX_AUDIT_PAGE_SIZE
@@ -5093,24 +5359,26 @@ impl FiatBridge {
             .unwrap_or(0);
         let mut records: Vec<ReceiptAuditView> = Vec::new(&env);
         let mut current_id = cursor;
-        while current_id < total_receipts && records.len() < limit {
+        let mut scanned = 0;
+        while current_id < total_receipts && scanned < limit {
             if let Some(escrow) = env
                 .storage()
                 .persistent()
                 .get::<_, EscrowRecord>(&DataKey::EscrowRecord(current_id))
             {
-                let receipt_hash: BytesN<32> = env
+                if let Some(receipt_hash) = env
                     .storage()
                     .temporary()
-                    .get(&DataKey::ReceiptIndex(current_id))
-                    .unwrap_or_else(|| BytesN::from_array(&env, &[0u8; 32]));
-                records.push_back(ReceiptAuditView {
-                    version: AUDIT_SCHEMA_VERSION,
-                    receipt_id: receipt_hash,
-                    token: escrow.token,
-                    amount: escrow.amount,
-                    status: ReceiptAuditStatus::Migrated,
-                });
+                    .get::<_, BytesN<32>>(&DataKey::ReceiptIndex(current_id))
+                {
+                    records.push_back(ReceiptAuditView {
+                        version: AUDIT_SCHEMA_VERSION,
+                        receipt_id: receipt_hash,
+                        token: escrow.token,
+                        amount: escrow.amount,
+                        status: ReceiptAuditStatus::Migrated,
+                    });
+                }
             } else if let Some(receipt_hash) = env
                 .storage()
                 .temporary()
@@ -5143,6 +5411,7 @@ impl FiatBridge {
                 }
             }
             current_id += 1;
+            scanned += 1;
         }
         let next_cursor = if current_id < total_receipts {
             Some(current_id)
@@ -5163,11 +5432,90 @@ impl FiatBridge {
         Self::get_receipt_audit_views(env, cursor, limit)
     }
 
+    /// Returns receipt history after an exclusive sequence cursor. Missing or
+    /// expired records are skipped, and each call examines at most `limit` IDs.
+    pub fn get_receipts_page_after(
+        env: Env,
+        after_cursor: Option<u64>,
+        limit: u32,
+    ) -> Result<ReceiptAuditPage, Error> {
+        if limit == 0 || limit > MAX_AUDIT_PAGE_SIZE {
+            return Err(Error::InvalidPageSize);
+        }
+        let total_receipts: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ReceiptCounter)
+            .unwrap_or(0);
+        let mut current_id = match after_cursor {
+            Some(id) => id.checked_add(1).unwrap_or(total_receipts),
+            None => 0,
+        };
+        let mut scanned = 0;
+        let mut records = Vec::new(&env);
+        while current_id < total_receipts && scanned < limit {
+            if let Some(escrow) = env
+                .storage()
+                .persistent()
+                .get::<_, EscrowRecord>(&DataKey::EscrowRecord(current_id))
+            {
+                if let Some(receipt_id) = env
+                    .storage()
+                    .temporary()
+                    .get::<_, BytesN<32>>(&DataKey::ReceiptIndex(current_id))
+                {
+                    records.push_back(ReceiptAuditView {
+                        version: AUDIT_SCHEMA_VERSION,
+                        receipt_id,
+                        token: escrow.token,
+                        amount: escrow.amount,
+                        status: ReceiptAuditStatus::Migrated,
+                    });
+                }
+            } else if let Some(receipt_id) = env
+                .storage()
+                .temporary()
+                .get::<_, BytesN<32>>(&DataKey::ReceiptIndex(current_id))
+            {
+                if let Some(receipt) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, Receipt>(&DataKey::Receipt(receipt_id.clone()))
+                {
+                    let token = env
+                        .storage()
+                        .persistent()
+                        .get(&DataKey::ReceiptToken(receipt_id.clone()))
+                        .or_else(|| env.storage().instance().get(&DataKey::Token))
+                        .ok_or(Error::NotInitialized)?;
+                    records.push_back(ReceiptAuditView {
+                        version: AUDIT_SCHEMA_VERSION,
+                        receipt_id,
+                        token,
+                        amount: receipt.amount,
+                        status: ReceiptAuditStatus::Active,
+                    });
+                }
+            }
+            current_id += 1;
+            scanned += 1;
+        }
+        let next_cursor = if current_id < total_receipts && scanned > 0 {
+            Some(current_id - 1)
+        } else {
+            None
+        };
+        Ok(ReceiptAuditPage {
+            records,
+            next_cursor,
+        })
+    }
+
     /// Returns a paginated view of liability records with a stable cursor.
     ///
     /// # Arguments
     /// * `cursor` - Starting sequence index / request_id (0-based)
-    /// * `limit` - Number of records to return (1..=MAX_AUDIT_PAGE_SIZE)
+    /// * `limit` - Maximum number of request IDs to inspect (1..=MAX_AUDIT_PAGE_SIZE)
     ///
     /// # Errors
     /// * `Error::InvalidPageSize` if limit == 0 or limit > MAX_AUDIT_PAGE_SIZE
@@ -5227,6 +5575,52 @@ impl FiatBridge {
         limit: u32,
     ) -> Result<LiabilityAuditPage, Error> {
         Self::get_liability_audit_views(env, cursor, limit)
+    }
+
+    /// Returns settled withdrawal records after an exclusive request-ID
+    /// cursor. Missing/pruned records and still-queued requests are skipped;
+    /// each call examines at most `limit` IDs.
+    pub fn get_completed_withdrawals_page(
+        env: Env,
+        after_cursor: Option<u64>,
+        limit: u32,
+    ) -> Result<LiabilityAuditPage, Error> {
+        if limit == 0 || limit > MAX_AUDIT_PAGE_SIZE {
+            return Err(Error::InvalidPageSize);
+        }
+        let total_requests: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextRequestID)
+            .unwrap_or(0);
+        let mut current_id = match after_cursor {
+            Some(id) => id.checked_add(1).unwrap_or(total_requests),
+            None => 0,
+        };
+        let mut scanned = 0;
+        let mut records = Vec::new(&env);
+        while current_id < total_requests && scanned < limit {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<_, LiabilityAuditView>(&DataKey::LiabilityRecord(current_id))
+            {
+                if record.status != LiabilityAuditStatus::Queued {
+                    records.push_back(record);
+                }
+            }
+            current_id += 1;
+            scanned += 1;
+        }
+        let next_cursor = if current_id < total_requests && scanned > 0 {
+            Some(current_id - 1)
+        } else {
+            None
+        };
+        Ok(LiabilityAuditPage {
+            records,
+            next_cursor,
+        })
     }
 
     pub fn get_wq_depth(env: Env) -> u64 {
@@ -5588,7 +5982,17 @@ impl FiatBridge {
             .get(&DataKey::Admin)
             .ok_or(Error::NotInitialized)?;
         admin.require_auth();
+        Self::record_admin_activity(env);
         Ok(admin)
+    }
+
+    fn record_admin_activity(env: &Env) {
+        env.storage()
+            .instance()
+            .set(&DataKey::LastAdminActionLedger, &env.ledger().sequence());
+        env.storage()
+            .instance()
+            .remove(&DataKey::AdminRecoveryProposal);
     }
 
     /// Returns [`Error::AddressDenied`] when `address` is on the denylist.
@@ -6104,39 +6508,23 @@ impl FiatBridge {
         .publish(&env);
 
         let total_ops = operations.len();
-        let mut success_count: u32 = 0;
-        let mut failure_count: u32 = 0;
-        let mut first_failed_index: Option<u32> = None;
-
-        for (idx, op) in operations.iter().enumerate() {
-            let result = Self::execute_single_admin_op(&env, &op);
-            if result.is_err() {
-                BatchFailEvent {
-                    version: EVENT_VERSION,
-                    index: idx as u32,
-                    total_ops,
-                }
-                .publish(&env);
-                failure_count += 1;
-                if first_failed_index.is_none() {
-                    first_failed_index = Some(idx as u32);
-                }
-                continue;
-            }
-            success_count += 1;
+        for op in operations.iter() {
+            // Returning the original error makes Soroban roll back every
+            // earlier operation and event in this invocation.
+            Self::execute_single_admin_op(&env, &op)?;
         }
 
         let batch_result = BatchResult {
             total_ops,
-            success_count,
-            failure_count,
-            failed_index: first_failed_index,
+            success_count: total_ops,
+            failure_count: 0,
+            failed_index: None,
         };
 
         BatchOkEvent {
             version: EVENT_VERSION,
-            success_count,
-            failure_count,
+            success_count: total_ops,
+            failure_count: 0,
             total_ops,
         }
         .publish(&env);
@@ -7266,6 +7654,7 @@ impl FiatBridge {
         env.storage()
             .instance()
             .set(&DataKey::MultisigProposal(id), &proposal);
+        Self::record_admin_activity(&env);
 
         env.events()
             .publish((EVENT_VERSION, Symbol::new(&env, "multisig_executed")), id);
@@ -7336,6 +7725,9 @@ impl FiatBridge {
     /// Configure the emergency recovery address and an associated withdrawal cap.
     pub fn set_emergency_recovery(env: Env, recovery: Address, cap: i128) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
+        if recovery == admin || recovery == env.current_contract_address() {
+            return Err(Error::InvalidRecipient);
+        }
         if cap <= 0 {
             return Err(Error::ZeroAmount);
         }
