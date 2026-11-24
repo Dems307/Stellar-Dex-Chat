@@ -153,6 +153,45 @@ Admin privileges in the FiatBridge are strictly tied to the on-chain state. The 
 
 ---
 
+## Recovery, History, and Token Accounting
+
+### Delayed Admin Recovery
+
+Configure an independent recovery address using `set_emergency_recovery` before
+the admin key is lost. After the configured inactivity threshold, the recovery
+address calls `propose_admin_recovery(successor)`. The proposed successor must
+authorize `execute_admin_recovery()` after the 48-hour timelock. Any intervening
+admin-authenticated action invalidates the proposal. `AdminRecoveryProposedEvent`
+and `AdminRecoveryExecutedEvent` record the proposal and completed transfer.
+This recovery path does not change the standard `transfer_admin` /
+`accept_admin` flow.
+
+### Historical Pagination
+
+`get_receipts_page_after(after_cursor, limit)` and
+`get_completed_withdrawals_page(after_cursor, limit)` use exclusive cursors:
+pass `None` for the first page, then pass the returned `next_cursor` to continue.
+The cursor represents the last sequence/request ID examined. Each call examines
+at most `limit` IDs (`1..=MAX_AUDIT_PAGE_SIZE`); pruned or unavailable records
+are skipped while the cursor still advances, preventing gaps from causing an
+unbounded scan.
+
+### Per-Token Escrow Accounting
+
+`get_token_escrow_accounting(token)` reports the token balance decomposition:
+
+`token_balance = user_assets + fee_liability + unassigned_dust`
+
+`pending_withdrawal_liability` is a subset of `user_assets`. Deposits,
+withdrawals, and partial withdrawals are accounted in the token's smallest
+unit, so partial transfers introduce no additional rounding. Fee rounding
+residue is retained per token as a numerator over 10,000 in `FeeRemainder`;
+it becomes a whole smallest unit only when later deposits complete the
+fraction. The view reports token precision and fails if liabilities are
+underfunded rather than returning a misleading decomposition.
+
+---
+
 ## Error Code Reference
 
 All errors are returned as `Result<_, Error>` variants. The contract uses a flat numbering scheme starting at 1.
@@ -257,6 +296,13 @@ A GitHub Actions step validates that the error table stays in sync with the cont
 | `set_cooldown(ledgers)` | admin | Set per-user deposit cooldown |
 | `transfer_admin(new_admin)` | admin | Initiate two-step admin transfer |
 | `accept_admin()` | pending admin | Complete admin transfer |
+| `set_emergency_recovery(recovery, cap)` | admin | Configure the independent recovery address and transfer cap |
+| `propose_admin_recovery(successor)` | configured recovery address | Propose successor after admin inactivity |
+| `execute_admin_recovery()` | proposed successor | Complete recovery after delay and explicit authorization |
+| `get_admin_recovery_proposal()` | — | Read the pending recovery proposal |
+| `get_receipts_page_after(after_cursor, limit)` | — | Read receipt history using bounded exclusive-cursor pages |
+| `get_completed_withdrawals_page(after_cursor, limit)` | — | Read settled withdrawals using bounded exclusive-cursor pages |
+| `get_token_escrow_accounting(token)` | — | Verify the per-token user/fee/dust balance decomposition |
 | `set_operator(operator, active)` | admin | Grant or revoke operator role (with timelock role check) |
 | `queue_renounce_admin()` | admin | Queue irreversible admin renounce under timelock |
 | `execute_renounce_admin()` | admin | Complete admin renounce after timelock elapses |
