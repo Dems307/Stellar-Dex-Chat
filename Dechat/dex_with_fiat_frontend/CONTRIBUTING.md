@@ -56,6 +56,37 @@ Baselines should only change when the UI change is intentional and reviewed. Whe
 
 If a snapshot fails unexpectedly, treat it as a potential regression first — investigate before reaching for `--update-snapshots`.
 
+## Contract deployment manifest
+
+Every contract deployment publishes a machine-readable manifest so operators and tooling can verify what is live without reading source. The manifest records the deployment `network`, the deployed Wasm `wasmHash`, the `contractId`, the contract `specVersion`, and the required `admin`/`oracle` configuration.
+
+### Generating a manifest
+
+Generate the manifest from the deployed artifact after a successful deploy. The generator derives the Wasm hash and contract ID from the artifact itself rather than accepting them by hand, so the manifest always reflects what was actually deployed:
+
+```bash
+pnpm manifest:generate -- --network testnet --artifact ./target/dex_with_fiat.wasm
+```
+
+Commit the generated manifest alongside the deployment record. Do not hand-edit `wasmHash`, `contractId`, or `specVersion` — regenerate instead.
+
+### Validation
+
+Before promoting a deployment, validate the manifest against the deployed artifact:
+
+```bash
+pnpm manifest:validate -- --manifest ./deployments/testnet.json --artifact ./target/dex_with_fiat.wasm
+```
+
+Validation fails when:
+
+- The manifest `wasmHash` does not match the artifact's hash.
+- The manifest `contractId` or `specVersion` is missing or inconsistent with the artifact.
+- The manifest `network` does not match the deployment target network (cross-network configuration is rejected).
+- Required `admin` or `oracle` configuration is absent.
+
+A failed validation must block the deployment — never override it to force a promotion. If validation fails, regenerate the manifest from the correct artifact and network and re-run the check.
+
 ## Commit and PR conventions
 
 - Keep changes scoped to the issue you are solving.
