@@ -56,6 +56,32 @@ Baselines should only change when the UI change is intentional and reviewed. Whe
 
 If a snapshot fails unexpectedly, treat it as a potential regression first — investigate before reaching for `--update-snapshots`.
 
+## Wallet session lifecycle
+
+Logging out is a security boundary, not just a UI reset. When a user logs out we must ensure a second account can never observe the previous account's drafts or transaction data.
+
+### Logout contract
+
+On logout the app performs the following, in order:
+
+1. **Revoke the server wallet session.** Call the existing session-revocation endpoint through the shared API client. Revocation is best-effort: a network failure or an already-expired/unauthorized session must not block the local logout. Log the failure and continue.
+2. **Clear account-scoped caches.** Drop any cached drafts, quotes, balances, and transaction history keyed to the previous account so they cannot leak into the next session.
+3. **Reset pending UI state.** Cancel in-flight requests and clear pending transaction/quote state so stale spinners or optimistic rows do not survive the logout.
+4. **Tear down subscriptions.** Unsubscribe from wallet, RPC, and quote streams tied to the previous session.
+
+### Financial safety
+
+Logout must never mutate on-chain state or cancel a transaction that has already been broadcast. Revocation only affects the server-side session and local caches; any submitted transaction continues to settle independently. If revocation fails, surface it in logs but still complete the local cleanup so the next account starts from a clean slate.
+
+### Testing logout
+
+Regression tests for logout should cover:
+
+- The normal path: session revoked, caches cleared, subscriptions torn down.
+- Revocation failure (network error): local cleanup still completes.
+- Authorization edge case (session already expired or unauthorized): logout still succeeds locally.
+- Recovery: logging in as a second account shows no drafts or transaction data from the first.
+
 ## Commit and PR conventions
 
 - Keep changes scoped to the issue you are solving.
