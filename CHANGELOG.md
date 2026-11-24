@@ -1002,6 +1002,8 @@ Repo Avatar
 - #191 Build an operator simulation for emergency pause and recovery
 - **contracts:** Resolve issues 176 through 179
 - **a11y:** Complete transaction confirmation WCAG 2.2 AA flow
+- #192 Show a decoded transaction effects diff before wallet signing
+- #193 Replace scattered network constants with validated network pro
 
 ### Changed
 
@@ -1371,6 +1373,7 @@ Repo Avatar
 - Enforce least-privilege workflow permissions and pinned actions
 - **changelog:** Update changelog [skip ci]
 - **deps:** Bump the actions group with 2 updates
+- **changelog:** Update changelog [skip ci]
 
 ### Deprecated
 
