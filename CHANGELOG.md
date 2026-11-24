@@ -992,6 +992,10 @@ Repo Avatar
 - #222 Introduce a transactional outbox for payout side effects
 - #223 Define a provider capability contract for reversals and recall
 - #224 Add a first-class payout reversal and dispute lifecycle
+- #194 Implement wallet-session revocation and logout cleanup
+- #195 Request least-privilege wallet permissions for each action
+- #196 Revalidate wallet account and chain immediately before submiss
+- #197 Model transaction recovery as a persisted typed state machine
 - #187 Add storage TTL and rent-budget regression coverage
 - #189 Publish a machine-readable contract deployment manifest
 - #190 Add deterministic event compatibility fixtures for every mutat
@@ -1365,6 +1369,8 @@ Repo Avatar
 - **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
 - Enforce least-privilege workflow permissions and pinned actions
+- **changelog:** Update changelog [skip ci]
+- **deps:** Bump the actions group with 2 updates
 
 ### Deprecated
 
