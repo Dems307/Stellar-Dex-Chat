@@ -42,6 +42,7 @@ Generated from the `Error` enum in `Dechat/stellar-contracts/src/lib.rs`.
 | 402 | `NoFeesToWithdraw` | Funds & Balances | No accumulated fees to withdraw |
 | 403 | `TransferFailed` | Funds & Balances | Token transfer failed or returned unexpected balance delta |
 | 404 | `ShortTransfer` | Funds & Balances | Token transferred less than requested amount |
+| 405 | `TokenInterfaceInvalid` | Funds & Balances | Required token balance or decimal query failed or returned unsupported precision |
 | 501 | `RequestNotFound` | Withdrawal Queue | Withdrawal request does not exist |
 | 502 | `WithdrawalLocked` | Withdrawal Queue | Withdrawal request not yet unlocked |
 | 503 | `OperatorDailyLimitExceeded` | Withdrawal Queue | Operator's daily withdrawal limit exceeded |
@@ -57,6 +58,15 @@ Generated from the `Error` enum in `Dechat/stellar-contracts/src/lib.rs`.
 | 702 | `OraclePriceInvalid` | External Services | Oracle returned invalid price |
 | 703 | `SlippageExceeded` | External Services | Slippage exceeds configured maximum |
 | 704 | `SlippageTooHigh` | External Services | Slippage is too high for this operation |
+| 705 | `OracleObservationMissing` | External Services | No usable oracle observation was returned |
+| 706 | `OracleObservationStale` | External Services | Oracle observation exceeds the configured age |
+| 707 | `OracleObservationFutureDated` | External Services | Oracle observation is dated after the current ledger |
+| 708 | `OracleConfidenceTooLow` | External Services | Oracle observation confidence is below the configured threshold |
+| 709 | `OracleConfigInvalid` | External Services | Oracle freshness or confidence configuration is invalid |
+| 710 | `FiatConversionOverflow` | External Services | Fiat conversion exceeded safe integer arithmetic bounds |
+| 711 | `OracleSpreadTooWide` | External Services | Aggregated oracle spread exceeds the configured bound |
+| 712 | `OracleSourcesInsufficient` | External Services | Fewer than the configured number of valid oracle sources responded |
+| 713 | `OracleVersionUnsupported` | External Services | A source returned an unsupported observation version |
 | 801 | `WithdrawalQuotaExceeded` | Quota & Migration | Withdrawal quota exceeded |
 | 802 | `MigrationAlreadyComplete` | Quota & Migration | Data migration already complete |
 | 803 | `BatchOperationFailed` | Quota & Migration | Batch operation failed |
@@ -80,10 +90,10 @@ Generated from the `Error` enum in `Dechat/stellar-contracts/src/lib.rs`.
 | Initialization | 101–104 | Contract lifecycle and state |
 | Authorization | 201–207 | Access control and permissions |
 | Constraints | 301–319 | Amount, limit, and business rule validation |
-| Funds & Balances | 401–402 | Balance checks and fee management |
+| Funds & Balances | 401–405 | Token balances, transfers, and fee management |
 | Withdrawal Queue | 501–504 | Withdrawal request processing |
 | Governance & Timelock | 601–607 | Admin actions and contract upgrades |
-| External Services | 701–704 | Oracle and pricing integration |
+| External Services | 701–713 | Oracle, pricing, and conversion integration |
 | Quota & Migration | 801–803 | Quota enforcement and data migrations |
 | Replay Protection | 901–902 | Nonce validation |
 | Deposit Floor | 1001 | Minimum deposit enforcement |
