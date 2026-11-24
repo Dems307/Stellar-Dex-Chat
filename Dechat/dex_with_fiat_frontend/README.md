@@ -3,6 +3,27 @@
 Frontend for the DEX-with-fiat flow. It renders the swap/transaction UI, drives the
 intent pipeline, and talks to the backend contract/API layer.
 
+## Network profiles
+
+All network-specific values (network passphrase, RPC endpoint, Horizon endpoint,
+contract IDs, and explorer base URL) live in a single typed source of truth —
+the network profile. Do not scatter these constants across the codebase; read
+them from the active profile instead.
+
+- **Startup validation.** The active profile is validated at startup. A missing
+  or malformed required field (for example an empty passphrase, a non-URL RPC or
+  Horizon endpoint, or a missing contract ID) fails fast with a clear error
+  naming the offending field, rather than surfacing later as a confusing
+  runtime failure.
+- **Unknown profiles block production writes.** When the active profile is
+  unknown/unrecognized, production write operations (transaction submission) are
+  refused. Read-only and non-production flows are unaffected. This preserves the
+  existing financial safety properties: no transaction is ever signed or
+  submitted against a network whose profile has not been validated.
+
+Explorer links are built from the profile's explorer base URL so that links
+always point at the same network the transaction targets.
+
 ## Model failover: conversation and policy versions
 
 When the intent pipeline fails over from one model/provider to another, the
