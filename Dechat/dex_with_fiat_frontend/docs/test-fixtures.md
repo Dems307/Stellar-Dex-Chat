@@ -66,3 +66,44 @@ cargo test -p <contract-crate> golden_events
 
 Keep fixtures synthetic: use public test addresses/contract IDs only, never real user data or
 credentials.
+
+## Emergency pause / recovery drill
+
+The operator drill for emergency pause and recovery is a repeatable testnet/local-network
+simulation. It exercises the pause guard, read-only views, queued liabilities, and authorized
+recovery without touching real funds or credentials.
+
+### What the drill covers
+
+1. **Pause** — an authorized operator pauses the contract. The drill asserts the pause flag is
+   set and that a `paused` event is emitted (see the golden events fixture).
+2. **Blocked mutations** — every state-changing entry point (deposits, withdrawals, swaps,
+   payout settlement, etc.) must reject with the contract's paused error while paused.
+3. **Available views** — read-only queries (balances, queued liabilities, config) must continue
+   to succeed and return the pre-pause values.
+4. **Queued liabilities** — liabilities queued before the pause must be preserved unchanged and
+   must not be silently dropped or double-counted.
+5. **Recovery** — an authorized operator unpauses the contract; the drill asserts the pause flag
+   is cleared, a `resumed`/`unpaused` event is emitted, and previously queued liabilities are
+   processed exactly once on the next settlement.
+
+### Failure and authorization cases
+
+The drill also covers the negative paths:
+
+- A non-operator (unauthorized) caller attempting to pause must fail with an authorization error
+  and leave the pause flag unchanged.
+- A non-operator attempting to unpause must fail with an authorization error and leave the
+  contract paused.
+- Mutations attempted while paused must fail without mutating balances or liabilities.
+
+### Running the drill
+
+Run the drill against a local network or testnet using synthetic operator keys only:
+
+```bash
+cargo test -p <contract-crate> pause_recovery_drill
+```
+
+The drill is deterministic and safe to re-run; it uses only synthetic/public test identifiers and
+never real user data or credentials.

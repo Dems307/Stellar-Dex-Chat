@@ -111,6 +111,33 @@ Validation fails when:
 
 A failed validation must block the deployment — never override it to force a promotion. If validation fails, regenerate the manifest from the correct artifact and network and re-run the check.
 
+## Emergency pause and recovery drill
+
+Operators should rehearse the emergency pause and recovery flow on a testnet or local network before relying on it in production. The drill is a repeatable simulation that pauses the contract, confirms that mutations are blocked while read-only views remain available, verifies that queued liabilities are preserved, and rehearses authorized recovery.
+
+### Running the drill
+
+Run the drill against a testnet or local network deployment (never against mainnet):
+
+```bash
+pnpm drill:pause-recovery -- --network testnet --manifest ./deployments/testnet.json
+```
+
+The drill uses the `admin` identity from the manifest to authorize pause and unpause. It does not accept or store credentials — sign with the operator's configured local key or wallet as usual.
+
+### What the drill verifies
+
+1. **Pause** — the authorized `admin` pauses the contract and the pause is observable in contract state.
+2. **Blocked mutations** — state-changing calls (e.g. swaps, deposits, withdrawals, payouts) are rejected while paused.
+3. **Available views** — read-only views (balances, quotes, queued liabilities) continue to return data while paused.
+4. **Queued liabilities** — liabilities queued before the pause are preserved and remain visible; nothing is silently dropped.
+5. **Authorized recovery** — the authorized `admin` unpauses the contract and mutations succeed again, with queued liabilities handled correctly.
+6. **Unauthorized attempts** — pause and unpause calls from a non-admin identity are rejected, and the contract remains in its prior state.
+
+### Failure handling
+
+If any step fails, the drill exits non-zero and reports which step failed. Treat a failed drill as a blocker: do not promote a deployment whose pause/recovery drill does not pass. Investigate the failure and re-run the drill after fixing the underlying issue — never bypass the drill to force a promotion.
+
 ## Commit and PR conventions
 
 - Keep changes scoped to the issue you are solving.
