@@ -7,7 +7,8 @@ This document records accessibility verification across connect, review, signing
 | :--- | :--- | :--- | :--- |
 | **Freighter Connect Dialog** | Focus trap, Focus return, ESC to dismiss | PASS | Added `useAccessibleModal` trap and restored focus to triggering button on modal close. |
 | **Deposit / Review Modal** | Accessible names, ARIA labels, Contrast ratio (>= 4.5:1) | PASS | Labeled numeric inputs, associated error descriptions with `aria-describedby`. |
-| **Transaction Status Timeline** | Live regions (`aria-live="polite"`), Reflow (320px) | PASS | Added concise, deduplicated announcements for payout transitions (queued -> processing -> settled/failed, plus stale). Clean responsive wrapping. |
+| **Transaction Confirmation (amount → quote → recipient → wallet sign), Issue #290** | Nested-dialog keyboard trap, polite quote/review announcements, inline error recovery, 320px reflow, contrast | PASS | Added associated labels/hints, a real nested 2FA dialog with suspendable parent trap, focus handoff to `Confirm & Sign`, classified error fallback, and AA-contrast confirm actions. Evidence: [ACCESSIBILITY_TRANSACTION_CONFIRMATION_290.md](ACCESSIBILITY_TRANSACTION_CONFIRMATION_290.md). |
+| **Transaction Status Timeline** | Live regions (`aria-live="polite"`), Reflow (320px) | PASS | Added announcements for status transitions (pending -> confirmed). Clean responsive wrapping. |
 | **Error Diagnostics Panel** | Keyboard navigation, Expandable disclosure state | PASS | Set `aria-expanded` and interactive button triggers with clear role alert. |
 | **Audit Admin Tables** | Screen reader headers, Table row navigation | PASS | Added accessible `<caption>` and `scope="col"` headers with keyboard navigable pagination. |
 
