@@ -1,47 +1,41 @@
 # DEX with Fiat Frontend
 
-Frontend for the DEX-with-fiat flow. It renders the swap/transaction UI, drives the
-intent pipeline, and talks to the backend contract/API layer.
+A React + TypeScript frontend for a decentralized exchange that supports fiat on-ramp flows and wallet-based trading.
 
-## Model failover: conversation and policy versions
+## Getting started
 
-When the intent pipeline fails over from one model/provider to another, the
-failover must be **transparent to financial safety**. Two invariants are enforced:
+```bash
+npm install
+npm run dev
+```
 
-1. **Conversation and policy versions are preserved.** Each request trace records
-   the model/provider identity together with the conversation version and the
-   policy version(s) that were in effect when the request was issued. A failover
-   to a different provider does not reset or bump these versions; the trace shows
-   the same conversation and policy versions before and after the switch.
-2. **Tool allowlists are identical across failover.** The set of tools (and thus
-   the transaction permissions) available to the fallback provider is exactly the
-   allowlist of the primary provider. A provider change can never broaden
-   transaction permissions — any attempt to add tools during failover is rejected
-   and the request fails closed rather than executing with wider permissions.
+## Wallet permissions
 
-### Request trace fields
+The app follows a least-privilege wallet model: each action requests only the
+account or signing capability it actually needs, and permission prompts are
+explained in the UI at the point of request.
 
-Each request trace includes:
+| Action | Wallet request |
+| --- | --- |
+| View balances / portfolio | Read-only account access (`eth_requestAccounts`) |
+| Place / cancel an order | Transaction signing for that single transaction |
+| Fiat on-ramp handoff | Read-only account access only |
 
-- `model` / `provider` — the model and provider that served the request.
-- `conversationVersion` — the conversation version at request time.
-- `policyVersion` — the policy version(s) applied to the request.
-- `toolAllowlist` — the effective tool allowlist used for the request.
+### Denial handling
 
-### Regression coverage
+If a user rejects a permission or signing prompt, the app does **not** create a
+partially authenticated session. The pending action is aborted, no connected
+state is persisted for that request, and the UI returns to a recoverable state
+where the user can retry or continue browsing without a wallet.
 
-Focused tests cover:
+### Compatibility notes
 
-- the normal failover path (provider switch preserves conversation/policy versions
-  and the tool allowlist), and
-- the edge case where a provider change attempts to broaden the transaction
-  permission allowlist — the request must be rejected and no transaction may be
-  executed with the broadened permissions.
+- Read-only browsing remains available without any wallet connection.
+- Signing is always requested per transaction; the app never asks for blanket
+  signing approval up front.
+- Existing financial safety properties (explicit confirmation before signing,
+  no silent transaction submission) are preserved.
 
-These properties preserve the existing financial safety guarantees; no
-compatibility or behavior change is introduced for the non-failover path.
+## Contributing
 
-## Development
-
-See the repository `CONTRIBUTING.md` for setup, checks, and contribution
-conventions.
+See [CONTRIBUTING.md](./CONTRIBUTING.md).

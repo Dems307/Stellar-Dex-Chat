@@ -82,6 +82,35 @@ Regression tests for logout should cover:
 - Authorization edge case (session already expired or unauthorized): logout still succeeds locally.
 - Recovery: logging in as a second account shows no drafts or transaction data from the first.
 
+## Wallet permissions
+
+We request the least-privilege wallet permission needed for each action instead of a blanket connect-and-sign flow. Each action asks only for the account or signing operation it actually needs, and the prompt is explained to the user at the point of request.
+
+### Permission tiers
+
+- **Read-only account access** — connecting to view balances, quotes, and history. No signing capability is requested.
+- **Message signing** — authenticating a session or proving account ownership. Requests a signature only; it does not authorize a transaction.
+- **Transaction signing** — submitting an order or payout. Requested only at the moment the user confirms a specific transaction, scoped to that transaction.
+
+### Prompting and denial
+
+- Explain the scope of each prompt in the UI before it is triggered so the user knows exactly what is being requested and why.
+- If the user denies a permission or signing request, do not create a partially authenticated session. Leave the app in a recoverable state: no stale connected state, no half-signed session, and a clear retry path.
+- A denial at the transaction-signing step must not leave an optimistic pending row or a session that appears authenticated for signing.
+
+### Financial safety
+
+Requesting a permission never mutates on-chain state. Denying a signing request simply aborts that action; any previously broadcast transaction continues to settle independently. Least-privilege requests must not weaken existing safety checks — pre-submit revalidation and typed transaction state still apply.
+
+### Testing permissions
+
+Regression tests for wallet permissions should cover:
+
+- The normal path: each action requests only its minimal permission tier.
+- Denial of account access: no connected state is established.
+- Denial of a signing request: no partially authenticated session and a recoverable UI state.
+- Recovery: retrying after a denial requests the permission again cleanly.
+
 ## Commit and PR conventions
 
 - Keep changes scoped to the issue you are solving.
